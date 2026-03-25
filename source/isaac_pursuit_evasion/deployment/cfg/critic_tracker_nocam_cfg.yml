@@ -1,0 +1,5 @@
+# Critic-only deployment config for tracker policy without camera-angle observations.
+obs_dim: 22
+output_dim: 1
+hidden_layers: [512, 256, 256, 256, 128]
+activation: elu

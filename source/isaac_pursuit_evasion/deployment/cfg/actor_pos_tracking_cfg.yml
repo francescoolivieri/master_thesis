@@ -1,0 +1,5 @@
+obs_dim: 14
+action_dim: 4
+hidden_layers: [256, 128, 64]
+activation: elu
+log_std_init: 0.0

@@ -1,0 +1,5 @@
+# Critic-only deployment config (mirrors skrl_ppo_cfg value network).
+obs_dim: 24
+output_dim: 1
+hidden_layers: [512, 256, 256, 256, 128]
+activation: elu

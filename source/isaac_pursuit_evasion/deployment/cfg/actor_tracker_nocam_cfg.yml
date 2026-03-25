@@ -1,0 +1,6 @@
+# Actor-only deployment config for tracker policy without camera-angle observations.
+obs_dim: 22
+action_dim: 4
+hidden_layers: [512, 256, 128]
+activation: elu
+log_std_init: 0.0

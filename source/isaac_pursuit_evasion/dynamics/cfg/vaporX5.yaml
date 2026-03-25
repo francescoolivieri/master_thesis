@@ -1,0 +1,25 @@
+# vapor_x5.yaml
+name: VaporX5
+mass: 0.608 # (kg)
+
+# architecture
+front_arm_length: 0.115 # meters, for a 5" quad (half-arm length)
+back_arm_length: 0.115
+front_arm_angle: 0.785398163 # pi/4 rad
+back_arm_angle: 0.785398163 # pi/4 rad
+
+# Motor
+tau: [0.01, 0.01, 0.01, 0.01]  # motor time constants (s) for each rotor
+# Thrust coefficient.
+# Calculated with 4557 rad/s max angular velociy, thrust to weight: 3.5, mass: 0.6076 kg and gravity: 9.81 m/s^2.
+# thrust_coef = (3.5 * 0.6076 * 9.81) / (4 * 4557**2) = 2.5115e-7."""
+thrust_coeff: 2.5115e-7 # k_l, thrust coefficient (N / (rad/s)^2)
+prop_drag_coeff: 1.5e-2 # k_d, drag coefficient for yaw torque
+drag_coeff: 0.224 # aerodynamic drag
+inertia: [0.003, 0.003, 0.006]  # inertia tensor (Ixx, Iyy, Izz) in kg·m²
+
+rotor_inertia: 0 #1.0e-5 # Jr+p, rotor + prop inertia for motor torque (kg·m²)
+omega_max: 4557.0
+#     Maximum angular velocity of the drone motors in rad/s.
+#     Calculated with 1960KV motor, with 6S LiPo battery with 4.2V per cell.
+#     1960 * 6 * 3.7 = 43,512 RPM ~= 4557 rad/s."""

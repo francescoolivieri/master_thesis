@@ -1,0 +1,23 @@
+# crazyflie_brushless.yaml
+name: crazyflie_brushless
+model: cf_brushless
+
+# reference physical values (simulation uses USD mass/inertia at runtime)
+mass_ref: 0.0393  # kg
+inertia_ref: [3.0e-5, 3.0e-5, 4.0e-5]
+
+# geometry (X configuration)
+arm_length: 0.05  # m (Bitcraze cf21bl)
+
+# motor dynamics
+tau_m: 0.005
+motor_speed_min: 0.0
+motor_speed_max: 2500.0
+
+# motor/prop coefficients
+k_eta: 4.8e-8 # increased to match T2W of 3.15
+k_m: 7.8e-10
+
+# aerodynamic drag (body frame)
+k_aero_xy: 9.1785e-7
+k_aero_z: 10.311e-7
