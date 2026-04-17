@@ -129,6 +129,14 @@ class PosTrackingEnv(DirectRLEnv):
             torch.tensor(self.cfg.collision_altitude, device=self.device),
         )
 
+        self._pillar_radius = float(self.cfg.pillar_radius)
+        self._pillar_collision_radius = float(self.cfg.pillar_radius + self.cfg.drone_collision_radius)
+        self._pillar_top_z = float(self.cfg.arena_min[2] + self.cfg.pillar_height)
+        if len(self.cfg.pillar_positions_xy) > 0:
+            self._pillar_positions_xy = torch.tensor(self.cfg.pillar_positions_xy, device=self.device, dtype=torch.float32)
+        else:
+            self._pillar_positions_xy = torch.zeros((0, 2), device=self.device, dtype=torch.float32)
+
         self._ref_pos_min = torch.tensor(self.cfg.ref_pos_min, device=self.device, dtype=torch.float32)
         self._ref_pos_max = torch.tensor(self.cfg.ref_pos_max, device=self.device, dtype=torch.float32)
         self._ref_yaw_min = float(self.cfg.ref_yaw_range[0])
@@ -177,6 +185,8 @@ class PosTrackingEnv(DirectRLEnv):
 
         if self.cfg.enable_walls:
             self._spawn_arena_walls()
+        if self.cfg.enable_pillars:
+            self._spawn_arena_pillars()
 
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
@@ -308,6 +318,15 @@ class PosTrackingEnv(DirectRLEnv):
             components["out_of_bounds"] = -bounds_pen
         else:
             components["out_of_bounds"] = torch.zeros_like(rewards)
+
+        pillar_collision = self._pillar_collision_mask(pos_local)
+        if pillar_collision.any():
+            pillar_pen = torch.zeros_like(rewards)
+            pillar_pen[pillar_collision] = self.cfg.reward_pillar_collision
+            rewards -= pillar_pen
+            components["pillar_collision"] = -pillar_pen
+        else:
+            components["pillar_collision"] = torch.zeros_like(rewards)
 
         self._last_rewards = rewards
         self._last_reward_components = components
@@ -448,6 +467,17 @@ class PosTrackingEnv(DirectRLEnv):
         above = pos_local > self._arena_max_safe
         return torch.any(below | above, dim=-1)
 
+    def _pillar_collision_mask(self, pos_local: torch.Tensor) -> torch.Tensor:
+        if (not self.cfg.enable_pillars) or self._pillar_positions_xy.shape[0] == 0:
+            return torch.zeros(pos_local.shape[0], dtype=torch.bool, device=self.device)
+
+        xy = pos_local[:, :2].unsqueeze(1)
+        pillar_xy = self._pillar_positions_xy.unsqueeze(0)
+        dxy = torch.norm(xy - pillar_xy, dim=-1)
+        inside_radius = dxy <= self._pillar_collision_radius
+        inside_height = (pos_local[:, 2] >= self.cfg.arena_min[2]) & (pos_local[:, 2] <= self._pillar_top_z)
+        return torch.any(inside_radius, dim=1) & inside_height
+
     def _update_success_flags(self, pos_local: torch.Tensor) -> torch.Tensor:
         pos_error = torch.norm(self._reference_pos - pos_local, dim=-1)
         within = pos_error < self.cfg.pos_tolerance
@@ -475,6 +505,17 @@ class PosTrackingEnv(DirectRLEnv):
         high = self._ref_pos_max
         sample = torch.rand(env_ids.shape[0], 3, device=self.device)
         pos = low + (high - low) * sample
+        if self.cfg.enable_pillars and self._pillar_positions_xy.shape[0] > 0:
+            # Keep references clear of obstacle cylinders so the objective is always feasible.
+            safety_radius = self._pillar_collision_radius + 0.2
+            for _ in range(8):
+                dxy = torch.cdist(pos[:, :2], self._pillar_positions_xy)
+                colliding = torch.any(dxy <= safety_radius, dim=1)
+                if not colliding.any():
+                    break
+                count = int(colliding.sum().item())
+                resample = torch.rand(count, 3, device=self.device)
+                pos[colliding] = low + (high - low) * resample
         yaw = torch.empty(env_ids.shape[0], 1, device=self.device).uniform_(self._ref_yaw_min, self._ref_yaw_max)
         self._reference_pos[env_ids] = pos
         self._reference_yaw[env_ids] = yaw
@@ -782,6 +823,27 @@ class PosTrackingEnv(DirectRLEnv):
                     continue
                 cfg = wall_x_cfg if "WallX" in path else wall_y_cfg
                 cfg.func(path, cfg, translation=translation)
+
+    def _spawn_arena_pillars(self) -> None:
+        if len(self.cfg.pillar_positions_xy) == 0:
+            return
+
+        center_z_local = self.cfg.arena_min[2] + 0.5 * self.cfg.pillar_height
+        material = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.18, 0.18, 0.18))
+        pillar_cfg = sim_utils.CylinderCfg(
+            radius=self.cfg.pillar_radius,
+            height=self.cfg.pillar_height,
+            visual_material=material,
+            copy_from_source=False,
+        )
+
+        for env_id in range(self.scene.cfg.num_envs):
+            base = f"/World/envs/env_{env_id}/Pillars"
+            for pillar_id, (x_local, y_local) in enumerate(self.cfg.pillar_positions_xy):
+                path = f"{base}/Pillar{pillar_id}"
+                if prim_utils.is_prim_path_valid(path):
+                    continue
+                pillar_cfg.func(path, pillar_cfg, translation=(x_local, y_local, center_z_local))
 
     # ---------------------------------------------------------------------
     # Utilities

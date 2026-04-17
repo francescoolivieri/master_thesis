@@ -77,6 +77,12 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     wall_thickness: float = 0.05
     wall_extra_margin: float = 0.5
 
+    enable_pillars: bool = True
+    pillar_positions_xy: tuple[tuple[float, float], ...] = ((-0.7, 0.0), (0.7, 0.0))
+    pillar_radius: float = 0.18
+    pillar_height: float = 1.8
+    drone_collision_radius: float = 0.09
+
     env_spacing = max(
         (arena_max[0] - arena_min[0]) + 2 * wall_extra_margin + 2 * wall_thickness,
         (arena_max[1] - arena_min[1]) + 2 * wall_extra_margin + 2 * wall_thickness,
@@ -129,6 +135,7 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     reward_action_smoothness: float = 0.02
     reward_crash: float = 10.0
     reward_out_of_bounds: float = 10.0
+    reward_pillar_collision: float = 3.0
 
     # Success criteria
     pos_tolerance: float = 0.15
