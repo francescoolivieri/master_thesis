@@ -105,6 +105,7 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     flag_yaw_tracking: bool = False
     flag_penalize_linvel: bool = False
     flag_action_smoothness_penalty: bool = False
+    enable_obstacle_observations: bool = True
 
     # Camera flags
     enable_cameras: bool = False
@@ -125,6 +126,7 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     ref_pos_max = (1.5, 1.0, 1.5)
     ref_yaw_range = (-math.pi, math.pi)
     ref_update_interval_s: float = 0.0  # 0 means static target per episode
+    reference_obstacle_clearance: float = 0.2
 
     # Rewards (positive weights; signs applied in env)
     reward_pos: float = 1.0

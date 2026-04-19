@@ -136,6 +136,8 @@ class PosTrackingEnv(DirectRLEnv):
             self._pillar_positions_xy = torch.tensor(self.cfg.pillar_positions_xy, device=self.device, dtype=torch.float32)
         else:
             self._pillar_positions_xy = torch.zeros((0, 2), device=self.device, dtype=torch.float32)
+        self._num_pillars = int(self._pillar_positions_xy.shape[0])
+        self._reference_pillar_clearance = float(self._pillar_collision_radius + self.cfg.reference_obstacle_clearance)
 
         self._ref_pos_min = torch.tensor(self.cfg.ref_pos_min, device=self.device, dtype=torch.float32)
         self._ref_pos_max = torch.tensor(self.cfg.ref_pos_max, device=self.device, dtype=torch.float32)
@@ -251,6 +253,12 @@ class PosTrackingEnv(DirectRLEnv):
         dist = torch.norm(pos_error, dim=-1, keepdim=True)
 
         parts = [pos_error, dist, vel_world, ang_vel, quat]
+        if self.cfg.enable_obstacle_observations and self._num_pillars > 0:
+            rel_xy = self._pillar_positions_xy.unsqueeze(0) - pos_local[:, :2].unsqueeze(1)
+            center_dist = torch.norm(rel_xy, dim=-1, keepdim=True)
+            surface_dist = center_dist - self._pillar_radius
+            obstacle_features = torch.cat((rel_xy, surface_dist), dim=-1).reshape(self.num_envs, -1)
+            parts.append(obstacle_features)
 
         if self.cfg.flag_yaw_tracking:
             yaw_err, yaw_align = self._yaw_features(quat)
@@ -399,6 +407,8 @@ class PosTrackingEnv(DirectRLEnv):
     @staticmethod
     def _compute_obs_dim(cfg: PosTrackingEnvCfg) -> int:
         dim = 3 + 1 + 3 + 3 + 4
+        if cfg.enable_obstacle_observations:
+            dim += len(cfg.pillar_positions_xy) * 3
         if cfg.flag_yaw_tracking:
             dim += 2
         if cfg.flag_action_smoothness_penalty:
@@ -507,7 +517,7 @@ class PosTrackingEnv(DirectRLEnv):
         pos = low + (high - low) * sample
         if self.cfg.enable_pillars and self._pillar_positions_xy.shape[0] > 0:
             # Keep references clear of obstacle cylinders so the objective is always feasible.
-            safety_radius = self._pillar_collision_radius + 0.2
+            safety_radius = self._reference_pillar_clearance
             for _ in range(8):
                 dxy = torch.cdist(pos[:, :2], self._pillar_positions_xy)
                 colliding = torch.any(dxy <= safety_radius, dim=1)
@@ -516,6 +526,24 @@ class PosTrackingEnv(DirectRLEnv):
                 count = int(colliding.sum().item())
                 resample = torch.rand(count, 3, device=self.device)
                 pos[colliding] = low + (high - low) * resample
+            dxy = torch.cdist(pos[:, :2], self._pillar_positions_xy)
+            colliding = torch.any(dxy <= safety_radius, dim=1)
+            if colliding.any():
+                # Deterministic fallback: project colliding references out of the nearest pillar.
+                nearest_idx = torch.argmin(dxy[colliding], dim=1)
+                nearest_pillars = self._pillar_positions_xy[nearest_idx]
+                vectors = pos[colliding, :2] - nearest_pillars
+                norms = torch.norm(vectors, dim=1, keepdim=True)
+                default_dirs = torch.tensor([1.0, 0.0], device=self.device, dtype=torch.float32).view(1, 2)
+                unit = torch.where(norms > 1e-6, vectors / norms.clamp_min(1e-6), default_dirs.expand(vectors.shape[0], -1))
+                pos[colliding, :2] = nearest_pillars + unit * safety_radius
+                pos[colliding, :2] = torch.maximum(pos[colliding, :2], low[:2].unsqueeze(0))
+                pos[colliding, :2] = torch.minimum(pos[colliding, :2], high[:2].unsqueeze(0))
+
+            final_dxy = torch.cdist(pos[:, :2], self._pillar_positions_xy)
+            final_colliding = torch.any(final_dxy <= safety_radius, dim=1)
+            if final_colliding.any():
+                raise RuntimeError("Reference sampling failed: some goals still intersect pillar clearance.")
         yaw = torch.empty(env_ids.shape[0], 1, device=self.device).uniform_(self._ref_yaw_min, self._ref_yaw_max)
         self._reference_pos[env_ids] = pos
         self._reference_yaw[env_ids] = yaw

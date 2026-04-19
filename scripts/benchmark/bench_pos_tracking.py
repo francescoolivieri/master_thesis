@@ -381,6 +381,7 @@ def main(env_cfg, agent_cfg: dict):
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode=render_mode)
     if args_cli.video:
         video_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[INFO] Recording rollout video to: {video_dir}")
         env = gym.wrappers.RecordVideo(
             env,
             video_folder=str(video_dir),
@@ -522,6 +523,7 @@ def main(env_cfg, agent_cfg: dict):
         "mean_episode_length": (sum(episode_lengths) / max(1, len(episode_lengths))) if episode_lengths else None,
         "mean_total_reward": mean_reward,
         "reward_components": {name: total / max(1, total_samples) for name, total in sum_components.items()},
+        "video_dir": str(video_dir) if args_cli.video else None,
     }
 
     with metrics_path.open("w", encoding="utf-8") as f:
