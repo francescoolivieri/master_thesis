@@ -1,38 +1,37 @@
 #!/usr/bin/env python3
-"""Capture a single arena screenshot from a task without training."""
+"""Capture one screenshot of the pos-tracking arena (training-equivalent setup)."""
 from __future__ import annotations
 
-import argparse
-import sys
 from pathlib import Path
 
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser(description="Capture a single screenshot from an Isaac Lab task.")
-parser.add_argument("--task", type=str, default="PosTracking-RL-velocity-v0", help="Gym task name.")
-parser.add_argument("--num-envs", type=int, default=1, help="Number of environments to instantiate.")
-parser.add_argument("--steps", type=int, default=2, help="Warmup steps before capturing.")
-parser.add_argument("--output", type=Path, default=Path("logs/pos_tracking/arena_screenshot.png"), help="Output PNG path.")
+TASK_NAME = "PosTracking-RL-velocity-v0"
+NUM_ENVS = 1
+WARMUP_STEPS = 20
+RENDER_ATTEMPTS = 40
+MIN_BRIGHTNESS = 0.03
+OUTPUT_PATH = Path("logs/pos_tracking/arena_posttraining.png")
 
-AppLauncher.add_app_launcher_args(parser)
-parser.set_defaults(headless=True)
-args_cli, hydra_args = parser.parse_known_args()
-
-# hydra_task_config expects command-line overrides in sys.argv.
-sys.argv = [sys.argv[0]] + hydra_args
-
-app_launcher = AppLauncher(args_cli)
+# Keep script usage simple: no custom CLI arguments.
+app_launcher = AppLauncher(headless=True, enable_cameras=True)
 simulation_app = app_launcher.app
+
+# Workaround for omni.replicator overscan bug where dataWindow values can be None.
+import carb as _carb
+
+_carb.settings.get_settings().set("/rtx/dataWindow/fitOutputToDataWindow", True)
 
 import gymnasium as gym
 import torch
 from isaaclab.sensors.camera.utils import save_images_to_file
-from isaaclab_tasks.utils.hydra import hydra_task_config
 import source.isaac_pursuit_evasion.isaac_pursuit_evasion.tasks.direct.pos_tracking  # noqa: F401
+from source.isaac_pursuit_evasion.isaac_pursuit_evasion.tasks.direct.pos_tracking.pos_tracking_env_cfg import (
+    pos_tracking_velocity_cfg,
+)
 
 
 def _to_hwc_float(frame) -> torch.Tensor:
-    """Convert rendered frame to [H, W, C] float tensor in [0, 1]."""
     image = torch.as_tensor(frame)
     if image.dim() == 4:
         image = image[0]
@@ -43,31 +42,54 @@ def _to_hwc_float(frame) -> torch.Tensor:
     image = image.to(torch.float32)
     if image.max() > 1.0:
         image = image / 255.0
-    return image.clamp(0.0, 1.0)
+    image = image.clamp(0.0, 1.0)
+    if image.shape[-1] == 4:
+        image = image[..., :3]
+    elif image.shape[-1] == 1:
+        image = image.repeat(1, 1, 3)
+    elif image.shape[-1] != 3:
+        raise RuntimeError(f"Unexpected channel count in frame: {image.shape[-1]}")
+    return image
 
 
-@hydra_task_config(args_cli.task, "skrl_cfg_entry_point")
-def main(env_cfg, _agent_cfg) -> None:
-    env_cfg.scene.num_envs = int(max(1, args_cli.num_envs))
+def main() -> None:
+    env_cfg = pos_tracking_velocity_cfg(num_envs=NUM_ENVS)
+    env_cfg.enable_cameras = True
+    env_cfg.debug_vis = True
+    env_cfg.debug_visualizer = True
 
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array")
+    env = gym.make(TASK_NAME, cfg=env_cfg, render_mode="rgb_array")
     try:
-        obs, _ = env.reset()
-        del obs
+        env.reset()
+        base_env = env.unwrapped
+        action_dim = int(getattr(base_env.cfg, "action_space", 0))
 
-        action_dim = int(getattr(env.unwrapped.cfg, "action_space", 0))
+        action = None
         if action_dim > 0:
-            action = torch.zeros((env_cfg.scene.num_envs, action_dim), device=env.unwrapped.device)
-            for _ in range(max(0, int(args_cli.steps))):
+            action = torch.zeros((NUM_ENVS, action_dim), device=base_env.device)
+            for _ in range(WARMUP_STEPS):
                 env.step(action)
 
-        frame = env.render()
-        image = _to_hwc_float(frame).unsqueeze(0).cpu()
+        image = None
+        brightness = 0.0
+        for _ in range(RENDER_ATTEMPTS):
+            frame = env.render()
+            image = _to_hwc_float(frame)
+            brightness = float(image.mean().item())
+            if brightness >= MIN_BRIGHTNESS:
+                break
+            if action is not None:
+                env.step(action)
 
-        output_path = args_cli.output.expanduser().resolve()
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        save_images_to_file(image, str(output_path))
-        print(f"[INFO] Saved screenshot to: {output_path}")
+        if image is None:
+            raise RuntimeError("No frame captured from viewport render.")
+        if brightness < MIN_BRIGHTNESS:
+            print(f"[WARN] Dark frame captured (brightness={brightness:.4f}).")
+
+        out_path = OUTPUT_PATH.expanduser().resolve()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        save_images_to_file(image.unsqueeze(0).cpu(), str(out_path))
+        print(f"[INFO] Saved screenshot to: {out_path} (brightness={brightness:.4f})")
     finally:
         env.close()
 
