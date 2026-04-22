@@ -30,6 +30,12 @@ parser.add_argument("--video", action="store_true", default=False, help="Record 
 parser.add_argument("--vidoe", dest="video", action="store_true", help="Alias for --video.")
 parser.add_argument("--video_length", type=int, default=500, help="Length of the recorded video (in steps).")
 parser.add_argument(
+    "--video-length",
+    dest="video_length",
+    type=int,
+    help=argparse.SUPPRESS,
+)
+parser.add_argument(
     "--video-interval-frames",
     type=int,
     default=None,
@@ -78,7 +84,7 @@ parser.add_argument(
     "--algorithm",
     type=str,
     default="PPO",
-    choices=["AMP", "PPO", "IPPO", "MAPPO"],
+    choices=["AMP", "PPO", "IPPO", "MAPPO", "DGPPO"],
     help="The RL algorithm used for training the skrl agent.",
 )
 parser.add_argument("--wandb-name", type=str, help="Override WandB run name (agent.agent.experiment.wandb_kwargs.name).")
@@ -285,7 +291,13 @@ class WandbBridge:
         module = self._ensure_module()
         if module and module.run is not None:
             try:
-                module.log(data, step=step)
+                # wandb forbids passing `step=` when sync_tensorboard=True is
+                # active (skrl enables it). Inject the step as a regular field
+                # so it still appears on the run and can be used as an x-axis.
+                payload = dict(data)
+                if step is not None:
+                    payload.setdefault("trainer/global_step", step)
+                module.log(payload)
             except Exception:
                 pass
 
@@ -320,7 +332,10 @@ class WandbBridge:
                     data = [[float(torch.mean(tensor).item())]]
                 table = module.Table(columns=["scores"], data=data)
                 plot = module.plot.histogram(table, "scores", title=title or key)
-                module.log({key: plot}, step=step)
+                payload = {key: plot}
+                if step is not None:
+                    payload["trainer/global_step"] = step
+                module.log(payload)
             except Exception:
                 pass
 
@@ -332,7 +347,10 @@ class WandbBridge:
                     return
                 table = module.Table(columns=["label", "value"], data=[[label, float(val)] for label, val in zip(labels, values)])
                 plot = module.plot.bar(table, "label", "value", title=title or key)
-                module.log({key: plot}, step=step)
+                payload = {key: plot}
+                if step is not None:
+                    payload["trainer/global_step"] = step
+                module.log(payload)
             except Exception:
                 pass
 
@@ -615,12 +633,14 @@ def _reward_components_to_metrics(components: Any) -> dict[str, float]:
             for name, tensor in agent_components.items():
                 mean_val = _safe_mean(tensor)
                 if mean_val is not None:
-                    metrics[f"Rewards/{agent}/{name}"] = mean_val
+                    # Keep reward charts positive for easier reading in dashboards.
+                    metrics[f"Rewards/{agent}/{name}"] = abs(mean_val)
     else:
         for name, tensor in components.items():
             mean_val = _safe_mean(tensor)
             if mean_val is not None:
-                metrics[f"Rewards/{name}"] = mean_val
+                # Keep reward charts positive for easier reading in dashboards.
+                metrics[f"Rewards/{name}"] = abs(mean_val)
     return metrics
 
 
@@ -1185,7 +1205,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # configure and instantiate the skrl runner
     # https://skrl.readthedocs.io/en/latest/api/utils/runner.html
     print("Obs space:", env.single_observation_space, "Action space:", env.single_action_space)
-    runner = Runner(env, agent_cfg)
+    if algorithm == "dgppo":
+        # DGPPO uses its own GNN-backed models and dual-critic update loop,
+        # so it bypasses skrl's default Runner. DGPPORunner exposes the same
+        # (.agent, .trainer, .run()) surface skrl's Runner does, so the
+        # monkey-patching below works unchanged.
+        from source.isaac_pursuit_evasion.nn.dgppo_runner import DGPPORunner
+
+        runner = DGPPORunner(env, agent_cfg)
+    else:
+        runner = Runner(env, agent_cfg)
     _log_agent_preprocessors(runner.agent, agent_cfg)
     checkpoints_dir = Path(getattr(runner.agent, "experiment_dir", log_dir)) / "checkpoints"
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
@@ -1226,6 +1255,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 self.track_data("System/total_frames", system_metrics["System/total_frames"])
                 wandb_bridge.log(system_metrics, step=current_step)
                 env_metrics: dict[str, float] = {}
+                if hasattr(base_env, "get_last_rewards"):
+                    try:
+                        reward_mean = _safe_mean(base_env.get_last_rewards())
+                        if reward_mean is not None:
+                            # Logging-only transform: keep reward graph positive
+                            # without changing the reward used for training.
+                            env_metrics["Rewards/total"] = abs(reward_mean)
+                    except Exception:
+                        pass
                 if hasattr(base_env, "get_last_reward_components"):
                     try:
                         components = base_env.get_last_reward_components()

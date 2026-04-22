@@ -518,7 +518,7 @@ class PosTrackingEnv(DirectRLEnv):
         if self.cfg.enable_pillars and self._pillar_positions_xy.shape[0] > 0:
             # Keep references clear of obstacle cylinders so the objective is always feasible.
             safety_radius = self._reference_pillar_clearance
-            for _ in range(8):
+            for _ in range(12):
                 dxy = torch.cdist(pos[:, :2], self._pillar_positions_xy)
                 colliding = torch.any(dxy <= safety_radius, dim=1)
                 if not colliding.any():
@@ -919,3 +919,125 @@ class PosTrackingEnv(DirectRLEnv):
 
     def get_reference_pose(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self._reference_pos.clone(), self._reference_yaw.clone()
+
+    # ---------------------------------------------------------------------
+    # DGPPO side channels (consumed by nn/dgppo_agent.py via EnvAccessor).
+    # These are independent of _get_observations so the flat PPO observation
+    # path stays byte-for-byte unchanged.
+    # ---------------------------------------------------------------------
+
+    # Graph state layout: [x, y, z, vx, vy, vz] in the per-env local frame.
+    graph_state_dim: int = 6
+
+    @property
+    def n_agents(self) -> int:
+        # Single drone for PosTracking; multi-agent envs should override.
+        return 1
+
+    @property
+    def n_obstacles(self) -> int:
+        return int(self._num_pillars)
+
+    @property
+    def n_constraints(self) -> int:
+        # Per-pillar surface slackness + 4 arena-XY bounds + 1 altitude floor.
+        # The DGPPO critic's Vh head has one output per entry here; see
+        # get_costs() below for the ordering.
+        return int(self._num_pillars) + 4 + 1
+
+    @property
+    def step_dt(self) -> float:
+        # DirectRLEnv accesses ``step_dt`` during ``super().__init__`` before
+        # this class sets ``self._step_dt``; derive it from config in that case.
+        if hasattr(self, "_step_dt"):
+            return float(self._step_dt)
+        cfg = getattr(self, "cfg", None)
+        if cfg is None:
+            return 0.0
+        sim_dt = float(getattr(cfg.sim, "dt", 0.0))
+        decimation = float(getattr(cfg, "decimation", 1))
+        return sim_dt * decimation
+
+    def _graph_agent_state_tensor(self) -> torch.Tensor:
+        """(B, 1, 6) agent state in the local (per-env) frame."""
+        env_origins = self._terrain.env_origins
+        pos_local = self._robot.data.root_pos_w - env_origins
+        vel_world = self._robot.data.root_lin_vel_w
+        state = torch.cat((pos_local, vel_world), dim=-1)
+        return state.unsqueeze(1)
+
+    def _graph_goal_state_tensor(self) -> torch.Tensor:
+        """(B, 1, 6) goal state = current reference position, zero velocity."""
+        zeros = torch.zeros_like(self._reference_pos)
+        goal = torch.cat((self._reference_pos, zeros), dim=-1)
+        return goal.unsqueeze(1)
+
+    def _graph_obstacle_state_tensor(self) -> torch.Tensor:
+        """(B, O, 6) pillar state: centers in local frame, zero velocity.
+
+        Each pillar is represented as a 3D point at the pillar top altitude
+        (middle of the cylinder in the horizontal plane); velocity entries
+        are zero since pillars are static.
+        """
+        O = int(self._num_pillars)
+        if O == 0:
+            return self._reference_pos.new_zeros(self.num_envs, 0, self.graph_state_dim)
+        z_mid = 0.5 * (self._pillar_top_z + float(self.cfg.arena_min[2]))
+        xy = self._pillar_positions_xy  # (O, 2)
+        zs = torch.full((O, 1), z_mid, device=self.device, dtype=xy.dtype)
+        pos = torch.cat((xy, zs), dim=-1)  # (O, 3)
+        vel = torch.zeros_like(pos)
+        state = torch.cat((pos, vel), dim=-1)  # (O, 6)
+        return state.unsqueeze(0).expand(self.num_envs, -1, -1).contiguous()
+
+    def get_graph_agent_state(self) -> torch.Tensor:
+        return self._graph_agent_state_tensor()
+
+    def get_graph_goal_state(self) -> torch.Tensor:
+        return self._graph_goal_state_tensor()
+
+    def get_graph_obstacle_state(self) -> torch.Tensor:
+        return self._graph_obstacle_state_tensor()
+
+    def get_costs(self) -> torch.Tensor:
+        """Return per-agent constraint values ``h(s)``, shape ``(B, A, NH)``.
+
+        Convention (matches ``compute_cbf_advantages`` in
+        ``nn/train_dgppo.py``): positive ``h`` means *unsafe*, negative
+        means *safe*. The CBF derivative + alpha * h is minimized during
+        training.
+
+        Head ordering (column-wise):
+            [0 .. O-1]   pillar surface slackness (unsafe = inside cylinder)
+            [O]          x > x_max
+            [O+1]        x < x_min
+            [O+2]        y > y_max
+            [O+3]        y < y_min
+            [O+4]        z < collision_altitude   (altitude floor)
+        """
+        env_origins = self._terrain.env_origins
+        pos_local = self._robot.data.root_pos_w - env_origins  # (B, 3)
+        B = pos_local.shape[0]
+
+        # Pillar costs: r_collision - distance_xy (positive when inside the
+        # inflated cylinder). Vertical extent is handled implicitly by the
+        # altitude-floor constraint.
+        if self._num_pillars > 0:
+            xy = pos_local[:, :2].unsqueeze(1)                       # (B, 1, 2)
+            pillar_xy = self._pillar_positions_xy.unsqueeze(0)       # (1, O, 2)
+            dist_xy = torch.norm(xy - pillar_xy, dim=-1)             # (B, O)
+            pillar_cost = self._pillar_collision_radius - dist_xy
+        else:
+            pillar_cost = pos_local.new_zeros(B, 0)
+
+        # Arena XY bounds: positive when outside.
+        x_max = pos_local[:, 0:1] - self._arena_max[0]
+        x_min = self._arena_min[0] - pos_local[:, 0:1]
+        y_max = pos_local[:, 1:2] - self._arena_max[1]
+        y_min = self._arena_min[1] - pos_local[:, 1:2]
+
+        # Altitude floor: positive when below the collision altitude.
+        z_floor = self.cfg.collision_altitude - pos_local[:, 2:3]
+
+        costs = torch.cat((pillar_cost, x_max, x_min, y_max, y_min, z_floor), dim=-1)
+        return costs.unsqueeze(1)  # (B, 1, NH)

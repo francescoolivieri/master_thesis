@@ -32,17 +32,17 @@ memory:
 agent:
   class: PPO
 
-  rollouts: 32
-  learning_epochs: 8
+  rollouts: 16
+  learning_epochs: 4
   mini_batches: 8
 
-  discount_factor: 0.99
+  discount_factor: 0.995
   lambda: 0.95
 
-  learning_rate: 5.0e-04
+  learning_rate: 2.0e-04
   learning_rate_scheduler: KLAdaptiveLR
   learning_rate_scheduler_kwargs:
-    kl_threshold: 0.008
+   kl_threshold: 0.008
 
   state_preprocessor: RunningStandardScaler
   state_preprocessor_kwargs: null
@@ -52,18 +52,18 @@ agent:
   random_timesteps: 0
   learning_starts: 0
 
-  grad_norm_clip: 1.0
+  grad_norm_clip: 0.5
   ratio_clip: 0.2
   value_clip: 0.2
   clip_predicted_values: True
 
   entropy_loss_scale: 0.0
-  value_loss_scale: 2.0
+  value_loss_scale: 1.0
 
   kl_threshold: 0.0
 
   rewards_shaper_scale: 0.1
-  time_limit_bootstrap: False
+  time_limit_bootstrap: True
 
   experiment:
     directory: "training"
@@ -79,5 +79,5 @@ agent:
 
 trainer:
   class: SequentialTrainer
-  timesteps: 200000
+  timesteps: 40000
   environment_info: log

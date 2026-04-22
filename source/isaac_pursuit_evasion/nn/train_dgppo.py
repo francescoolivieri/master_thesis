@@ -26,7 +26,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from gnn import GraphTransformerGNN
+try:
+    # Package import (used when train_dgppo is imported as part of the
+    # ``isaac_pursuit_evasion.nn`` package, e.g. from the DGPPO agent).
+    from .gnn import GraphTransformerGNN
+except ImportError:
+    # Script import (used when this file is executed directly, e.g. the
+    # parity harness: ``python train_dgppo.py --fixture ...``).
+    from gnn import GraphTransformerGNN
 
 
 # ---------------------------------------------------------------------------

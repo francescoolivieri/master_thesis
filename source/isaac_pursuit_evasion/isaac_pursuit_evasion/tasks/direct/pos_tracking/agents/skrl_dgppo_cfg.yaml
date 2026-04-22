@@ -1,0 +1,76 @@
+# Agent configuration for the DGPPO port (see nn/dgppo_agent.py).
+#
+# The schema intentionally diverges from skrl_ppo_cfg.yaml: DGPPO builds its
+# own GNN-backed policy/critic instead of the GaussianMixin/DeterministicMixin
+# MLPs that skrl's default runner instantiates. The DGPPORunner shim consumes
+# this file directly.
+
+seed: 42
+
+# Connectivity radius for A-A / A-O edges when building the graph. Set a
+# little larger than the arena half-width so a single drone always sees
+# every pillar; tighten if the scene grows.
+obs_radius: 10.0
+
+gnn:
+  out_dim: 64
+  msg_dim: 32
+  n_heads: 3
+  # NOTE: nn/gnn.py reuses the same ``in_dim`` for node and edge linears
+  # within each GraphTransformer layer, so edges are not re-projected
+  # between layers. For multi-layer GNNs the edge-side in_dim would stop
+  # matching the node side after the first layer; stick to 1 for now.
+  policy_layers: 1
+  vl_layers: 1
+  vh_layers: 1
+
+# Recurrent option mirrors the JAX reference; kept off in v1.
+use_rnn: false
+rnn:
+  cell: gru          # or lstm
+  hidden: 64
+  layers: 1
+
+agent:
+  class: DGPPO
+
+  rollouts: 32
+  learning_epochs: 8
+  mini_batches: 8
+
+  discount_factor: 0.99
+  lambda: 0.95
+
+  # Separate LRs for policy / Vl / Vh as in dgppo/algo/dgppo.py.
+  lr_policy: 3.0e-04
+  lr_vl: 1.0e-03
+  lr_vh: 1.0e-03
+
+  # PPO & DGPPO knobs.
+  ratio_clip: 0.2
+  grad_norm_clip: 2.0
+  entropy_loss_scale: 1.0e-02
+  vl_loss_scale: 1.0
+  vh_loss_scale: 1.0
+
+  # CBF advantage shaping.
+  alpha: 10.0
+  cbf_eps: 1.0e-02
+  cbf_weight: 1.0
+
+  experiment:
+    directory: "training"
+    experiment_name: ""
+    write_interval: auto
+    checkpoint_interval: auto
+
+    wandb: true
+    wandb_kwargs:
+      project: "drones_rpl"
+      entity: ""
+      name: ""
+
+trainer:
+  class: SequentialTrainer
+  timesteps: 2000000
+  environment_info: log
