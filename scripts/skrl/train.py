@@ -281,11 +281,24 @@ class WandbBridge:
         module = self._ensure_module()
         return bool(module and module.run is not None)
 
+    def _log_kwargs(self, module, step: Optional[int]) -> dict[str, int]:
+        if step is None:
+            return {}
+        try:
+            run = module.run
+            settings = getattr(run, "settings", None)
+            if bool(getattr(settings, "sync_tensorboard", False)):
+                # W&B rejects explicit steps when TensorBoard sync is enabled.
+                return {}
+        except Exception:
+            pass
+        return {"step": int(step)}
+
     def log(self, data: dict[str, float], step: Optional[int] = None) -> None:
         module = self._ensure_module()
         if module and module.run is not None:
             try:
-                module.log(data, step=step)
+                module.log(data, **self._log_kwargs(module, step))
             except Exception:
                 pass
 
@@ -320,7 +333,7 @@ class WandbBridge:
                     data = [[float(torch.mean(tensor).item())]]
                 table = module.Table(columns=["scores"], data=data)
                 plot = module.plot.histogram(table, "scores", title=title or key)
-                module.log({key: plot}, step=step)
+                module.log({key: plot}, **self._log_kwargs(module, step))
             except Exception:
                 pass
 
@@ -332,7 +345,7 @@ class WandbBridge:
                     return
                 table = module.Table(columns=["label", "value"], data=[[label, float(val)] for label, val in zip(labels, values)])
                 plot = module.plot.bar(table, "label", "value", title=title or key)
-                module.log({key: plot}, step=step)
+                module.log({key: plot}, **self._log_kwargs(module, step))
             except Exception:
                 pass
 
@@ -356,6 +369,17 @@ class WandbBridge:
             if run_id:
                 return str(run_id)
         return None
+
+    def finish(self, exit_code: Optional[int] = None) -> None:
+        module = self._ensure_module()
+        if module and module.run is not None:
+            try:
+                kwargs = {}
+                if exit_code is not None:
+                    kwargs["exit_code"] = int(exit_code)
+                module.finish(**kwargs)
+            except Exception:
+                pass
 
     def log_artifact(
         self,
@@ -1288,17 +1312,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # except Exception as exc:
     #     print(f"[WARN] Initial evaluation failed: {exc}")
 
-    # run training
-    runner.run()
+    run_failed = False
+    try:
+        # run training
+        runner.run()
 
-    total_timesteps = int(agent_cfg.get("trainer", {}).get("timesteps", getattr(runner.trainer, "timesteps", 0)))
-    if total_timesteps > 0:
-        runner.agent.write_checkpoint(total_timesteps, total_timesteps)
-        if checkpoint_uploader is not None:
-            checkpoint_uploader.upload_new()
-
-    # close the simulator
-    env.close()
+        total_timesteps = int(agent_cfg.get("trainer", {}).get("timesteps", getattr(runner.trainer, "timesteps", 0)))
+        if total_timesteps > 0:
+            runner.agent.write_checkpoint(total_timesteps, total_timesteps)
+            if checkpoint_uploader is not None:
+                checkpoint_uploader.upload_new()
+    except Exception:
+        run_failed = True
+        raise
+    finally:
+        # Always close run/simulator so failed jobs still show correctly in W&B.
+        wandb_bridge.finish(exit_code=1 if run_failed else 0)
+        env.close()
 
 
 if __name__ == "__main__":

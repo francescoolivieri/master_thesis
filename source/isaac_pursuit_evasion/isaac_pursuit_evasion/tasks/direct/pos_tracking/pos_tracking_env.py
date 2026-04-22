@@ -518,7 +518,9 @@ class PosTrackingEnv(DirectRLEnv):
         if self.cfg.enable_pillars and self._pillar_positions_xy.shape[0] > 0:
             # Keep references clear of obstacle cylinders so the objective is always feasible.
             safety_radius = self._reference_pillar_clearance
-            for _ in range(8):
+            # Tiny offset avoids floating-point ties at exactly safety_radius.
+            safe_radius = safety_radius + 0.05
+            for _ in range(12):
                 dxy = torch.cdist(pos[:, :2], self._pillar_positions_xy)
                 colliding = torch.any(dxy <= safety_radius, dim=1)
                 if not colliding.any():
@@ -526,24 +528,42 @@ class PosTrackingEnv(DirectRLEnv):
                 count = int(colliding.sum().item())
                 resample = torch.rand(count, 3, device=self.device)
                 pos[colliding] = low + (high - low) * resample
-            dxy = torch.cdist(pos[:, :2], self._pillar_positions_xy)
-            colliding = torch.any(dxy <= safety_radius, dim=1)
-            if colliding.any():
-                # Deterministic fallback: project colliding references out of the nearest pillar.
+
+            # Deterministic fallback: iteratively project away from the nearest violating pillar.
+            default_dirs = torch.tensor([1.0, 0.0], device=self.device, dtype=torch.float32).view(1, 2)
+            for _ in range(24):
+                dxy = torch.cdist(pos[:, :2], self._pillar_positions_xy)
+                colliding = torch.any(dxy <= safety_radius, dim=1)
+                if not colliding.any():
+                    break
                 nearest_idx = torch.argmin(dxy[colliding], dim=1)
                 nearest_pillars = self._pillar_positions_xy[nearest_idx]
                 vectors = pos[colliding, :2] - nearest_pillars
                 norms = torch.norm(vectors, dim=1, keepdim=True)
-                default_dirs = torch.tensor([1.0, 0.0], device=self.device, dtype=torch.float32).view(1, 2)
                 unit = torch.where(norms > 1e-6, vectors / norms.clamp_min(1e-6), default_dirs.expand(vectors.shape[0], -1))
-                pos[colliding, :2] = nearest_pillars + unit * safety_radius
-                pos[colliding, :2] = torch.maximum(pos[colliding, :2], low[:2].unsqueeze(0))
-                pos[colliding, :2] = torch.minimum(pos[colliding, :2], high[:2].unsqueeze(0))
+                projected = nearest_pillars + unit * safe_radius
+                pos[colliding, :2] = torch.clamp(projected, min=low[:2], max=high[:2])
 
             final_dxy = torch.cdist(pos[:, :2], self._pillar_positions_xy)
             final_colliding = torch.any(final_dxy <= safety_radius, dim=1)
             if final_colliding.any():
-                raise RuntimeError("Reference sampling failed: some goals still intersect pillar clearance.")
+                # Last resort: sample XY from a dense random candidate set and pick known-safe points.
+                candidate_count = 4096
+                candidate_xy = low[:2] + (high[:2] - low[:2]) * torch.rand(candidate_count, 2, device=self.device)
+                candidate_dxy = torch.cdist(candidate_xy, self._pillar_positions_xy)
+                safe_candidates = candidate_xy[torch.all(candidate_dxy > safety_radius, dim=1)]
+                if safe_candidates.shape[0] == 0:
+                    raise RuntimeError(
+                        "Reference sampling failed: no feasible XY location satisfies pillar clearance in current bounds."
+                    )
+                count = int(final_colliding.sum().item())
+                pick_idx = torch.randint(0, safe_candidates.shape[0], (count,), device=self.device)
+                pos[final_colliding, :2] = safe_candidates[pick_idx]
+
+                final_dxy = torch.cdist(pos[:, :2], self._pillar_positions_xy)
+                final_colliding = torch.any(final_dxy <= safety_radius, dim=1)
+                if final_colliding.any():
+                    raise RuntimeError("Reference sampling failed: some goals still intersect pillar clearance.")
         yaw = torch.empty(env_ids.shape[0], 1, device=self.device).uniform_(self._ref_yaw_min, self._ref_yaw_max)
         self._reference_pos[env_ids] = pos
         self._reference_yaw[env_ids] = yaw
