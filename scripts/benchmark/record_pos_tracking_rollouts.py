@@ -74,6 +74,103 @@ def _resolve_path(path: Path) -> Path:
     return Path(path).expanduser().resolve()
 
 
+def _get_local_xy(base_env) -> torch.Tensor:
+    """Return drone XY positions in local env coordinates (num_envs, 2)."""
+    root_pos_w = base_env._robot.data.root_pos_w
+    env_origins = base_env._terrain.env_origins
+    pos_local = root_pos_w - env_origins
+    return pos_local[:, :2].detach().cpu()
+
+
+def _get_reference_local_xy(base_env) -> torch.Tensor:
+    """Return reference goal XY in local env coordinates (num_envs, 2)."""
+    return base_env._reference_pos[:, :2].detach().cpu()
+
+
+def _plot_xy_rollouts(
+    output_dir: Path,
+    env_cfg,
+    trajectories: list[list[tuple[float, float]]],
+    goals_xy: list[tuple[float, float]],
+) -> Path | None:
+    """Save a 2D XY trajectory plot with arena bounds and obstacles."""
+    if not trajectories:
+        return None
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Circle, Rectangle
+    except Exception as exc:  # pragma: no cover - optional plotting dependency
+        print(f"[WARN] Could not import matplotlib to plot trajectories: {exc}")
+        return None
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    arena_min = env_cfg.arena_min
+    arena_max = env_cfg.arena_max
+    width = arena_max[0] - arena_min[0]
+    height = arena_max[1] - arena_min[1]
+    ax.add_patch(
+        Rectangle(
+            (arena_min[0], arena_min[1]),
+            width,
+            height,
+            fill=False,
+            lw=2.0,
+            ls="--",
+            ec="black",
+            label="Arena bounds",
+        )
+    )
+
+    if getattr(env_cfg, "enable_pillars", False):
+        for idx, (px, py) in enumerate(getattr(env_cfg, "pillar_positions_xy", ())):
+            pillar = Circle(
+                (float(px), float(py)),
+                radius=float(env_cfg.pillar_radius),
+                color="dimgray",
+                alpha=0.35,
+                ec="black",
+                lw=1.0,
+                label="Pillar obstacle" if idx == 0 else None,
+            )
+            ax.add_patch(pillar)
+
+    cmap = plt.cm.get_cmap("tab10", max(1, len(trajectories)))
+    for rollout_idx, points in enumerate(trajectories):
+        if len(points) < 2:
+            continue
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        color = cmap(rollout_idx)
+        ax.plot(xs, ys, color=color, lw=1.8, label=f"Rollout {rollout_idx + 1}")
+        ax.scatter(xs[0], ys[0], color=color, marker="o", s=24)
+        ax.scatter(xs[-1], ys[-1], color=color, marker="x", s=35)
+        if rollout_idx < len(goals_xy):
+            goal = goals_xy[rollout_idx]
+            ax.scatter(
+                goal[0],
+                goal[1],
+                color=color,
+                marker="*",
+                s=260,
+                edgecolors="black",
+                linewidths=0.8,
+                zorder=30,
+            )
+
+    ax.set_title("Drone XY trajectories")
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best", fontsize=8, ncols=2)
+    fig.tight_layout()
+
+    plot_path = output_dir / "trajectory_xy.png"
+    fig.savefig(plot_path, dpi=180)
+    plt.close(fig)
+    return plot_path
+
+
 def _extract_policy_state_dict(payload: Any) -> Mapping[str, Any] | None:
     if isinstance(payload, torch.nn.Module):
         return payload.state_dict()
@@ -203,6 +300,8 @@ def main(env_cfg, _agent_cfg: dict):
     env_cfg.sim.device = args_cli.device if args_cli.device else env_cfg.sim.device
     if args_cli.seed is not None:
         env_cfg.seed = int(args_cli.seed)
+    fixed_goal_candidates = ((-1.8, 0.0), (1.5, 0.0), (-1.0, 0.0))
+    fixed_goal_budget = min(3, int(args_cli.num_rollouts))
     env_cfg.debug_vis = True
     env_cfg.debug_visualizer = True
     env_cfg.enable_cameras = True
@@ -219,22 +318,80 @@ def main(env_cfg, _agent_cfg: dict):
     base_env = env.unwrapped if hasattr(env, "unwrapped") else env
     device = str(base_env.device)
     policy = PolicyRunner.from_checkpoint(checkpoint, args_cli.actor_cfg, device=device)
+    fixed_goal_z = float((env_cfg.ref_pos_min[2] + env_cfg.ref_pos_max[2]) * 0.5)
+    next_fixed_goal_idx = 0
+
+    def _assign_fixed_goals(env_ids: list[int]) -> None:
+        nonlocal next_fixed_goal_idx
+        if fixed_goal_budget <= 0:
+            return
+        for env_id in env_ids:
+            if next_fixed_goal_idx >= fixed_goal_budget:
+                break
+            goal_xy = fixed_goal_candidates[next_fixed_goal_idx]
+            base_env._reference_pos[env_id, 0] = float(goal_xy[0])
+            base_env._reference_pos[env_id, 1] = float(goal_xy[1])
+            base_env._reference_pos[env_id, 2] = fixed_goal_z
+            if hasattr(base_env, "_reference_timer"):
+                base_env._reference_timer[env_id] = 0.0
+            next_fixed_goal_idx += 1
 
     obs, _ = env.reset()
+    _assign_fixed_goals(list(range(int(args_cli.num_envs))))
+    current_paths: list[list[tuple[float, float]]] = [[] for _ in range(int(args_cli.num_envs))]
+    current_goals: list[tuple[float, float] | None] = [None for _ in range(int(args_cli.num_envs))]
+    finished_paths: list[list[tuple[float, float]]] = []
+    finished_goals: list[tuple[float, float]] = []
+    for env_id, xy in enumerate(_get_local_xy(base_env)):
+        current_paths[env_id].append((float(xy[0].item()), float(xy[1].item())))
+    ref_xy = _get_reference_local_xy(base_env)
+    for env_id, goal in enumerate(ref_xy):
+        current_goals[env_id] = (float(goal[0].item()), float(goal[1].item()))
+
     episode_count = 0
     total_steps = 0
     while episode_count < int(args_cli.num_rollouts) and total_steps < int(args_cli.max_steps):
         obs_tensor = torch.as_tensor(obs["policy"], device=base_env.device)
         actions = policy(obs_tensor)
         obs, _, terminated, truncated, _ = env.step(actions)
+        xy_now = _get_local_xy(base_env)
+
         done = terminated | truncated
         if bool(done.any().item()):
+            done_ids = torch.nonzero(done, as_tuple=False).flatten().tolist()
+            done_idx_set = set(done_ids)
+            for env_id, xy in enumerate(xy_now):
+                if env_id not in done_idx_set:
+                    current_paths[env_id].append((float(xy[0].item()), float(xy[1].item())))
+            for env_id in done_ids:
+                if len(finished_paths) < int(args_cli.num_rollouts):
+                    finished_paths.append(current_paths[env_id].copy())
+                    if current_goals[env_id] is not None:
+                        finished_goals.append(current_goals[env_id])
+                current_paths[env_id].clear()
+                current_paths[env_id].append((float(xy_now[env_id, 0].item()), float(xy_now[env_id, 1].item())))
+            _assign_fixed_goals(done_ids)
+
+            ref_xy = _get_reference_local_xy(base_env)
+            for env_id, goal in enumerate(ref_xy):
+                current_goals[env_id] = (float(goal[0].item()), float(goal[1].item()))
             done_eps = int(done.to(torch.int32).sum().item())
             episode_count += done_eps
             print(f"[INFO] Completed rollouts: {episode_count}/{args_cli.num_rollouts}")
+        else:
+            for env_id, xy in enumerate(xy_now):
+                current_paths[env_id].append((float(xy[0].item()), float(xy[1].item())))
         total_steps += 1
 
     env.close()
+    plot_path = _plot_xy_rollouts(
+        output_dir,
+        env_cfg,
+        finished_paths[: int(args_cli.num_rollouts)],
+        finished_goals[: int(args_cli.num_rollouts)],
+    )
+    if plot_path is not None:
+        print(f"[INFO] XY trajectory plot: {plot_path}")
     print(f"[INFO] Finished. Recorded up to {min(episode_count, int(args_cli.num_rollouts))} rollout videos in: {video_dir}")
 
 
