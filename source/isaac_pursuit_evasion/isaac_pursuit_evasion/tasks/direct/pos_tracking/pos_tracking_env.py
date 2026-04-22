@@ -36,6 +36,7 @@ DONE_REASON_LABELS = {
     3: "out_of_bounds",
     4: "timeout",
     5: "invalid_state",
+    6: "pillar_collision",
 }
 
 
@@ -347,12 +348,13 @@ class PosTrackingEnv(DirectRLEnv):
         pos_local = self._robot.data.root_pos_w - env_origins
         crash = self._crash_mask(pos_local)
         out_of_bounds = self._out_of_bounds_mask(pos_local)
+        pillar_collision = self._pillar_collision_mask(pos_local)
         invalid = ~torch.isfinite(self._robot.data.root_state_w).all(dim=-1)
 
         success = self._update_success_flags(pos_local)
         self._last_success = success
 
-        terminated = crash | out_of_bounds | invalid
+        terminated = crash | out_of_bounds | pillar_collision | invalid
         if self.cfg.terminate_on_success:
             terminated = terminated | success
 
@@ -364,6 +366,7 @@ class PosTrackingEnv(DirectRLEnv):
         done_reason[out_of_bounds] = 3
         done_reason[timeout] = 4
         done_reason[invalid] = 5
+        done_reason[pillar_collision] = 6
         self._last_done_reason = done_reason
 
         return terminated, truncated
