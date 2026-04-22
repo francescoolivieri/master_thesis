@@ -3,8 +3,9 @@ Numpy-backend parity check for the DGPPO update-time helpers.
 
 This mirrors the JAX reference exactly (reverse scan with a growing rolling
 buffer of "next values"), and is used as a ground truth for the torch port
-in ``train_dgppo.py``. All checks in ``run_update_fixture_parity`` should
-PASS against the bundled ``update_fixture.npz``.
+in ``dgppo_losses.py`` / ``dgppo_parity_torch.py``. All checks in
+``run_update_fixture_parity`` should PASS against the bundled
+``update_fixture.npz``.
 """
 
 import argparse
@@ -15,7 +16,7 @@ import numpy as np
 def compute_dec_ocp_gae(Tah_hs, T_l, Tp1ah_Vh, Tp1_Vl, disc_gamma, gae_lambda, discount_to_max=True):
     """
     Decomposed-OCP GAE target for both the constraint value ``Vh`` and the
-    reward value ``Vl``. See the torch port in ``train_dgppo.py`` for the
+    reward value ``Vl``. See the torch port in ``dgppo_losses.py`` for the
     full docstring of shapes and semantics.
     """
     B, T, A, NH = Tah_hs.shape
@@ -85,7 +86,7 @@ def compute_dec_ocp_gae(Tah_hs, T_l, Tp1ah_Vh, Tp1_Vl, disc_gamma, gae_lambda, d
 
 
 def compute_cbf_advantages(bT_Ql, bT_Vl, bTah_Vh, bTp1ah_Vh, alpha, cbf_eps, cbf_weight):
-    """CBF-based PPO advantage. See ``train_dgppo.py`` for details."""
+    """CBF-based PPO advantage. See ``dgppo_losses.py`` for details."""
     bT_Al_raw = bT_Ql - bT_Vl
     bT_Al_norm = (bT_Al_raw - bT_Al_raw.mean(axis=1, keepdims=True)) / (
         bT_Al_raw.std(axis=1, keepdims=True) + 1e-8

@@ -78,7 +78,7 @@ parser.add_argument(
     "--algorithm",
     type=str,
     default="PPO",
-    choices=["AMP", "PPO", "IPPO", "MAPPO"],
+    choices=["AMP", "PPO", "IPPO", "MAPPO", "DGPPO"],
     help="The RL algorithm used for training the skrl agent.",
 )
 parser.add_argument("--wandb-name", type=str, help="Override WandB run name (agent.agent.experiment.wandb_kwargs.name).")
@@ -200,6 +200,7 @@ import source.isaac_pursuit_evasion.isaac_pursuit_evasion.tasks.direct  # noqa: 
 from source.isaac_pursuit_evasion.isaac_pursuit_evasion.tasks.direct.pos_tracking.pos_tracking_env import (
     DONE_REASON_LABELS,
 )
+from source.isaac_pursuit_evasion.isaac_pursuit_evasion.nn.dgppo_isaaclab import run_dgppo_training
 
 
 class PerformanceTracker:
@@ -1205,6 +1206,29 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             fps=fps_guess,
             check_interval_sec=max(5.0, video_interval_steps * (step_dt or 0.0) if video_interval_steps else 30.0),
         )
+
+    if algorithm == "dgppo":
+        run_failed = False
+        try:
+            print("Obs space:", env.single_observation_space, "Action space:", env.single_action_space)
+            total_timesteps = int(agent_cfg.get("trainer", {}).get("timesteps", 0))
+            if total_timesteps <= 0:
+                raise ValueError("DGPPO requires trainer.timesteps > 0 in the agent config.")
+            run_dgppo_training(
+                env=env,
+                base_env=base_env,
+                agent_cfg=agent_cfg,
+                log_dir=log_dir,
+                total_timesteps=total_timesteps,
+                checkpoint_path=resume_path,
+            )
+        except Exception:
+            run_failed = True
+            raise
+        finally:
+            wandb_bridge.finish(exit_code=1 if run_failed else 0)
+            env.close()
+        return
 
     # configure and instantiate the skrl runner
     # https://skrl.readthedocs.io/en/latest/api/utils/runner.html
