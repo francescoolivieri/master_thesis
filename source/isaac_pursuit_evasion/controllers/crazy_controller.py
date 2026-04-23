@@ -241,13 +241,13 @@ class CrazyfliePIDController:
             k_eta = float(getattr(self.drone_cfg, "k_eta", 0.0))
             omega_max = float(getattr(self.drone_cfg, "motor_speed_max", getattr(self.drone_cfg, "omega_max", 0.0)))
             if k_eta > 0.0 and omega_max > 0.0 and thrust_cmd_max > 0.0:
-                thrust_max = 4.0 * k_eta * omega_max**2
+                thrust_max = float(getattr(self.drone_cfg, "thrust_max", 0.0)) or 4.0 * k_eta * omega_max**2
                 thrust_cmd_scale = thrust_max / thrust_cmd_max
         self.thrust_cmd_scale = float(thrust_cmd_scale) if thrust_cmd_scale is not None else 1.0
         self.vel_thrust_scale = float(params.get("vel_thrust_scale", params.get("thrust_scale", 1000.0)))
 
-        self._thrust_base_from_params = "thrust_base" in params or "thrustBase" in params
-        thrust_base_cmd = params.get("thrust_base", params.get("thrustBase", None))
+        self._thrust_base_from_params = "thrust_base_cmd" in params or "thrustBase" in params
+        thrust_base_cmd = params.get("thrust_base_cmd", params.get("thrustBase", None))
         if thrust_base_cmd is None:
             thrust_base_cmd = (self.mass.item() * 9.81) / max(self.thrust_cmd_scale, 1e-6)
         self.thrust_base_cmd = float(thrust_base_cmd)

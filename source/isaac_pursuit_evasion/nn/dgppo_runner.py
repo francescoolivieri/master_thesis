@@ -38,12 +38,22 @@ class DGPPORunner:
     ``agent_cfg`` dict (same shape as :file:`skrl_dgppo_cfg.yaml`).
     """
 
-    def __init__(self, env, agent_cfg: Mapping[str, Any]) -> None:
+    def __init__(self, env, *args) -> None:
+        if len(args) == 1:
+            det_env = env
+            agent_cfg = args[0]
+        elif len(args) == 2:
+            det_env, agent_cfg = args
+        else:
+            raise TypeError("DGPPORunner expects (env, agent_cfg) or (env, det_env, agent_cfg)")
         self.env = env
+        self.det_env = det_env
         self.cfg = dict(agent_cfg)
 
         base_env = env.unwrapped if hasattr(env, "unwrapped") else env
+        det_base_env = det_env.unwrapped if hasattr(det_env, "unwrapped") else det_env
         env_accessor = EnvAccessor(base_env)
+        det_env_accessor = EnvAccessor(det_base_env)
         device = torch.device(getattr(env, "device", getattr(base_env, "device", "cpu")))
 
         # Shapes come from the env (the agent has no prior knowledge of the env).
@@ -103,6 +113,8 @@ class DGPPORunner:
             policy=policy,
             critic=critic,
             env_accessor=env_accessor,
+            det_env=det_env,
+            det_env_accessor=det_env_accessor,
             graph_layout=layout,
             cfg=agent_hparams,
             observation_space=getattr(env, "single_observation_space", getattr(env, "observation_space", None)),
@@ -122,3 +134,11 @@ class DGPPORunner:
 
     def run(self) -> None:
         self.trainer.train()
+
+    def close(self) -> None:
+        if self.det_env is self.env:
+            return
+        try:
+            self.det_env.close()
+        except Exception:
+            pass

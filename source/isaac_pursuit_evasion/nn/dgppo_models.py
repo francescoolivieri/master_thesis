@@ -388,7 +388,23 @@ class DGPPOCritic(nn.Module):
         filtering with a hard-coded ``n_agents``). Splitting explicitly keeps
         their semantics intact and avoids silent shape bugs.
         """
-        # Run the full GNN once on the batched graph.
+        # Fast path used by the default IsaacLab setup (no recurrent critic):
+        # keep all operations batched and avoid the Python per-env loop.
+        if rnn_state is None and getattr(head, "rnn", None) is None:
+            per_agent = head.gnn(graph, node_type=0, n_type=n_agents)  # (E, n_agents, gnn_out)
+            if isinstance(head, RStateFn):
+                x = per_agent.mean(dim=1)  # (E, gnn_out)
+                x = head.mlp(x)            # (E, hid)
+                v = head.value_out(x).unsqueeze(1)  # (E, 1, n_out)
+                return v, None
+
+            E = per_agent.shape[0]
+            x = per_agent.reshape(E * n_agents, -1)
+            x = head.mlp(x).reshape(E, n_agents, -1)
+            v = head.value_out(x)  # (E, n_agents, n_out)
+            return v, None
+
+        # Fallback for recurrent critics: preserve sub-graph semantics exactly.
         per_agent = head.gnn(graph, node_type=0, n_type=n_agents)  # (E, n_agents, gnn_out)
         E = per_agent.shape[0]
 
@@ -402,6 +418,11 @@ class DGPPOCritic(nn.Module):
                 start = e * x.shape[0] if isinstance(head, DecStateFn) else e
                 stride = x.shape[0] if isinstance(head, DecStateFn) else 1
                 rs_e = rnn_state[:, start:start + stride]
+            elif getattr(head, "rnn", None) is not None:
+                # The caller may run value inference with no recurrent carry
+                # (e.g. bootstrap/value-only paths). Initialize a zero carry
+                # for this sub-graph so RNN-enabled critics remain usable.
+                rs_e = head.rnn.initialize_carry(n_agents=x.shape[0], device=x.device)
             if isinstance(head, RStateFn):
                 x = x.mean(dim=0, keepdim=True)  # (1, gnn_out)
                 x = head.mlp(x)

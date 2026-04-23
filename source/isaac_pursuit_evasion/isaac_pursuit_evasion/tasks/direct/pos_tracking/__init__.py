@@ -48,3 +48,14 @@ gym.register(
         "skrl_dgppo_cfg_entry_point": f"{agents.__name__}:skrl_dgppo_cfg.yaml",
     },
 )
+
+gym.register(
+    id="PosTracking-RL-velocity-DGPPO-v0",
+    entry_point=f"{__name__}.pos_tracking_env:PosTrackingEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.pos_tracking_env_cfg:pos_tracking_velocity_cfg",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+        "skrl_dgppo_cfg_entry_point": f"{agents.__name__}:skrl_dgppo_cfg.yaml",
+    },
+)

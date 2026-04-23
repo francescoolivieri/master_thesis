@@ -411,6 +411,7 @@ def compute_cbf_advantages(
     alpha: float,
     cbf_eps: float,
     cbf_weight: float,
+    dt: float = 0.03,
     cbf_scale: Optional[float] = None,
 ) -> dict[str, torch.Tensor]:
     """
@@ -429,8 +430,7 @@ def compute_cbf_advantages(
     )
     bTa_Al = bT_Al_norm[:, :, None].expand(-1, -1, bTah_Vh.shape[2])
 
-    # Discrete CBF derivative: (V_{t+1} - V_t) / dt + alpha * V_t 
-    dt = 0.03  # self.env.dt
+    # Discrete CBF derivative: (V_{t+1} - V_t) / dt + alpha * V_t.
     bTah_cbf_deriv = (bTp1ah_Vh[:, 1:] - bTah_Vh) / dt + alpha * bTah_Vh
     bTah_Acbf = torch.clamp(bTah_cbf_deriv + cbf_eps, min=0.0)
     

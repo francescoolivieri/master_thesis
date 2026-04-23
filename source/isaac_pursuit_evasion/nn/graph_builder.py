@@ -27,7 +27,7 @@ from typing import Optional
 
 import torch
 
-from .gnn import EdgeBlock, GraphData
+from .gnn import GraphData
 
 
 AGENT_TYPE = 0
@@ -105,51 +105,22 @@ def _make_node_features(
     return nodes, states, type_ids
 
 
-def _edge_blocks_for_env(
-    agent_state: torch.Tensor,        # (A, S)
-    goal_state: torch.Tensor,         # (G, S) with G == A (one goal per agent)
-    obs_state: torch.Tensor,          # (O, S)
-    *,
-    obs_radius: float,
-    agent_ids: torch.Tensor,          # (A,)
-    goal_ids: torch.Tensor,           # (G,)
-    obs_ids: torch.Tensor,            # (O,)
-    self_loops_in_agent_block: bool = False,
-) -> list[EdgeBlock]:
-    """Build the three canonical edge blocks (A-A, A-G, A-O) for one env.
-
-    Mirrors ``dgppo/env/mpe/mpe_target.py::edge_blocks``: distance-gated
-    connectivity for A-A and A-O, and a one-to-one diagonal matching for A-G.
-    """
-    A = agent_state.shape[0]
-    O = obs_state.shape[0]
-    device = agent_state.device
-
-    # A - A
-    a_pos = agent_state[:, :2]
-    dist_aa = torch.cdist(a_pos, a_pos)
-    aa_mask = dist_aa < obs_radius
-    if not self_loops_in_agent_block:
-        aa_mask = aa_mask & ~torch.eye(A, dtype=torch.bool, device=device)
-    aa_feats = agent_state[:, None, :] - agent_state[None, :, :]  # (A, A, S)
-    aa = EdgeBlock(aa_feats, aa_mask, agent_ids, agent_ids)
-
-    # A - G (identity matching along diagonal)
-    ag_feats = torch.zeros((A, A, agent_state.shape[1]), dtype=agent_state.dtype, device=device)
-    diag = torch.arange(A, device=device)
-    ag_feats[diag, diag, :] = agent_state - goal_state
-    ag_mask = torch.eye(A, dtype=torch.bool, device=device)
-    ag = EdgeBlock(ag_feats, ag_mask, agent_ids, goal_ids)
-
-    # A - O
-    if O > 0:
-        o_pos = obs_state[:, :2]
-        dist_ao = torch.cdist(a_pos, o_pos)
-        ao_mask = dist_ao < obs_radius
-        ao_feats = agent_state[:, None, :] - obs_state[None, :, :]
-        ao = EdgeBlock(ao_feats, ao_mask, agent_ids, obs_ids)
-        return [aa, ag, ao]
-    return [aa, ag]
+def _flatten_edge_block_batched(
+    edge_feats: torch.Tensor,   # (E, R, S, F)
+    edge_mask: torch.Tensor,    # (E, R, S)
+    recv_ids: torch.Tensor,     # (E, R)
+    send_ids: torch.Tensor,     # (E, S)
+    pad_ids: torch.Tensor,      # (E,)
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Flatten a batched dense edge block and route masked edges to pad ids."""
+    E, R, S, F = edge_feats.shape
+    recv_grid = recv_ids[:, :, None].expand(E, R, S)
+    send_grid = send_ids[:, None, :].expand(E, R, S)
+    pad_grid = pad_ids[:, None, None].expand(E, R, S)
+    recv_flat = torch.where(edge_mask, recv_grid, pad_grid).reshape(-1)
+    send_flat = torch.where(edge_mask, send_grid, pad_grid).reshape(-1)
+    feats_flat = edge_feats.reshape(E * R * S, F)
+    return feats_flat, recv_flat, send_flat
 
 
 def build_graph_data(
@@ -195,35 +166,43 @@ def build_graph_data(
     local_obs_ids = torch.arange(O, device=device) + 2 * A
     local_pad_id = N_per - 1
 
-    edge_feats_all = []
-    recv_all = []
-    send_all = []
-    edges_per_env = []
+    env_offsets = (torch.arange(E, device=device) * N_per).unsqueeze(1)
+    agent_ids = local_agent_ids.unsqueeze(0) + env_offsets
+    goal_ids = local_goal_ids.unsqueeze(0) + env_offsets
+    obs_ids = local_obs_ids.unsqueeze(0) + env_offsets
+    pad_ids = (local_pad_id + env_offsets.squeeze(1)).long()
 
-    for e in range(E):
-        offset = e * N_per
-        agent_ids = local_agent_ids + offset
-        goal_ids = local_goal_ids + offset
-        obs_ids = local_obs_ids + offset
-        pad_id = local_pad_id + offset
+    # A - A
+    a_pos = agent_state[..., :2]
+    dist_aa = torch.cdist(a_pos, a_pos)
+    aa_mask = dist_aa < obs_radius
+    aa_mask = aa_mask & ~torch.eye(A, dtype=torch.bool, device=device).unsqueeze(0)
+    aa_feats = agent_state[:, :, None, :] - agent_state[:, None, :, :]
+    aa_f, aa_r, aa_s = _flatten_edge_block_batched(aa_feats, aa_mask, agent_ids, agent_ids, pad_ids)
 
-        blocks = _edge_blocks_for_env(
-            agent_state[e],
-            goal_state[e],
-            obs_state[e],
-            obs_radius=obs_radius,
-            agent_ids=agent_ids,
-            goal_ids=goal_ids,
-            obs_ids=obs_ids,
-        )
-        n_e = 0
-        for block in blocks:
-            feats, recvs, sends = block.make_edges(pad_id=pad_id)
-            edge_feats_all.append(feats)
-            recv_all.append(recvs)
-            send_all.append(sends)
-            n_e += feats.shape[0]
-        edges_per_env.append(n_e)
+    # A - G (identity)
+    ag_feats = torch.zeros((E, A, A, S), dtype=agent_state.dtype, device=device)
+    diag = torch.arange(A, device=device)
+    ag_feats[:, diag, diag, :] = agent_state - goal_state
+    ag_mask = torch.eye(A, dtype=torch.bool, device=device).unsqueeze(0).expand(E, -1, -1)
+    ag_f, ag_r, ag_s = _flatten_edge_block_batched(ag_feats, ag_mask, agent_ids, goal_ids, pad_ids)
+
+    edge_feats_all = [aa_f, ag_f]
+    recv_all = [aa_r, ag_r]
+    send_all = [aa_s, ag_s]
+    edges_per_env = A * A + A * A
+
+    # A - O
+    if O > 0:
+        o_pos = obs_state[..., :2]
+        dist_ao = torch.cdist(a_pos, o_pos)
+        ao_mask = dist_ao < obs_radius
+        ao_feats = agent_state[:, :, None, :] - obs_state[:, None, :, :]
+        ao_f, ao_r, ao_s = _flatten_edge_block_batched(ao_feats, ao_mask, agent_ids, obs_ids, pad_ids)
+        edge_feats_all.append(ao_f)
+        recv_all.append(ao_r)
+        send_all.append(ao_s)
+        edges_per_env += A * O
 
     nodes_flat = nodes_pe.reshape(E * N_per, -1)
     states_flat = states_pe.reshape(E * N_per, -1)
@@ -243,7 +222,7 @@ def build_graph_data(
         send_flat = torch.zeros(0, dtype=torch.long, device=device)
 
     n_nodes = torch.full((E,), N_per, dtype=torch.long, device=device)
-    n_edges = torch.tensor(edges_per_env, dtype=torch.long, device=device)
+    n_edges = torch.full((E,), edges_per_env, dtype=torch.long, device=device)
 
     return GraphData(
         n_nodes=n_nodes,

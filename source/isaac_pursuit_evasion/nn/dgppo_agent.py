@@ -116,6 +116,8 @@ class DGPPOAgent:
         policy: DGPPOPolicy,
         critic: DGPPOCritic,
         env_accessor: EnvAccessor,
+        det_env: Any,
+        det_env_accessor: EnvAccessor,
         graph_layout: GraphLayout,
         cfg: Mapping[str, Any],
         observation_space,
@@ -125,6 +127,8 @@ class DGPPOAgent:
         self.policy = policy.to(device)
         self.critic = critic.to(device)
         self.env = env_accessor
+        self.det_env = det_env
+        self.det_env_accessor = det_env_accessor
         self.layout = graph_layout
         self.cfg = dict(cfg)
         self.observation_space = observation_space
@@ -141,6 +145,7 @@ class DGPPOAgent:
         self.alpha: float = float(cfg.get("alpha", 10.0))
         self.cbf_eps: float = float(cfg.get("cbf_eps", 1e-2))
         self.cbf_weight: float = float(cfg.get("cbf_weight", 1.0))
+        self.cbf_schedule: bool = bool(cfg.get("cbf_schedule", True))
         self.grad_clip: float = float(cfg.get("grad_norm_clip", 2.0))
         self.entropy_scale: float = float(cfg.get("entropy_loss_scale", 0.0))
         self.vl_loss_scale: float = float(cfg.get("vl_loss_scale", 1.0))
@@ -163,9 +168,12 @@ class DGPPOAgent:
             vh_params += list(self.critic.vh_head.rnn.parameters())
         self._vl_opt = torch.optim.Adam(vl_params, lr=self.lr_vl)
         self._vh_opt = torch.optim.Adam(vh_params, lr=self.lr_vh)
+        self._vl_grad_params = vl_params
+        self._vh_grad_params = vh_params
 
         # Rollout memory (allocated in :meth:`init`).
         self.memory: Optional[DGPPORolloutMemory] = None
+        self.det_memory: Optional[DGPPORolloutMemory] = None
 
         # Running-mode flag (mirrors skrl).
         self.training: bool = True
@@ -176,6 +184,7 @@ class DGPPOAgent:
         self._writer = None
         self._checkpoint_interval: int = 0
         self._write_interval: int = 0
+        self._total_timesteps: int = 0
 
         # skrl trainers inspect ``agent.value`` when running eval helpers.
         # The helper in ``train.py`` expects ``value.act(inputs, role="value")``
@@ -195,9 +204,12 @@ class DGPPOAgent:
         self._last_value_l: Optional[torch.Tensor] = None
         self._last_value_h: Optional[torch.Tensor] = None
         self._last_rnn_state: Optional[torch.Tensor] = None
+        self._last_mean_action: Optional[torch.Tensor] = None
 
         # Rollout-local RNN carry (one per agent across the env batch).
         self._rnn_state: Optional[torch.Tensor] = None
+        self._stoch_env_ids: Optional[torch.Tensor] = None
+        self._det_env_ids: Optional[torch.Tensor] = None
 
     # ------------------------------------------------------------------
     # skrl-compatible lifecycle
@@ -233,6 +245,7 @@ class DGPPOAgent:
         total_timesteps = 0
         if trainer_cfg is not None:
             total_timesteps = int(trainer_cfg.get("timesteps", 0))
+        self._total_timesteps = total_timesteps
 
         write_interval = exp_cfg.get("write_interval", "auto")
         checkpoint_interval = exp_cfg.get("checkpoint_interval", "auto")
@@ -242,9 +255,30 @@ class DGPPOAgent:
         )
 
         # Allocate the rollout memory now that we know the env shape.
+        if self.env.num_envs < 2 or (self.env.num_envs % 2) != 0:
+            raise ValueError(
+                f"DGPPO split rollout requires an even num_envs >= 2, got {self.env.num_envs}"
+            )
+        split = self.env.num_envs // 2
+        self._det_env_ids = torch.arange(0, split, device=self.device, dtype=torch.long)
+        self._stoch_env_ids = torch.arange(split, self.env.num_envs, device=self.device, dtype=torch.long)
+
         self.memory = DGPPORolloutMemory(
             rollout_length=self.rollouts,
-            num_envs=self.env.num_envs,
+            num_envs=int(self._stoch_env_ids.numel()),
+            n_agents=self.layout.n_agents,
+            n_obs=self.layout.n_obs,
+            state_dim=self.layout.state_dim,
+            action_dim=int(self.action_space.shape[-1]),
+            n_constraints=self.layout.n_obs if False else self.env.n_constraints,
+            device=self.device,
+            use_rnn=self.policy.backbone.use_rnn,
+        )
+        # Deterministic rollout stream used for Vh targets (mirrors the
+        # reference update that trains Vh on a deterministic-policy rollout).
+        self.det_memory = DGPPORolloutMemory(
+            rollout_length=self.rollouts,
+            num_envs=int(self._det_env_ids.numel()),
             n_agents=self.layout.n_agents,
             n_obs=self.layout.n_obs,
             state_dim=self.layout.state_dim,
@@ -269,6 +303,21 @@ class DGPPOAgent:
         if value is None:
             return 0
         return int(value)
+
+    def _cbf_scale(self, timestep: int) -> float:
+        """Mirror the reference piecewise CBF schedule when enabled."""
+        if not self.cbf_schedule:
+            return self.cbf_weight
+        if self._total_timesteps <= 0:
+            return self.cbf_weight
+        scale = self.cbf_weight
+        half = int(self._total_timesteps * 0.5)
+        three_quarter = int(self._total_timesteps * 0.75)
+        if timestep >= half:
+            scale *= 2.0
+        if timestep >= three_quarter:
+            scale *= 2.0
+        return scale
 
     def set_running_mode(self, mode: str) -> None:
         assert mode in ("train", "eval")
@@ -338,6 +387,7 @@ class DGPPOAgent:
         self._last_log_prob = log_prob.detach()
         self._last_value_l = vl.detach()
         self._last_value_h = vh.detach()
+        self._last_mean_action = mean_action.detach()
         if self.policy.backbone.use_rnn:
             self._last_rnn_state = (
                 self._rnn_state.detach() if self._rnn_state is not None else None
@@ -346,9 +396,15 @@ class DGPPOAgent:
 
         # skrl expects (action, log_prob, outputs_dict). We also stash the
         # deterministic mean for eval-time use (see ``train.py`` line 926).
-        action_flat = action.reshape(self.env.num_envs, -1)
+        assert self._det_env_ids is not None and self._stoch_env_ids is not None
+        action_mixed = action.clone()
+        action_mixed[self._det_env_ids] = mean_action[self._det_env_ids]
+        log_prob_mixed = torch.zeros_like(log_prob)
+        log_prob_mixed[self._stoch_env_ids] = log_prob[self._stoch_env_ids]
+
+        action_flat = action_mixed.reshape(self.env.num_envs, -1)
         mean_flat = mean_action.reshape(self.env.num_envs, -1)
-        return action_flat, log_prob.reshape(self.env.num_envs, -1), {"mean_actions": mean_flat}
+        return action_flat, log_prob_mixed.reshape(self.env.num_envs, -1), {"mean_actions": mean_flat}
 
     def pre_interaction(self, timestep: int, timesteps: int) -> None:
         # Nothing to do; included for skrl lifecycle compatibility.
@@ -367,7 +423,8 @@ class DGPPOAgent:
         timesteps: int,
     ) -> None:
         del states, next_states, infos, timestep, timesteps
-        assert self.memory is not None
+        assert self.memory is not None and self.det_memory is not None
+        assert self._det_env_ids is not None and self._stoch_env_ids is not None
         # Actions arrive flat ``(B, Da)``; reshape to ``(B, A, Da)``.
         B = self.env.num_envs
         A = self.layout.n_agents
@@ -378,17 +435,51 @@ class DGPPOAgent:
         # ``rewards`` may be ``(B,)`` or ``(B, 1)`` depending on wrapper.
         reward = rewards.reshape(B).to(self.device)
 
+        stoch_ids = self._stoch_env_ids
+        det_ids = self._det_env_ids
         self.memory.add(
-            agent_state=self._last_graph_snapshot["agent"],
-            goal_state=self._last_graph_snapshot["goal"],
-            obs_state=self._last_graph_snapshot["obs"],
-            action=action.to(self.device),
-            log_prob=self._last_log_prob.to(self.device) if self._last_log_prob is not None else torch.zeros(B, A, device=self.device),
-            reward=reward,
-            cost=cost.to(self.device),
-            value_l=self._last_value_l if self._last_value_l is not None else torch.zeros(B, device=self.device),
-            value_h=self._last_value_h if self._last_value_h is not None else torch.zeros(B, A, self.env.n_constraints, device=self.device),
-            rnn_state=self._last_rnn_state,
+            agent_state=self._last_graph_snapshot["agent"][stoch_ids],
+            goal_state=self._last_graph_snapshot["goal"][stoch_ids],
+            obs_state=self._last_graph_snapshot["obs"][stoch_ids],
+            action=action[stoch_ids].to(self.device),
+            log_prob=(
+                self._last_log_prob[stoch_ids].to(self.device)
+                if self._last_log_prob is not None
+                else torch.zeros(stoch_ids.numel(), A, device=self.device)
+            ),
+            reward=reward[stoch_ids],
+            cost=cost[stoch_ids].to(self.device),
+            value_l=(
+                self._last_value_l[stoch_ids]
+                if self._last_value_l is not None
+                else torch.zeros(stoch_ids.numel(), device=self.device)
+            ),
+            value_h=(
+                self._last_value_h[stoch_ids]
+                if self._last_value_h is not None
+                else torch.zeros(stoch_ids.numel(), A, self.env.n_constraints, device=self.device)
+            ),
+            rnn_state=None,
+        )
+        self.det_memory.add(
+            agent_state=self._last_graph_snapshot["agent"][det_ids],
+            goal_state=self._last_graph_snapshot["goal"][det_ids],
+            obs_state=self._last_graph_snapshot["obs"][det_ids],
+            action=action[det_ids].to(self.device),
+            log_prob=torch.zeros(det_ids.numel(), A, device=self.device),
+            reward=reward[det_ids],
+            cost=cost[det_ids].to(self.device),
+            value_l=(
+                self._last_value_l[det_ids]
+                if self._last_value_l is not None
+                else torch.zeros(det_ids.numel(), device=self.device)
+            ),
+            value_h=(
+                self._last_value_h[det_ids]
+                if self._last_value_h is not None
+                else torch.zeros(det_ids.numel(), A, self.env.n_constraints, device=self.device)
+            ),
+            rnn_state=None,
         )
 
         # Reset RNN carry for envs that just ended (mirrors the common PPO
@@ -407,18 +498,20 @@ class DGPPOAgent:
 
     def post_interaction(self, timestep: int, timesteps: int) -> None:
         """Drive training, logging, and periodic checkpointing."""
-        assert self.memory is not None
+        assert self.memory is not None and self.det_memory is not None
+        assert self._det_env_ids is not None and self._stoch_env_ids is not None
 
         if self.memory.is_full:
             # Bootstrap values at the terminal step.
             with torch.no_grad():
                 graph, _ = self._build_graph()
                 vl_boot, vh_boot = self._compute_values(graph)
-            self.memory.set_final_values(vl_boot, vh_boot)
-
+            self.memory.set_final_values(vl_boot[self._stoch_env_ids], vh_boot[self._stoch_env_ids])
+            self.det_memory.set_final_values(vl_boot[self._det_env_ids], vh_boot[self._det_env_ids])
             self._update(timestep, timesteps)
 
             self.memory.reset()
+            self.det_memory.reset()
             # Reset RNN carry between rollouts to avoid stale gradients.
             if self.policy.backbone.use_rnn:
                 self._rnn_state = self.policy.initialize_carry(
@@ -438,13 +531,25 @@ class DGPPOAgent:
     def _update(self, timestep: int, timesteps: int) -> None:
         assert self.memory is not None
         mem = self.memory
+        det_mem = self.det_memory
+        assert det_mem is not None
         view = mem.as_bTah_view()
+        det_view = det_mem.as_bTah_view()
 
         # (1) GAE targets for Qh (per-agent, per-head) and Ql (scalar reward).
         Qh, Ql = compute_dec_ocp_gae(
             Tah_hs=view["bTah_hs"],
             T_l=view["bT_l"],
             Tp1ah_Vh=view["bTp1ah_Vh"],
+            Tp1_Vl=view["bTp1_Vl"],
+            disc_gamma=self.gamma,
+            gae_lambda=self.gae_lambda,
+        )
+        # Deterministic rollout target stream for Vh (reference DGPPO logic).
+        Qh_det, _ = compute_dec_ocp_gae(
+            Tah_hs=det_view["bTah_hs"],
+            T_l=det_view["bT_l"],
+            Tp1ah_Vh=det_view["bTp1ah_Vh"],
             Tp1_Vl=view["bTp1_Vl"],
             disc_gamma=self.gamma,
             gae_lambda=self.gae_lambda,
@@ -459,6 +564,8 @@ class DGPPOAgent:
             alpha=self.alpha,
             cbf_eps=self.cbf_eps,
             cbf_weight=self.cbf_weight,
+            dt=self.env.dt,
+            cbf_scale=self._cbf_scale(timestep),
         )
         bTa_A = adv_info["bTa_A"].detach()
         self.track_data("DGPPO/safe_rate", float(adv_info["bTa_is_safe"].float().mean().item()))
@@ -472,10 +579,11 @@ class DGPPOAgent:
             for idx in mem.minibatch_iter(self.mini_batches):
                 info = self._update_minibatch(
                     idx=idx,
-                    Qh=Qh,
+                    Qh_det=Qh_det,
                     Ql=Ql,
                     bTa_A=bTa_A,
                     view=view,
+                    det_view=det_view,
                 )
                 loss_p_acc += info["loss_p"]
                 loss_vl_acc += info["loss_vl"]
@@ -494,10 +602,11 @@ class DGPPOAgent:
         self,
         *,
         idx: torch.Tensor,
-        Qh: torch.Tensor,
+        Qh_det: torch.Tensor,
         Ql: torch.Tensor,
         bTa_A: torch.Tensor,
         view: dict[str, torch.Tensor],
+        det_view: dict[str, torch.Tensor],
     ) -> dict[str, float]:
         """Single PPO minibatch step over one chunk of the ``B`` axis."""
         # Gather the minibatch (axes: B first after ``as_bTah_view``).
@@ -506,7 +615,7 @@ class DGPPOAgent:
         obs_s = view["bTo_obs_state"][idx]
         actions = view["bTa_actions"][idx]           # (b, T, A, Da)
         old_logp = view["bTa_logp"][idx]             # (b, T, A)
-        Qh_mb = Qh[idx]                              # (b, T, A, NH)
+        Qh_det_mb = Qh_det[idx]                      # (b, T, A, NH)
         Ql_mb = Ql[idx]                              # (b, T)
         adv_mb = bTa_A[idx]                          # (b, T, A)
 
@@ -549,24 +658,29 @@ class DGPPOAgent:
         self._vl_opt.zero_grad()
         loss_vl.backward()
         torch.nn.utils.clip_grad_norm_(
-            [p for p in self.critic.vl_gnn.parameters()]
-            + list(self.critic.vl_head.mlp.parameters())
-            + list(self.critic.vl_head.value_out.parameters()),
+            self._vl_grad_params,
             self.grad_clip,
         )
         self._vl_opt.step()
 
         # ---- Critic Vh ----
-        vh, _ = self.critic.get_vh(graph, rnn_state=None, n_agents=A)
+        det_agent_s = det_view["bTa_agent_state"][idx]
+        det_goal_s = det_view["bTa_goal_state"][idx]
+        det_obs_s = det_view["bTo_obs_state"][idx]
+        det_graph = build_graph_data(
+            agent_state=det_agent_s.reshape(BT, A, -1),
+            goal_state=det_goal_s.reshape(BT, A, -1),
+            obs_state=det_obs_s.reshape(BT, det_obs_s.shape[2], -1),
+            obs_radius=self.obs_radius,
+        )
+        vh, _ = self.critic.get_vh(det_graph, rnn_state=None, n_agents=A)
         vh = vh.reshape(b, T, A, -1)
-        loss_vh = self.vh_loss_scale * F.mse_loss(vh, Qh_mb)
+        loss_vh = self.vh_loss_scale * F.mse_loss(vh, Qh_det_mb)
 
         self._vh_opt.zero_grad()
         loss_vh.backward()
         torch.nn.utils.clip_grad_norm_(
-            [p for p in self.critic.vh_gnn.parameters()]
-            + list(self.critic.vh_head.mlp.parameters())
-            + list(self.critic.vh_head.value_out.parameters()),
+            self._vh_grad_params,
             self.grad_clip,
         )
         self._vh_opt.step()

@@ -34,21 +34,21 @@ rnn:
 agent:
   class: DGPPO
 
-  rollouts: 32
-  learning_epochs: 8
+  rollouts: 16
+  learning_epochs: 4
   mini_batches: 8
 
-  discount_factor: 0.99
+  discount_factor: 0.995
   lambda: 0.95
 
   # Separate LRs for policy / Vl / Vh as in dgppo/algo/dgppo.py.
-  lr_policy: 3.0e-04
+  lr_policy: 2.0e-04
   lr_vl: 1.0e-03
   lr_vh: 1.0e-03
 
   # PPO & DGPPO knobs.
   ratio_clip: 0.2
-  grad_norm_clip: 2.0
+  grad_norm_clip: 0.5
   entropy_loss_scale: 1.0e-02
   vl_loss_scale: 1.0
   vh_loss_scale: 1.0
@@ -72,5 +72,5 @@ agent:
 
 trainer:
   class: SequentialTrainer
-  timesteps: 2000000
+  timesteps: 20000
   environment_info: log
