@@ -1,5 +1,7 @@
 import torch
 import time
+import copy
+import dataclasses
 import torch.nn.functional as F
 from typing import Any, Mapping, Optional
 from skrl.agents.torch import Agent, AgentCfg
@@ -14,11 +16,13 @@ class DGPPOAgent(Agent):
         Vl: DGPPOValueNet,
         Vh: DGPPOValueNet,
         env: Any, #remove
-        cfg: AgentCfg, 
+        cfg: AgentCfg | Mapping[str, Any], 
         observation_space,
         action_space,
         device: torch.device,
     ) -> None:        
+        raw_cfg = dict(cfg) if isinstance(cfg, Mapping) else {}
+        skrl_cfg = cfg if isinstance(cfg, AgentCfg) else AgentCfg(experiment=raw_cfg.get("experiment", {}))
         
         super().__init__(
             models={"policy": policy, "Vl": Vl, "Vh": Vh},
@@ -26,10 +30,11 @@ class DGPPOAgent(Agent):
             observation_space=observation_space,
             action_space=action_space,
             device=device,
-            cfg=cfg,
+            cfg=skrl_cfg,
         )
         
         #self.training = False
+        self._dgppo_cfg = raw_cfg
         
         self.policy = policy.to(device)
         self.Vl = Vl.to(device)
@@ -66,35 +71,43 @@ class DGPPOAgent(Agent):
         
         # Setup memory (Note: personalised memory for cleaner code)
         self.memory: Optional[DGPPORolloutMemory] = None
-        self.num_envs = self.cfg.get("num_envs", 1)
+        self.num_envs = self._cfg_get("num_envs", 1)
         self._rnn_state = None
+        self._vl_rnn_state = None
         self._stoch_env_ids = None
         self._det_env_ids = None
         self._last_graph = None
         self._last_log_prob = None
         self._current_Vl = None
         self._current_Vh = None
+        self._current_policy_rnn_state = None
+        self._current_vl_rnn_state = None
         self._current_next_observations = None
+        self._rollout = 0
         
     def init(self, *, trainer_cfg: dict[str, Any] | None = None) -> None:
         """
         Called once by the trainer before the first interaction.
         """
-        super().init(trainer_cfg=trainer_cfg)
+        super().init(trainer_cfg=self._trainer_cfg_for_skrl(trainer_cfg))
         self.enable_models_training_mode(False)
         
         if self.memory is not None:
             return
         
         ###
-        rollout_length = int(self.cfg.get("rollouts", 32))  # from AgentCfg
+        rollout_length = int(self._cfg_get("rollouts", 32))  # from AgentCfg
         n_agents = self.env.num_agents
         layout = self.env.unwrapped.graph_obs_layout
         n_obs = int(layout.get("n_obstacles", 0))
-        state_dim = self.env.state_space.shape[0]
+        state_dim = int(layout["state_dim"])
         action_dim = self.env.action_space.shape[0]
         n_constraints = int(getattr(self.env, "n_constraints", getattr(self.env.unwrapped, "n_constraints", 1)))
         use_rnn = self.policy.use_rnn
+        rnn_cfg = self._cfg_get("rnn", {})
+        rnn_cell = str(rnn_cfg.get("cell", "gru"))
+        rnn_hidden = int(rnn_cfg.get("hidden", 64))
+        rnn_layers = int(rnn_cfg.get("layers", 1))
 
         # Allocate the DGPPO rollout memory now that we know the env shape
         if self.env.num_envs < 2 or (self.env.num_envs % 2) != 0:
@@ -117,12 +130,18 @@ class DGPPOAgent(Agent):
             n_constraints=n_constraints,
             device=self.device,
             use_rnn=use_rnn,
+            rnn_layers=rnn_layers,
+            rnn_hidden=rnn_hidden,
+            rnn_cell=rnn_cell,
         )
 
         # Initial RNN carry for the rollout (B * A agents, regardless of env).
         if self.policy.use_rnn:
             self._rnn_state = self.policy.initialize_carry(
                 n_agents_total=self.env.num_envs * n_agents, device=self.device
+            )
+            self._vl_rnn_state = self.Vl.initialize_carry(
+                n_units=self.env.num_envs, device=self.device
             )
         
      
@@ -142,35 +161,42 @@ class DGPPOAgent(Agent):
         :param timesteps:    Total timesteps.
         :return: (actions (E*A, action_dim), extras dict with log_prob and mean_action).
         """
-        n_agents_total = self.env.num_envs * self.env.num_agents
+        n_agents = self.env.num_agents
 
         
         with torch.no_grad():  #  Saves memory
             graph = self._build_graph(observations, states)
             self._last_graph = graph
+            policy_rnn_in = self._clone_rnn_state(self._rnn_state)
+            vl_rnn_in = self._clone_rnn_state(self._vl_rnn_state)
 
             action, log_prob, mean_action, new_rnn = self.policy.act(
                 graph,
-                rnn_state=self._rnn_state,
-                n_agents_total=n_agents_total,
+                rnn_state=policy_rnn_in,
+                n_agents=n_agents,
                 deterministic=not self.training,  
             )
 
             if self.training:
-                # ?? Shouldn t I store also the rrn states?
-                vl, _ = self.Vl(graph, self._rnn_state, self.env.num_agents)
-                vh, _ = self.Vh(graph, self._rnn_state, self.env.num_agents)
+                vl, new_vl_rnn = self.Vl(graph, vl_rnn_in, n_agents)
+                vh, _ = self.Vh(graph, policy_rnn_in, n_agents)
                 self._current_Vl = vl
                 self._current_Vh = vh
+                self._current_policy_rnn_state = policy_rnn_in
+                self._current_vl_rnn_state = vl_rnn_in
+            else:
+                new_vl_rnn = None
 
 
         # Carry the RNN state forward to the next timestep
         if new_rnn is not None:
             self._rnn_state = new_rnn
+        if new_vl_rnn is not None:
+            self._vl_rnn_state = new_vl_rnn
 
         self._last_log_prob = log_prob
 
-        # Determinstic actions
+        # Deterministic actions
         # action_mixed = action.clone()
         # action_mixed[self._det_env_ids] = mean_action[self._det_env_ids]
         # log_prob_mixed = torch.zeros_like(log_prob)
@@ -193,10 +219,38 @@ class DGPPOAgent(Agent):
         self.policy.train(self.training)   # nn.Module.train()
         self.Vl.train(self.training)
         self.Vh.train(self.training)
+
+    def _cfg_get(self, key: str, default: Any = None) -> Any:
+        return self._dgppo_cfg.get(key, default)
+
+    def _env_dt(self) -> float:
+        env = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
+        if hasattr(env, "dt"):
+            return float(env.dt)
+        if hasattr(env, "step_dt"):
+            return float(env.step_dt)
+        cfg = getattr(env, "cfg", None)
+        sim_cfg = getattr(cfg, "sim", None)
+        if cfg is not None and sim_cfg is not None:
+            return float(sim_cfg.dt) * float(cfg.decimation)
+        raise AttributeError("Unable to infer DGPPO environment dt")
+
+    @staticmethod
+    def _trainer_cfg_for_skrl(trainer_cfg: Any) -> Any:
+        if trainer_cfg is None or dataclasses.is_dataclass(trainer_cfg):
+            return trainer_cfg
+        if not isinstance(trainer_cfg, Mapping):
+            return None
+        fields = [
+            (
+                str(key),
+                Any,
+                dataclasses.field(default_factory=lambda value=value: copy.deepcopy(value)),
+            )
+            for key, value in trainer_cfg.items()
+        ]
+        return dataclasses.make_dataclass("DGPPOTrainerCfg", fields)()
         
-
-    ### CHECK FROM HERE
-
     def record_transition(
         self,
         *,
@@ -289,15 +343,38 @@ class DGPPOAgent(Agent):
                 det_cost=costs_all[self._det_env_ids],
                 det_value_l=value_l_all[self._det_env_ids],
                 det_value_h=value_h_all[self._det_env_ids],
+                stc_rnn_state=self._rnn_state_for_envs(
+                    self._current_policy_rnn_state, self._stoch_env_ids, n_agents
+                ),
+                det_rnn_state=self._rnn_state_for_envs(
+                    self._current_policy_rnn_state, self._det_env_ids, n_agents
+                ),
+                stc_vl_rnn_state=self._vl_rnn_state_for_envs(
+                    self._current_vl_rnn_state, self._stoch_env_ids
+                ),
+                det_vl_rnn_state=self._vl_rnn_state_for_envs(
+                    self._current_vl_rnn_state, self._det_env_ids
+                ),
             )
 
             if self.memory.is_full:
                 with torch.no_grad():
                     next_graph = self._build_graph(next_observations, next_states)
-                    vl_boot, _ = self.Vl(next_graph, self._rnn_state, self.env.num_agents)
-                    vh_boot, _ = self.Vh(next_graph, self._rnn_state, self.env.num_agents)
+                    vl_boot, _ = self.Vl(next_graph, self._vl_rnn_state, self.env.num_agents)
+                    if self.policy.use_rnn:
+                        _, _, _, vh_rnn_state = self.policy.act(
+                            next_graph,
+                            self._current_policy_rnn_state,
+                            self.env.num_agents,
+                            deterministic=True,
+                        )
+                    else:
+                        vh_rnn_state = None
+                    vh_boot, _ = self.Vh(next_graph, vh_rnn_state, self.env.num_agents)
                 self.memory.set_final_values("stc", vl_boot[self._stoch_env_ids], vh_boot[self._stoch_env_ids])
                 self.memory.set_final_values("det", vl_boot[self._det_env_ids], vh_boot[self._det_env_ids])
+
+            self._reset_done_rnn_states(terminated=terminated, truncated=truncated)
             
         
                              
@@ -364,7 +441,7 @@ class DGPPOAgent(Agent):
             alpha=self.alpha,
             cbf_eps=self.cbf_eps,
             cbf_weight=self.cbf_weight,
-            dt=self.env.dt,
+            dt=self._env_dt(),
             cbf_scale=self._cbf_scale(timestep=timestep, timesteps=timesteps),
         )
         bTa_A = adv_info["bTa_A"].detach()
@@ -429,24 +506,33 @@ class DGPPOAgent(Agent):
     
         b, T, A, _ = actions.shape
         BT = b * T
-
-        # Flatten (B, T) -> (BT) sub-graphs and rebuild a single batched graph.
-        graph = build_graph_data(
-            agent_state=agent_s.reshape(BT, A, -1),
-            goal_state=goal_s.reshape(BT, A, -1),
-            obs_state=obs_s.reshape(BT, obs_s.shape[2], -1),
-            obs_radius=self.obs_radius,
-        )
-        n_agents_total = BT * A
+        graph = None
+        if (not self.policy.use_rnn) or (not self.Vl.use_rnn):
+            graph = build_graph_data(
+                agent_state=agent_s.reshape(BT, A, -1),
+                goal_state=goal_s.reshape(BT, A, -1),
+                obs_state=obs_s.reshape(BT, obs_s.shape[2], -1),
+                obs_radius=self.obs_radius,
+            )
 
         # ---- Policy ----
-        log_prob, entropy, _ = self.policy.evaluate(
-            graph,
-            action=actions.reshape(n_agents_total, -1),
-            rnn_state=None,
-            n_agents_total=n_agents_total,
-        )
-        log_prob = log_prob.reshape(b, T, A)
+        if self.policy.use_rnn:
+            log_prob, entropy = self._evaluate_policy_sequence(
+                agent_s=agent_s,
+                goal_s=goal_s,
+                obs_s=obs_s,
+                actions=actions,
+                rnn_states=view["bTa_rnn_states"][idx],
+            )
+        else:
+            assert graph is not None
+            log_prob, entropy, _ = self.policy.evaluate(
+                graph,
+                action=actions.reshape(BT, A, -1),
+                rnn_state=None,
+                n_agents=A,
+            )
+            log_prob = log_prob.reshape(b, T, A)
         ratio = torch.exp(log_prob - old_logp.detach())
         surrogate = compute_policy_surrogate(ratio, adv_mb, self.clip_eps)
         loss_policy = surrogate["loss_policy"]
@@ -459,8 +545,17 @@ class DGPPOAgent(Agent):
         self._policy_opt.step()
 
         # ---- Critic Vl ----
-        vl, _ = self.Vl(graph, None, A)
-        vl = vl.reshape(b, T)
+        if self.Vl.use_rnn:
+            vl = self._evaluate_vl_sequence(
+                agent_s=agent_s,
+                goal_s=goal_s,
+                obs_s=obs_s,
+                rnn_states=view["bT_vl_rnn_states"][idx],
+            )
+        else:
+            assert graph is not None
+            vl, _ = self.Vl(graph, None, A)
+            vl = vl.reshape(b, T)
         loss_vl = self.vl_loss_scale * F.mse_loss(vl, Ql_mb)
 
         self._vl_opt.zero_grad(set_to_none=True)
@@ -475,14 +570,22 @@ class DGPPOAgent(Agent):
         det_agent_s = det_view["bTa_agent_state"][idx]
         det_goal_s = det_view["bTa_goal_state"][idx]
         det_obs_s = det_view["bTo_obs_state"][idx]
-        det_graph = build_graph_data(
-            agent_state=det_agent_s.reshape(BT, A, -1),
-            goal_state=det_goal_s.reshape(BT, A, -1),
-            obs_state=det_obs_s.reshape(BT, det_obs_s.shape[2], -1),
-            obs_radius=self.obs_radius,
-        )
-        vh, _ = self.Vh(det_graph, None, A)
-        vh = vh.reshape(b, T, A, -1)
+        if self.Vh.use_rnn:
+            vh = self._evaluate_vh_sequence(
+                agent_s=det_agent_s,
+                goal_s=det_goal_s,
+                obs_s=det_obs_s,
+                rnn_states=det_view["bTa_rnn_states"][idx],
+            )
+        else:
+            det_graph = build_graph_data(
+                agent_state=det_agent_s.reshape(BT, A, -1),
+                goal_state=det_goal_s.reshape(BT, A, -1),
+                obs_state=det_obs_s.reshape(BT, det_obs_s.shape[2], -1),
+                obs_radius=self.obs_radius,
+            )
+            vh, _ = self.Vh(det_graph, None, A)
+            vh = vh.reshape(b, T, A, -1)
         loss_vh = self.vh_loss_scale * F.mse_loss(vh, Qh_det_mb)
 
         self._vh_opt.zero_grad(set_to_none=True)
@@ -499,27 +602,184 @@ class DGPPOAgent(Agent):
             "loss_vh": float(loss_vh.item()),
             "clip_frac": float(surrogate["clip_frac"].item()),
         }
+
+    @staticmethod
+    def _clone_rnn_state(rnn_state: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        return None if rnn_state is None else rnn_state.detach().clone()
+
+    def _rnn_state_for_envs(
+        self,
+        rnn_state: Optional[torch.Tensor],
+        env_ids: torch.Tensor,
+        n_agents: int,
+    ) -> Optional[torch.Tensor]:
+        """Select policy RNN carries for env ids as ``[B, A, L, C, H]``."""
+        if rnn_state is None:
+            return None
+        L, _, C, H = rnn_state.shape
+        state = rnn_state.reshape(L, self.env.num_envs, n_agents, C, H)
+        return state[:, env_ids].permute(1, 2, 0, 3, 4).contiguous()
+
+    def _vl_rnn_state_for_envs(
+        self,
+        rnn_state: Optional[torch.Tensor],
+        env_ids: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Select centralized Vl RNN carries for env ids as ``[B, L, C, H]``."""
+        if rnn_state is None:
+            return None
+        return rnn_state[:, env_ids].permute(1, 0, 2, 3).contiguous()
+
+    def _reset_done_rnn_states(
+        self,
+        *,
+        terminated: torch.Tensor,
+        truncated: torch.Tensor,
+    ) -> None:
+        """Zero recurrent carries for envs that IsaacLab reset after this step."""
+        if self._rnn_state is None and self._vl_rnn_state is None:
+            return
+
+        done = (terminated.reshape(-1) | truncated.reshape(-1)).to(device=self.device)
+        env_ids = done.nonzero(as_tuple=False).flatten()
+        if env_ids.numel() == 0:
+            return
+
+        if self._rnn_state is not None:
+            L, _, C, H = self._rnn_state.shape
+            state = self._rnn_state.reshape(L, self.env.num_envs, self.env.num_agents, C, H)
+            state[:, env_ids] = 0.0
+            self._rnn_state = state.reshape(L, self.env.num_envs * self.env.num_agents, C, H)
+
+        if self._vl_rnn_state is not None:
+            self._vl_rnn_state[:, env_ids] = 0.0
+
+    def _evaluate_policy_sequence(
+        self,
+        *,
+        agent_s: torch.Tensor,
+        goal_s: torch.Tensor,
+        obs_s: torch.Tensor,
+        actions: torch.Tensor,
+        rnn_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Evaluate policy log-prob/entropy by scanning chunks from zero carry.
+
+        This mirrors the reference DGPPO PPO update: each recurrent chunk is
+        re-unrolled with the current policy parameters, rather than treating
+        rollout-time hidden states as independent inputs.
+        """
+        del rnn_states
+        b, T, A, _ = actions.shape
+        log_probs = []
+        entropies = []
+        chunk_len = max(1, self.rnn_step)
+
+        for start in range(0, T, chunk_len):
+            stop = min(start + chunk_len, T)
+            rnn_state = self.policy.initialize_carry(n_agents_total=b * A, device=self.device)
+            for t in range(start, stop):
+                graph = build_graph_data(
+                    agent_state=agent_s[:, t],
+                    goal_state=goal_s[:, t],
+                    obs_state=obs_s[:, t],
+                    obs_radius=self.obs_radius,
+                )
+                log_prob, entropy, rnn_state = self.policy.evaluate(
+                    graph,
+                    action=actions[:, t],
+                    rnn_state=rnn_state,
+                    n_agents=A,
+                )
+                log_probs.append(log_prob)
+                entropies.append(entropy)
+
+        return torch.stack(log_probs, dim=1), torch.stack(entropies, dim=1)
+
+    def _evaluate_vl_sequence(
+        self,
+        *,
+        agent_s: torch.Tensor,
+        goal_s: torch.Tensor,
+        obs_s: torch.Tensor,
+        rnn_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate centralized critic by scanning chunks from zero carry."""
+        del rnn_states
+        b, T, A, _ = agent_s.shape
+        values = []
+        chunk_len = max(1, self.rnn_step)
+
+        for start in range(0, T, chunk_len):
+            stop = min(start + chunk_len, T)
+            rnn_state = self.Vl.initialize_carry(n_units=b, device=self.device)
+            for t in range(start, stop):
+                graph = build_graph_data(
+                    agent_state=agent_s[:, t],
+                    goal_state=goal_s[:, t],
+                    obs_state=obs_s[:, t],
+                    obs_radius=self.obs_radius,
+                )
+                value, rnn_state = self.Vl(graph, rnn_state, A)
+                values.append(value.reshape(b))
+
+        return torch.stack(values, dim=1)
+
+    def _evaluate_vh_sequence(
+        self,
+        *,
+        agent_s: torch.Tensor,
+        goal_s: torch.Tensor,
+        obs_s: torch.Tensor,
+        rnn_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate decomposed safety critic using stored policy RNN carries."""
+        b, T, A, _ = agent_s.shape
+        BT = b * T
+        graph = build_graph_data(
+            agent_state=agent_s.reshape(BT, A, -1),
+            goal_state=goal_s.reshape(BT, A, -1),
+            obs_state=obs_s.reshape(BT, obs_s.shape[2], -1),
+            obs_radius=self.obs_radius,
+        )
+        rnn_state = rnn_states.permute(3, 0, 1, 2, 4, 5).reshape(
+            self.Vh.rnn.rnn_layers,
+            BT * A,
+            1 if self.Vh.rnn.rnn_cell == "gru" else 2,
+            self.Vh.rnn.hidden_size,
+        )
+        value, _ = self.Vh(graph, rnn_state, A)
+        return value.reshape(b, T, A, -1)
     
     def load_dgppo_hyperparameters(self) -> None:
-        self.gamma: float = float(self.cfg.get("discount_factor", 0.99))
-        self.gae_lambda: float = float(self.cfg.get("gae_lambda", self.cfg.get("lambda", 0.95)))
-        self.learning_starts: int = int(self.cfg.get("learning_starts", 0))
-        self.rollouts: int = int(self.cfg.get("rollouts", 32))
-        self.learning_epochs: int = int(self.cfg.get("learning_epochs", 8))
-        self.mini_batches: int = int(self.cfg.get("mini_batches", 8))
-        self.clip_eps: float = float(self.cfg.get("ratio_clip", 0.2))
-        self.alpha: float = float(self.cfg.get("alpha", 10.0))
-        self.cbf_eps: float = float(self.cfg.get("cbf_eps", 1e-2))
-        self.cbf_weight: float = float(self.cfg.get("cbf_weight", 1.0))
-        self.cbf_schedule: bool = bool(self.cfg.get("cbf_schedule", True))
-        self.grad_clip: float = float(self.cfg.get("grad_norm_clip", 2.0))
-        self.entropy_scale: float = float(self.cfg.get("entropy_loss_scale", 0.0))
-        self.vl_loss_scale: float = float(self.cfg.get("vl_loss_scale", 1.0))
-        self.vh_loss_scale: float = float(self.cfg.get("vh_loss_scale", 1.0))
-        self.obs_radius: float = float(self.cfg.get("obs_radius", 2.0))
-        self.lr_policy: float = float(self.cfg.get("lr_policy", 3e-4))
-        self.lr_vl: float = float(self.cfg.get("lr_vl", 1e-3))
-        self.lr_vh: float = float(self.cfg.get("lr_vh", 1e-3))
+        self.gamma: float = float(self._cfg_get("discount_factor", 0.99))
+        self.gae_lambda: float = float(self._cfg_get("gae_lambda", self._cfg_get("lambda", 0.95)))
+        self.learning_starts: int = int(self._cfg_get("learning_starts", 0))
+        self.rollouts: int = int(self._cfg_get("rollouts", 32))
+        self.learning_epochs: int = int(self._cfg_get("learning_epochs", 8))
+        self.mini_batches: int = int(self._cfg_get("mini_batches", 8))
+        self.clip_eps: float = float(self._cfg_get("ratio_clip", 0.2))
+        self.alpha: float = float(self._cfg_get("alpha", 10.0))
+        self.cbf_eps: float = float(self._cfg_get("cbf_eps", 1e-2))
+        self.cbf_weight: float = float(self._cfg_get("cbf_weight", 1.0))
+        self.cbf_schedule: bool = bool(self._cfg_get("cbf_schedule", True))
+        self.grad_clip: float = float(self._cfg_get("grad_norm_clip", 2.0))
+        self.entropy_scale: float = float(self._cfg_get("entropy_loss_scale", 0.0))
+        self.vl_loss_scale: float = float(self._cfg_get("vl_loss_scale", 1.0))
+        self.vh_loss_scale: float = float(self._cfg_get("vh_loss_scale", 1.0))
+        self.obs_radius: float = float(self._cfg_get("obs_radius", 2.0))
+        self.lr_policy: float = float(self._cfg_get("lr_policy", 3e-4))
+        self.lr_vl: float = float(self._cfg_get("lr_vl", 1e-3))
+        self.lr_vh: float = float(self._cfg_get("lr_vh", 1e-3))
+        self.deterministic_rollout_strategy: str = str(
+            self._cfg_get("deterministic_rollout_strategy", "env_split")
+        )
+        self.rnn_step: int = int(self._cfg_get("rnn_step", self.rollouts))
+        if self.deterministic_rollout_strategy != "env_split":
+            raise NotImplementedError(
+                "Only deterministic_rollout_strategy='env_split' is supported by the IsaacLab/skrl port. "
+                "The JAX reference's separate deterministic rollout pass would require a separate env rollout source."
+            )
 
     def _cbf_scale(self, *, timestep: int, timesteps: int) -> float:
         """Piecewise-constant CBF weight schedule."""
@@ -765,12 +1025,6 @@ def _make_edge_list(
     edges_flat = torch.cat(edge_f_parts, dim=0)
     recvs_flat = torch.cat(recv_parts,   dim=0)
     sends_flat = torch.cat(send_parts,   dim=0)
-
-    # Zero-pad edge features to node_dim (type-indicator slots stay 0)
-    edges_flat = torch.cat(
-        [edges_flat, edges_flat.new_zeros(edges_flat.shape[0], NUM_TYPE_INDICATORS)],
-        dim=-1,
-    )
 
     return edges_flat, recvs_flat, sends_flat, n_edges_per_env
 

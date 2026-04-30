@@ -138,6 +138,7 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     reward_crash: float = 10.0
     reward_out_of_bounds: float = 10.0
     reward_pillar_collision: float = 10.0
+    dgppo_cost_margin: float = 0.05
 
     # Success criteria
     pos_tolerance: float = 0.15

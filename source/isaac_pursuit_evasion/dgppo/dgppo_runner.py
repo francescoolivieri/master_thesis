@@ -24,11 +24,12 @@ class DGPPORunner:
         n_agents = env.num_agents
         n_envs = env.num_envs
         n_constraints = int(getattr(base_env, "n_constraints", 1))
-        state_dim = base_env.state_space.shape[0]  # physical state (for CBF)
+        layout = base_env.graph_obs_layout
+        state_dim = int(layout["state_dim"])  # physical graph state (for CBF)
         action_dim = env.action_space.shape[0]  # per agent action size
        
-        edge_dim = 4   # 3-D relative position + distance | DEPENDS ON GRAPH BUILDER
-        node_dim = base_env.observation_space.shape[0] # per agent obs -> GNN node features
+        edge_dim = state_dim
+        node_dim = state_dim + 3  # physical state + [obstacle, goal, agent] indicators
         
 
         # - Policy

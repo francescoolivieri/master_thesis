@@ -335,6 +335,7 @@ class PosTrackingEnv(DirectRLEnv):
 
         self._last_rewards = rewards
         self._last_reward_components = components
+        self._update_dgppo_cost_extras(pos_local)
         self._maybe_save_camera_images()
         return rewards
 
@@ -508,6 +509,26 @@ class PosTrackingEnv(DirectRLEnv):
         inside_radius = dxy <= self._pillar_collision_radius
         inside_height = (pos_local[:, 2] >= self.cfg.arena_min[2]) & (pos_local[:, 2] <= self._pillar_top_z)
         return torch.any(inside_radius, dim=1) & inside_height
+
+    def _update_dgppo_cost_extras(self, pos_local: torch.Tensor) -> None:
+        """Expose DGPPO constraint costs as ``[E, A, H]`` in IsaacLab extras."""
+        if self._num_pillars == 0:
+            costs = pos_local.new_zeros(self.num_envs, self.num_agents, 0)
+        else:
+            dxy = torch.norm(pos_local[:, None, :2] - self._pillar_positions_xy[None, :, :], dim=-1)
+            height_active = (
+                (pos_local[:, 2] >= self.cfg.arena_min[2])
+                & (pos_local[:, 2] <= self._pillar_top_z)
+            )
+            raw_cost = self._pillar_collision_radius - dxy
+            raw_cost = torch.where(height_active[:, None], raw_cost, -torch.ones_like(raw_cost))
+            margin = float(self.cfg.dgppo_cost_margin)
+            shifted = torch.where(raw_cost <= 0.0, raw_cost - margin, raw_cost + margin)
+            costs = torch.clamp(shifted, min=-1.0, max=1.0).unsqueeze(1)
+
+        self.extras["costs"] = costs
+        if costs.numel() > 0:
+            self.extras.setdefault("log", {})["dgppo_cost_max"] = costs.max()
 
     def _update_success_flags(self, pos_local: torch.Tensor) -> torch.Tensor:
         pos_error = torch.norm(self._reference_pos - pos_local, dim=-1)

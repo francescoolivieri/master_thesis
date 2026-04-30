@@ -78,7 +78,7 @@ parser.add_argument(
     "--algorithm",
     type=str,
     default="PPO",
-    choices=["AMP", "PPO", "IPPO", "MAPPO"],
+    choices=["AMP", "PPO", "IPPO", "MAPPO", "DGPPO"],
     help="The RL algorithm used for training the skrl agent.",
 )
 parser.add_argument("--wandb-name", type=str, help="Override WandB run name (agent.agent.experiment.wandb_kwargs.name).")
@@ -1216,6 +1216,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if algorithm != "dgppo":
         runner = Runner(env, agent_cfg)
     else:
+        from source.isaac_pursuit_evasion.dgppo.dgppo_runner import DGPPORunner
         # skrl's default runner is not compatible with DGPPO, so we use our ad-hoc.
         # DGPPORunner exposes the same interface as the default runner.
         runner = DGPPORunner(env, agent_cfg)
@@ -1293,7 +1294,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         original_write_checkpoint = runner.agent.write_checkpoint
 
         def _write_checkpoint_with_upload(self, timestep: int, timesteps: int) -> None:  # type: ignore[override]
-            original_write_checkpoint(timestep, timesteps)
+            original_write_checkpoint(timestep=timestep, timesteps=timesteps)
             try:
                 checkpoint_uploader.upload_new()
             except Exception:

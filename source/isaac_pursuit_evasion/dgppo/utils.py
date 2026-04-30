@@ -268,7 +268,7 @@ class GraphData:
 
         return type_feats.reshape(self.batch_shape + (n_states, tot_n_states))
     
-    def get_envs_graphs(self, env_ids: torch.Tensor) -> GraphData:
+    def get_envs_graphs(self, env_ids: torch.Tensor):
         """
         Get the graphs for the given environment ids.
         """
@@ -290,9 +290,10 @@ class GraphTransformer(MessagePassing):
     A residual-style 'node_proj' branch is added to the aggregated messages before the activation.
     """
 
-    def __init__(self, in_dim: int, out_dim: int, n_heads: int, act: Callable = torch.relu):
+    def __init__(self, in_dim: int, out_dim: int, n_heads: int, edge_dim: int, act: Callable = torch.relu):
         super().__init__(aggr='add')  # "Add" aggregation. (equal to "sum"?)
         self.in_dim = in_dim
+        self.edge_dim = edge_dim
         self.out_dim = out_dim
         self.n_heads = n_heads
         self.act = act
@@ -305,7 +306,7 @@ class GraphTransformer(MessagePassing):
         self.query = nn.Linear(in_dim, out_dim * n_heads)
         self.key = nn.Linear(in_dim, out_dim * n_heads)
         self.value = nn.Linear(in_dim, out_dim * n_heads)
-        self.edge_feats = nn.Linear(in_dim, out_dim * n_heads, bias=False)
+        self.edge_feats = nn.Linear(edge_dim, out_dim * n_heads, bias=False)
         
         self.node_proj = nn.Linear(in_dim, out_dim)
 
@@ -350,9 +351,10 @@ class GraphTransformerGNN(nn.Module):
     reshaped per sub-graph as '(batch_shape, n_type, out_dim)'.
     """
 
-    def __init__(self, in_dim: int, msg_dim: int, out_dim: int, n_heads: int, n_layers: int):
+    def __init__(self, in_dim: int, edge_dim: int, msg_dim: int, out_dim: int, n_heads: int, n_layers: int):
         super().__init__()
         self.in_dim = in_dim
+        self.edge_dim = edge_dim
         self.msg_dim = msg_dim
         self.out_dim = out_dim
         self.n_heads = n_heads
@@ -362,7 +364,7 @@ class GraphTransformerGNN(nn.Module):
         cur_dim = in_dim
         for i in range(n_layers):
             layer_out_dim = out_dim if i == n_layers - 1 else msg_dim
-            layers.append(GraphTransformer(cur_dim, layer_out_dim, n_heads, torch.relu))
+            layers.append(GraphTransformer(cur_dim, layer_out_dim, n_heads, edge_dim, torch.relu))
             cur_dim = layer_out_dim
         self.gnn_layers = nn.ModuleList(layers)
 
@@ -492,4 +494,3 @@ class RNN(nn.Module):
         device = device or next(self.parameters()).device
         n_carries = 1 if self.rnn_cell == "gru" else 2
         return torch.zeros(self.rnn_layers, n_agents, n_carries, self.hidden_size, device=device)
-

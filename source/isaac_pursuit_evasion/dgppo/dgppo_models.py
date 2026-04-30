@@ -37,15 +37,17 @@ class DecStateFn(nn.Module):
         nn.init.zeros_(self.value_out.bias)
 
     def forward(self, graph, rnn_state: torch.Tensor, n_agents: int):
-        x = self.gnn(graph, node_type=0, n_type=n_agents)    # (n_agents, gnn_out_dim)
-        x = self.mlp(x)                                       # (n_agents, hid)
-        assert x.shape[0] == n_agents
+        x = self.gnn(graph, node_type=0, n_type=n_agents)    # (..., n_agents, gnn_out_dim)
+        x = self.mlp(x)                                       # (..., n_agents, hid)
+        assert x.shape[-2] == n_agents
 
         if self.rnn is not None:
-            x, rnn_state = self.rnn(x, rnn_state)
+            leading_shape = x.shape[:-1]
+            x, rnn_state = self.rnn(x.reshape(-1, x.shape[-1]), rnn_state)
+            x = x.reshape(*leading_shape, -1)
 
-        x = self.value_out(x)                                 # (n_agents, n_out)
-        assert x.shape == (n_agents, self.n_out)
+        x = self.value_out(x)                                 # (..., n_agents, n_out)
+        assert x.shape[-2:] == (n_agents, self.n_out)
         return x, rnn_state
 
 
@@ -68,15 +70,17 @@ class RStateFn(nn.Module):
         nn.init.zeros_(self.value_out.bias)
 
     def forward(self, graph, rnn_state: torch.Tensor, n_agents: int):
-        x = self.gnn(graph, node_type=0, n_type=n_agents)    # (n_agents, gnn_out_dim)
-        x = x.mean(dim=0, keepdim=True)                       # (1, gnn_out_dim)
+        x = self.gnn(graph, node_type=0, n_type=n_agents)    # (..., n_agents, gnn_out_dim)
+        x = x.mean(dim=-2)                                    # (..., gnn_out_dim)
         x = self.mlp(x)
 
         if self.rnn is not None:
-            x, rnn_state = self.rnn(x, rnn_state)
+            leading_shape = x.shape[:-1]
+            x, rnn_state = self.rnn(x.reshape(-1, x.shape[-1]), rnn_state)
+            x = x.reshape(*leading_shape, -1)
 
-        x = self.value_out(x)                                 # (1, n_out)
-        assert x.shape == (1, self.n_out)
+        x = self.value_out(x)                                 # (..., n_out)
+        assert x.shape[-1:] == (self.n_out,)
         return x, rnn_state
 
 class DGPPOValueNet(nn.Module):
@@ -109,6 +113,7 @@ class DGPPOValueNet(nn.Module):
         # Note: same backbone as the policy net, different heads
         self.gnn = GraphTransformerGNN(
             in_dim=node_dim,
+            edge_dim=edge_dim,
             msg_dim=gnn_msg_dim,
             out_dim=gnn_out_dim,
             n_heads=gnn_heads,
@@ -137,6 +142,12 @@ class DGPPOValueNet(nn.Module):
     def forward(self, graph, rnn_state: torch.Tensor, n_agents: int):
         # GNN -> MLP -> RNN (optional) -> Final projection
         return self.net(graph, rnn_state, n_agents)
+
+    @torch.no_grad()
+    def initialize_carry(self, n_units: int, device=None) -> Optional[torch.Tensor]:
+        if self.rnn is None:
+            return None
+        return self.rnn.initialize_carry(n_units, device=device)
 
     def enable_training_mode(self, enabled: bool = True) -> None:
         """Called by skrl Agent.enable_models_training_mode()."""
@@ -269,12 +280,14 @@ class DGPPOPolicy(nn.Module):
         self.device = torch.device(device) if device is not None else torch.device("cpu")
         self.std_dev_min = std_dev_min
         self.std_dev_init = std_dev_init
+        self.std_dev_init_inv = math.log(math.exp(std_dev_init) - 1.0)
 
         # Note: same backbone as the value net, different heads
         self.use_rnn = use_rnn
 
         self.gnn = GraphTransformerGNN(
             in_dim=node_dim,
+            edge_dim=edge_dim,
             msg_dim=gnn_msg_dim,
             out_dim=gnn_out_dim,
             n_heads=gnn_heads,
@@ -320,7 +333,7 @@ class DGPPOPolicy(nn.Module):
         self,
         graph: GraphData,
         rnn_state: Optional[torch.Tensor],
-        n_agents_total: int,
+        n_agents: int,
     ) -> tuple[TanhNormal, Optional[torch.Tensor]]:
         """
            Forward the policy network to get a TanhNormal distribution over actions.
@@ -329,23 +342,25 @@ class DGPPOPolicy(nn.Module):
             - rnn_state
         """
         
-        x = self.gnn(graph, node_type=0, n_type=n_agents_total)
+        x = self.gnn(graph, node_type=0, n_type=n_agents)
         x = self.mlp(x)
         if self.rnn is not None:
-            x, rnn_state = self.rnn(x, rnn_state)
+            leading_shape = x.shape[:-1]
+            x, rnn_state = self.rnn(x.reshape(-1, x.shape[-1]), rnn_state)
+            x = x.reshape(*leading_shape, -1)
         else:
             rnn_state = None
         h = self.scale_hid(x)
         
         mean = self.mean_head(h)
-        std = F.softplus(self.std_head(h) + self.std_dev_init) + self.std_dev_min
+        std = F.softplus(self.std_head(h) + self.std_dev_init_inv) + self.std_dev_min
         return TanhNormal(mean, std), rnn_state
     
     def act(
         self,
         graph: GraphData,
         rnn_state: Optional[torch.Tensor],
-        n_agents_total: int,
+        n_agents: int,
         *,
         deterministic: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
@@ -356,7 +371,7 @@ class DGPPOPolicy(nn.Module):
             - mode of the generated distribution
             - rnn_state
         """
-        dist, rnn_state = self.distribution(graph, rnn_state, n_agents_total)
+        dist, rnn_state = self.distribution(graph, rnn_state, n_agents)
         if deterministic:
             action = dist.mode()
         else:
@@ -370,7 +385,7 @@ class DGPPOPolicy(nn.Module):
         graph: GraphData,
         action: torch.Tensor,
         rnn_state: Optional[torch.Tensor],
-        n_agents_total: int,
+        n_agents: int,
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """ 
         Evaluates a taken action. Returns :
@@ -378,7 +393,7 @@ class DGPPOPolicy(nn.Module):
             - entropy of the generated distribution
             - rnn_state
         """
-        dist, rnn_state = self.distribution(graph, rnn_state, n_agents_total)
+        dist, rnn_state = self.distribution(graph, rnn_state, n_agents)
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()
         return log_prob, entropy, rnn_state    
@@ -392,4 +407,3 @@ class DGPPOPolicy(nn.Module):
         if self.rnn is None:
             return None
         return self.rnn.initialize_carry(n_agents_total, device=device)
-        

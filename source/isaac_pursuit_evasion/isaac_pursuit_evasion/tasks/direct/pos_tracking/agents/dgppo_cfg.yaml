@@ -8,6 +8,10 @@ agent:
   cbf_eps:      0.01    # CBF slack (h >= -eps is "safe enough")
   cbf_weight:   1.0     # weight on the CBF penalty term
   cbf_schedule: true    # linearly increase cbf_weight during training
+  # Deterministic data is collected from the first half of IsaacLab envs while
+  # stochastic PPO data is collected from the second half. This is intentional:
+  # it avoids a separate JAX-style deterministic rollout pass / second env copy.
+  deterministic_rollout_strategy: env_split
 
   # PPO / GAE
   discount_factor:  0.99
