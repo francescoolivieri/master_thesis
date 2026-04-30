@@ -97,6 +97,8 @@ def _extract_preprocessor_state(payload: Mapping[str, Any], key: str) -> Mapping
 def load_skrl_scalers(payload: Any) -> tuple[SkrlScaler | None, SkrlScaler | None]:
     if not isinstance(payload, Mapping):
         return None, None
-    obs_state = _extract_preprocessor_state(payload, "state_preprocessor")
+    obs_state = _extract_preprocessor_state(payload, "observation_preprocessor")
+    if obs_state is None:
+        obs_state = _extract_preprocessor_state(payload, "state_preprocessor")
     value_state = _extract_preprocessor_state(payload, "value_preprocessor")
     return _extract_mean_std(obs_state), _extract_mean_std(value_state)

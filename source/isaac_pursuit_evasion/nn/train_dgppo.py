@@ -272,6 +272,8 @@ class ValueNet(nn.Module):
         self.net = head_cls(gnn=self.gnn, mlp=self.head, rnn=self.rnn, n_out=n_out)
 
     def forward(self, graph, rnn_state: torch.Tensor, n_agents: int):
+        
+        # GNN -> MLP -> RNN (optional) -> MLP
         return self.net(graph, rnn_state, n_agents)
 
 

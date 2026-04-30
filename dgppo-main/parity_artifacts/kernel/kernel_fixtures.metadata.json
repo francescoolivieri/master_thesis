@@ -1,0 +1,12 @@
+{
+  "kernel_fixture_config": {
+    "T": 5,
+    "clip_eps": 0.25,
+    "disc_gamma": 0.99,
+    "gae_lambda": 0.95,
+    "max_grad_norm": 2.0,
+    "n_agents": 4,
+    "n_cost": 2,
+    "seed": 0
+  }
+}

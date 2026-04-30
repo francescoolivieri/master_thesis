@@ -102,6 +102,7 @@ parser.add_argument(
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
+
 args_cli, hydra_args = parser.parse_known_args()
 # always enable cameras to record video
 if args_cli.video:
@@ -715,7 +716,9 @@ def _tracking_error_metrics(base_env: Any) -> dict[str, float]:
 def _estimate_values(agent, states: torch.Tensor) -> torch.Tensor:
     if not hasattr(agent, "value") or agent.value is None:
         return torch.zeros(states.shape[0], device=states.device)
-    state_preprocessor = getattr(agent, "_state_preprocessor", lambda x: x)
+    state_preprocessor = getattr(
+        agent, "_observation_preprocessor", getattr(agent, "_state_preprocessor", lambda x: x)
+    )
     value_preprocessor = getattr(agent, "_value_preprocessor", lambda x, inverse=False: x)
     with torch.no_grad():
         inputs = {"states": state_preprocessor(states)}
@@ -766,11 +769,11 @@ def _extract_preprocessor_stats(preprocessor: Any) -> tuple[str, str]:
 
 def _log_agent_preprocessors(agent: Any, agent_cfg: dict) -> None:
     cfg_agent = agent_cfg.get("agent", {}) if isinstance(agent_cfg, dict) else {}
-    cfg_state = cfg_agent.get("state_preprocessor")
+    cfg_state = cfg_agent.get("observation_preprocessor", cfg_agent.get("state_preprocessor"))
     cfg_value = cfg_agent.get("value_preprocessor")
-    print(f"[INFO] Agent preprocessor config: state={cfg_state}, value={cfg_value}")
+    print(f"[INFO] Agent preprocessor config: observation/state={cfg_state}, value={cfg_value}")
 
-    state_pre = getattr(agent, "_state_preprocessor", None)
+    state_pre = getattr(agent, "_observation_preprocessor", getattr(agent, "_state_preprocessor", None))
     value_pre = getattr(agent, "_value_preprocessor", None)
 
     def _describe(pre: Any) -> str:
@@ -782,7 +785,7 @@ def _log_agent_preprocessors(agent: Any, agent_cfg: dict) -> None:
         mean_str, std_str = _extract_preprocessor_stats(pre)
         return f"{name}(size={size}, device={device}) mean={mean_str} std={std_str}"
 
-    print(f"[INFO] Agent preprocessor runtime (state): {_describe(state_pre)}")
+    print(f"[INFO] Agent preprocessor runtime (observation/state): {_describe(state_pre)}")
     print(f"[INFO] Agent preprocessor runtime (value): {_describe(value_pre)}")
 
 
@@ -1209,7 +1212,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # configure and instantiate the skrl runner
     # https://skrl.readthedocs.io/en/latest/api/utils/runner.html
     print("Obs space:", env.single_observation_space, "Action space:", env.single_action_space)
-    runner = Runner(env, agent_cfg)
+    
+    if algorithm != "dgppo":
+        runner = Runner(env, agent_cfg)
+    else:
+        # skrl's default runner is not compatible with DGPPO, so we use our ad-hoc.
+        # DGPPORunner exposes the same interface as the default runner.
+        runner = DGPPORunner(env, agent_cfg)
+        
     _log_agent_preprocessors(runner.agent, agent_cfg)
     checkpoints_dir = Path(getattr(runner.agent, "experiment_dir", log_dir)) / "checkpoints"
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
@@ -1224,7 +1234,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         original_post_interaction = runner.agent.post_interaction
 
         def _post_interaction_with_monitoring(self, timestep: int, timesteps: int) -> None:  # type: ignore[override]
-            original_post_interaction(timestep, timesteps)
+            original_post_interaction(timestep=timestep, timesteps=timesteps)
             current_step = timestep + 1
             update = performance_tracker.update(current_step)
             if update is not None:

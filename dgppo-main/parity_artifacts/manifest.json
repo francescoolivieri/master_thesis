@@ -1,0 +1,308 @@
+{
+  "manifest": [
+    {
+      "atol": 1e-06,
+      "description": "Dec-EFOCP GAE safety head output",
+      "level": "kernel",
+      "name": "kernel/gae/Qhs",
+      "required": true,
+      "rtol": 1e-05
+    },
+    {
+      "atol": 1e-06,
+      "description": "Dec-EFOCP GAE task scalar output",
+      "level": "kernel",
+      "name": "kernel/gae/Ql",
+      "required": true,
+      "rtol": 1e-05
+    },
+    {
+      "atol": 1e-06,
+      "description": "Unclipped PPO surrogate term",
+      "level": "kernel",
+      "name": "kernel/ppo/loss_policy1",
+      "required": true,
+      "rtol": 1e-05
+    },
+    {
+      "atol": 1e-06,
+      "description": "Clipped PPO surrogate term",
+      "level": "kernel",
+      "name": "kernel/ppo/loss_policy2",
+      "required": true,
+      "rtol": 1e-05
+    },
+    {
+      "atol": 1e-06,
+      "description": "PPO clipped objective",
+      "level": "kernel",
+      "name": "kernel/ppo/loss_policy",
+      "required": true,
+      "rtol": 1e-05
+    },
+    {
+      "atol": 1e-06,
+      "description": "Clip fraction",
+      "level": "kernel",
+      "name": "kernel/ppo/clip_frac",
+      "required": true,
+      "rtol": 1e-05
+    },
+    {
+      "atol": 1e-06,
+      "description": "Gradient global L2 norm",
+      "level": "kernel",
+      "name": "kernel/grad/original_norm",
+      "required": true,
+      "rtol": 1e-05
+    },
+    {
+      "atol": 1e-06,
+      "description": "Gradient norm after clip",
+      "level": "kernel",
+      "name": "kernel/grad/clipped_norm",
+      "required": true,
+      "rtol": 1e-05
+    },
+    {
+      "atol": 1e-05,
+      "description": "Value sequence from Vl scan",
+      "level": "update",
+      "name": "update/value/bT_Vl",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Bootstrapped Vl values",
+      "level": "update",
+      "name": "update/value/bTp1_Vl",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Safety values from Vh",
+      "level": "update",
+      "name": "update/value/bTah_Vh",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Bootstrapped Vh values",
+      "level": "update",
+      "name": "update/value/bTp1ah_Vh",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Safety values on deterministic rollout",
+      "level": "update",
+      "name": "update/value/bTah_Vh_det",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Bootstrapped Vh values on deterministic rollout",
+      "level": "update",
+      "name": "update/value/bTp1ah_Vh_det",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "GAE safety targets",
+      "level": "update",
+      "name": "update/gae/bTah_Qh",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "GAE safety targets for deterministic rollout",
+      "level": "update",
+      "name": "update/gae/bTah_Qh_det",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "GAE task targets",
+      "level": "update",
+      "name": "update/gae/bT_Ql",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Raw task advantage",
+      "level": "update",
+      "name": "update/adv/bT_Al_raw",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Normalized task advantage",
+      "level": "update",
+      "name": "update/adv/bT_Al_norm",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "CBF derivative term",
+      "level": "update",
+      "name": "update/adv/bTah_cbf_deriv",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "CBF hinge penalty term",
+      "level": "update",
+      "name": "update/adv/bTah_Acbf",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Safety mask",
+      "level": "update",
+      "name": "update/adv/bTa_is_safe",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Final policy advantage",
+      "level": "update",
+      "name": "update/adv/bTa_A",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Importance-sampling ratio",
+      "level": "update",
+      "name": "update/policy/ratio",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Batch unclipped surrogate",
+      "level": "update",
+      "name": "update/policy/loss_policy1",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Batch clipped surrogate",
+      "level": "update",
+      "name": "update/policy/loss_policy2",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Batch surrogate objective",
+      "level": "update",
+      "name": "update/policy/loss_policy",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Batch clip fraction",
+      "level": "update",
+      "name": "update/policy/clip_frac",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Batch policy entropy",
+      "level": "update",
+      "name": "update/policy/entropy",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Logged policy loss",
+      "level": "update",
+      "name": "update/metrics/policy_loss",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Logged Vl loss",
+      "level": "update",
+      "name": "update/metrics/Vl_loss",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Logged Vh loss",
+      "level": "update",
+      "name": "update/metrics/Vh_loss",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Logged policy grad norm",
+      "level": "update",
+      "name": "update/metrics/policy_grad_norm",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Logged Vl grad norm",
+      "level": "update",
+      "name": "update/metrics/Vl_grad_norm",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Logged Vh grad norm",
+      "level": "update",
+      "name": "update/metrics/Vh_grad_Vh_norm",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "L2 norm of policy parameter delta",
+      "level": "update",
+      "name": "update/param_delta/policy",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "L2 norm of Vl parameter delta",
+      "level": "update",
+      "name": "update/param_delta/Vl",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "L2 norm of Vh parameter delta",
+      "level": "update",
+      "name": "update/param_delta/Vh",
+      "required": true,
+      "rtol": 0.0001
+    }
+  ]
+}

@@ -79,7 +79,7 @@ class EdgeBlock(NamedTuple):
 
 
 @dataclass
-class GraphData(Generic[_State]):
+class GraphData:
     """
     Flat, padded batched-graph representation used by the GNN.
 
@@ -94,7 +94,7 @@ class GraphData(Generic[_State]):
     n_edges: torch.Tensor            # (n_graphs,) edges per sub-graph
     nodes: torch.Tensor              # (sum_n_nodes, node_feat_dim)
     edges: Optional[torch.Tensor]    # (sum_n_edges, edge_feat_dim)
-    states: _State                   # per-node physical state, (sum_n_nodes, state_dim)
+    states: torch.Tensor             # per-node physical state, (sum_n_nodes, state_dim)
     receivers: torch.Tensor          # (sum_n_edges,) -- indexes ``nodes``
     senders: torch.Tensor            # (sum_n_edges,) -- indexes ``nodes``
     node_types: torch.Tensor         # (sum_n_nodes,) node type ids, -1 for padding
@@ -147,6 +147,13 @@ class GraphData(Generic[_State]):
         type_feats[idx[n_is_type]] = self.states[n_is_type]
 
         return type_feats.reshape(self.batch_shape + (n_states, tot_n_states))
+    
+    def get_envs_graphs(self, env_ids: torch.Tensor) -> GraphData:
+        """
+        Get the graphs for the given environment ids.
+        """
+        return GraphData(n_nodes=self.n_nodes[env_ids], n_edges=self.n_edges[env_ids], nodes=self.nodes[env_ids], edges=self.edges[env_ids], states=self.states[env_ids], receivers=self.receivers[env_ids], senders=self.senders[env_ids], node_types=self.node_types[env_ids])
+    
 
     def _replace(self, **kwargs):
         return replace(self, **kwargs)

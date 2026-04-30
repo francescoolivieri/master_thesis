@@ -245,31 +245,27 @@ class PosTrackingEnv(DirectRLEnv):
 
     def _get_observations(self) -> dict:
         env_origins = self._terrain.env_origins
-        pos_local = self._robot.data.root_pos_w - env_origins
-        vel_world = self._robot.data.root_lin_vel_w
-        ang_vel = self._robot.data.root_ang_vel_b
-        quat = self._robot.data.root_quat_w
 
-        pos_error = self._reference_pos - pos_local
-        dist = torch.norm(pos_error, dim=-1, keepdim=True)
+        # Agent state: pos (3) + vel (3)
+        agent_pos = self._robot.data.root_pos_w - env_origins  # (E, 3)
+        agent_vel = self._robot.data.root_lin_vel_w             # (E, 3)
 
-        parts = [pos_error, dist, vel_world, ang_vel, quat]
-        if self.cfg.enable_obstacle_observations and self._num_pillars > 0:
-            rel_xy = self._pillar_positions_xy.unsqueeze(0) - pos_local[:, :2].unsqueeze(1)
-            center_dist = torch.norm(rel_xy, dim=-1, keepdim=True)
-            surface_dist = center_dist - self._pillar_radius
-            obstacle_features = torch.cat((rel_xy, surface_dist), dim=-1).reshape(self.num_envs, -1)
-            parts.append(obstacle_features)
+        # Goal state: pos only (3) — vel is always zero, omitted
+        goal_pos = self._reference_pos                          # (E, 3)
 
-        if self.cfg.flag_yaw_tracking:
-            yaw_err, yaw_align = self._yaw_features(quat)
-            parts.append(yaw_align)
-            parts.append(yaw_err)
-        if self.cfg.flag_action_smoothness_penalty:
-            parts.append(self._prev_actions)
+        # Obstacle state: xy only, flattened — vel/z always zero, omitted
+        if self._num_pillars > 0:
+            obstacle_xy_flat = (
+                self._pillar_positions_xy.unsqueeze(0).expand(self.num_envs, -1, -1)
+                .reshape(self.num_envs, -1)
+            )  # (E, O*2)
+        else:
+            obstacle_xy_flat = agent_pos.new_empty(self.num_envs, 0)
 
-        obs = torch.cat(parts, dim=-1)
+        # Layout: [agent_pos(3), agent_vel(3), goal_pos(3), obstacle_xy(O*2)]
+        obs = torch.cat([agent_pos, agent_vel, goal_pos, obstacle_xy_flat], dim=-1)
         return {"policy": obs}
+    
 
     def _get_rewards(self) -> torch.Tensor:
         env_origins = self._terrain.env_origins
@@ -407,16 +403,38 @@ class PosTrackingEnv(DirectRLEnv):
     # Helpers
     # ---------------------------------------------------------------------
 
+
+    # Graph observation helpers (used by DGPPOAgent._build_graph)
+    _GRAPH_STATE_DIM: int = 6  # (x, y, z, vx, vy, vz)
+
+    @property
+    def num_agents(self) -> int:
+        return 1
+    
+    @property
+    def n_constraints(self) -> int:
+        return self._num_pillars # pairwise constraint
+
+    @property
+    def graph_obs_layout(self) -> dict:
+        """Return the layout of the flat policy-obs vector for graph construction."""
+        agent_end = self._GRAPH_STATE_DIM              # 6
+        goal_end  = agent_end + 3                      # 9  (goal pos only)
+        obstacles_end   = goal_end  + self._num_pillars * 2  # 9 + O*2
+        
+        return {
+            "state_dim"   : self._GRAPH_STATE_DIM,
+            "n_agents"    : self.num_agents,
+            "n_obstacles" : self._num_pillars,
+            "agent_end"   : agent_end,
+            "goal_end"    : goal_end,
+            "obstacles_end"     : obstacles_end,
+        }
+
     @staticmethod
     def _compute_obs_dim(cfg: PosTrackingEnvCfg) -> int:
-        dim = 3 + 1 + 3 + 3 + 4
-        if cfg.enable_obstacle_observations:
-            dim += len(cfg.pillar_positions_xy) * 3
-        if cfg.flag_yaw_tracking:
-            dim += 2
-        if cfg.flag_action_smoothness_penalty:
-            dim += cfg.action_space
-        return dim
+        # agent (pos3 + vel3) + goal pos (3) + obstacle xy flat (O * 2)
+        return 6 + 3 + len(cfg.pillar_positions_xy) * 2
 
     def _build_action_wrapper(self):
         def passthrough(td: TensorDict) -> torch.Tensor:
