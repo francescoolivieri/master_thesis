@@ -21,7 +21,7 @@ class DGPPOAgent(Agent):
         action_space,
         device: torch.device,
     ) -> None:        
-        raw_cfg = dict(cfg) if isinstance(cfg, Mapping) else {}
+        raw_cfg = self._plain_mapping(cfg) if isinstance(cfg, Mapping) else {}
         skrl_cfg = cfg if isinstance(cfg, AgentCfg) else AgentCfg(experiment=raw_cfg.get("experiment", {}))
         
         super().__init__(
@@ -222,6 +222,20 @@ class DGPPOAgent(Agent):
 
     def _cfg_get(self, key: str, default: Any = None) -> Any:
         return self._dgppo_cfg.get(key, default)
+
+    @classmethod
+    def _plain_mapping(cls, value: Any) -> dict[str, Any]:
+        return {str(key): cls._plain_value(item) for key, item in value.items()}
+
+    @classmethod
+    def _plain_value(cls, value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return cls._plain_mapping(value)
+        if isinstance(value, list):
+            return [cls._plain_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(cls._plain_value(item) for item in value)
+        return value
 
     def _env_dt(self) -> float:
         env = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
