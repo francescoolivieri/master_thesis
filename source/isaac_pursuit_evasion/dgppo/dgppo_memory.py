@@ -18,7 +18,7 @@ Rollout memory used by DGPPOAgent.
     costs          (T, B, A, NH)
     values_l       (T+1, B)
     values_h       (T+1, B, A, NH)
-    rnn_state      (T, L, B*A, C, H)  -- only kept if the policy has an RNN
+    rnn_state      (T, B, A, L, C, H)  -- only kept if the policy has an RNN
 
 ``values_l`` / ``values_h`` have one extra step for the terminal bootstrap.
 """
@@ -163,11 +163,29 @@ class DGPPORolloutMemory(RandomMemory):
         
         if self.use_rnn:
             if stc_rnn_state is not None:
-                self._tensor("stc_rnn_states")[t] = stc_rnn_state.reshape(-1)
+                self._tensor("stc_rnn_states")[t] = self._canonical_rnn_state(
+                    stc_rnn_state, self.n_stc_envs
+                ).reshape(-1)
             if det_rnn_state is not None:
-                self._tensor("det_rnn_states")[t] = det_rnn_state.reshape(-1)
+                self._tensor("det_rnn_states")[t] = self._canonical_rnn_state(
+                    det_rnn_state, self.n_det_envs
+                ).reshape(-1)
 
         self._cursor += 1
+
+    def _canonical_rnn_state(self, rnn_state: torch.Tensor, B: int) -> torch.Tensor:
+        """Return policy RNN state as ``[B, A, L, C, H]`` for storage."""
+        A = self._n_agents
+        if rnn_state.shape == (self.rnn_layers, B * A, self.rnn_carries, self.rnn_hidden):
+            return rnn_state.reshape(self.rnn_layers, B, A, self.rnn_carries, self.rnn_hidden).permute(1, 2, 0, 3, 4)
+        if rnn_state.shape == (B, A, self.rnn_layers, self.rnn_carries, self.rnn_hidden):
+            return rnn_state
+        raise ValueError(
+            "Unexpected RNN state shape "
+            f"{tuple(rnn_state.shape)}; expected "
+            f"{(self.rnn_layers, B * A, self.rnn_carries, self.rnn_hidden)} or "
+            f"{(B, A, self.rnn_layers, self.rnn_carries, self.rnn_hidden)}"
+        )
 
     def set_final_values(self, split: str, value_l: torch.Tensor, value_h: torch.Tensor) -> None:
         if split not in ("stc", "det"):
@@ -220,10 +238,12 @@ class DGPPORolloutMemory(RandomMemory):
         
         if self.use_rnn:
             # RNN state shape in memory: [T, B * A * L * C * H]
-            # Transpose to [B, T, A, L, C, H]
+            # Transpose to [B, T, L, A, C, H], matching the RNN carry layout per rollout step.
             # Wait, N = B * A. The memory stores it as [T, N * L * C * H]
-            rnn_states = self._tensor(f"{split}_rnn_states").reshape(T, B, A, self.rnn_layers, self.rnn_carries, self.rnn_hidden)
-            data["bTa_rnn_states"] = rnn_states.transpose(0, 1) # [B, T, A, L, C, H]
+            rnn_states = self._tensor(f"{split}_rnn_states").reshape(
+                T, B, A, self.rnn_layers, self.rnn_carries, self.rnn_hidden
+            )
+            data["bTa_rnn_states"] = rnn_states.permute(1, 0, 3, 2, 4, 5) # [B, T, L, A, C, H]
             
         return data
 

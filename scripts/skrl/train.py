@@ -1216,8 +1216,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if algorithm != "dgppo":
         runner = Runner(env, agent_cfg)
     else:
+        
         # skrl's default runner is not compatible with DGPPO, so we use our ad-hoc.
         # DGPPORunner exposes the same interface as the default runner.
+        from source.isaac_pursuit_evasion.dgppo.dgppo_runner import DGPPORunner
         runner = DGPPORunner(env, agent_cfg)
         
     _log_agent_preprocessors(runner.agent, agent_cfg)

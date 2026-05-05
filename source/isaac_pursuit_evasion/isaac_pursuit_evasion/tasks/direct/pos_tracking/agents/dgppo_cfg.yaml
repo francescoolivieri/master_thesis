@@ -1,6 +1,6 @@
 seed: 42
 
-# - DGPPOAgent hyper-parameters, read by DGPPOAgent.load_dgppo_hyperparameters() and DGPPORunner.__init__()
+# - DG-PPO hyper-parameters, consumed by DGPPOAgentCfg / DGPPOAgent / DGPPORunner
 agent:
 
   # DGPPO-specific
@@ -37,13 +37,23 @@ agent:
     hidden: 64
     layers: 1
 
-  # GNN backbone (shared between policy and critics)
+  # GNN backbone
   gnn:
     policy_layers: 1
     critic_layers: 1
-    out_dim:  64
+    policy_out_dim: 64
+    critic_out_dim: 64
     msg_dim:  32
     n_heads:  3
+
+  # MLP / policy-head architecture
+  model:
+    policy_mlp_hid: [128, 64]
+    critic_mlp_hid: [128, 64]
+    scale_hid: 64
+    scale_final: 0.01
+    std_dev_init: 0.5
+    std_dev_min: 1.0e-5
 
   # skrl experiment logging
   experiment:
@@ -51,6 +61,7 @@ agent:
     experiment_name: ""
     write_interval: auto
     checkpoint_interval: auto
+    store_separately: false
     wandb: false
     wandb_kwargs:
       project: "drones_dgppo"

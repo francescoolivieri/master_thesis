@@ -21,7 +21,8 @@ class DecStateFn(nn.Module):
     """
     Decentralized head: one output per agent. 
     
-    Applies the shared GNN, filters to agent nodes, passes each agent through the shared MLP/RNN, and projects to ``n_out``.
+    Applies the shared GNN, filters to agent nodes, passes each agent through the shared MLP/RNN,
+    and projects to ``n_out``.
     """
 
     def __init__(self, gnn: nn.Module, mlp: nn.Module, rnn: Optional[nn.Module] = None, n_out: int = 1):
@@ -38,14 +39,14 @@ class DecStateFn(nn.Module):
 
     def forward(self, graph, rnn_state: torch.Tensor, n_agents: int):
         x = self.gnn(graph, node_type=0, n_type=n_agents)    # (n_agents, gnn_out_dim)
-        x = self.mlp(x)                                       # (n_agents, hid)
-        assert x.shape[0] == n_agents
+        batch_shape = x.shape[:-2]
+        x = self.mlp(x).reshape(-1, self.mlp.hid_sizes[-1])   # (B*n_agents, hid)
 
         if self.rnn is not None:
             x, rnn_state = self.rnn(x, rnn_state)
 
         x = self.value_out(x)                                 # (n_agents, n_out)
-        assert x.shape == (n_agents, self.n_out)
+        x = x.reshape(batch_shape + (n_agents, self.n_out))
         return x, rnn_state
 
 
@@ -69,14 +70,15 @@ class RStateFn(nn.Module):
 
     def forward(self, graph, rnn_state: torch.Tensor, n_agents: int):
         x = self.gnn(graph, node_type=0, n_type=n_agents)    # (n_agents, gnn_out_dim)
-        x = x.mean(dim=0, keepdim=True)                       # (1, gnn_out_dim)
-        x = self.mlp(x)
+        batch_shape = x.shape[:-2]
+        x = x.mean(dim=-2)                                    # (..., gnn_out_dim)
+        x = self.mlp(x).reshape(-1, self.mlp.hid_sizes[-1])
 
         if self.rnn is not None:
             x, rnn_state = self.rnn(x, rnn_state)
 
         x = self.value_out(x)                                 # (1, n_out)
-        assert x.shape == (1, self.n_out)
+        x = x.reshape(batch_shape + (self.n_out,))
         return x, rnn_state
 
 class DGPPOValueNet(nn.Module):
@@ -327,7 +329,7 @@ class DGPPOPolicy(nn.Module):
         self,
         graph: GraphData,
         rnn_state: Optional[torch.Tensor],
-        n_agents_total: int,
+        n_agents: int,
     ) -> tuple[TanhNormal, Optional[torch.Tensor]]:
         """
            Forward the policy network to get a TanhNormal distribution over actions.
@@ -336,8 +338,9 @@ class DGPPOPolicy(nn.Module):
             - rnn_state
         """
         
-        x = self.gnn(graph, node_type=0, n_type=n_agents_total)
-        x = self.mlp(x)
+        x = self.gnn(graph, node_type=0, n_type=n_agents)
+        batch_shape = x.shape[:-2]
+        x = self.mlp(x).reshape(-1, self.mlp.hid_sizes[-1])
         if self.rnn is not None:
             x, rnn_state = self.rnn(x, rnn_state)
         else:
@@ -346,6 +349,8 @@ class DGPPOPolicy(nn.Module):
         
         mean = self.mean_head(h)
         std = F.softplus(self.std_head(h) + self.std_dev_init_inv) + self.std_dev_min
+        mean = mean.reshape(batch_shape + (n_agents, -1))
+        std = std.reshape(batch_shape + (n_agents, -1))
         return TanhNormal(mean, std), rnn_state
     
     def act(
@@ -369,7 +374,12 @@ class DGPPOPolicy(nn.Module):
         else:
             action = dist.sample()
         log_prob = dist.log_prob(action)
-        return action, log_prob, dist.mode(), rnn_state
+        return (
+            action.reshape(-1, action.shape[-1]),
+            log_prob.reshape(-1),
+            dist.mode().reshape(-1, action.shape[-1]),
+            rnn_state,
+        )
         
     
     def evaluate(
@@ -386,8 +396,9 @@ class DGPPOPolicy(nn.Module):
             - rnn_state
         """
         dist, rnn_state = self.distribution(graph, rnn_state, n_agents_total)
-        log_prob = dist.log_prob(action)
-        entropy = dist.entropy()
+        action = action.reshape(dist.mean.shape)
+        log_prob = dist.log_prob(action).reshape(-1)
+        entropy = dist.entropy().reshape(-1)
         return log_prob, entropy, rnn_state
     
     def enable_training_mode(self, enabled: bool = True) -> None:

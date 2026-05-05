@@ -21,6 +21,8 @@ class UpdateGraphBatch:
     advantages: torch.Tensor
     ql_targets: torch.Tensor
     qh_det_targets: torch.Tensor
+    rnn_states: Optional[torch.Tensor]
+    det_rnn_states: Optional[torch.Tensor]
     b: int
     T: int
     A: int
@@ -28,6 +30,10 @@ class UpdateGraphBatch:
     @property
     def n_agents_total(self) -> int:
         return self.b * self.T * self.A
+
+    @property
+    def chunk_ids(self) -> torch.Tensor:
+        return torch.arange(self.T, device=self.actions.device).reshape(1, self.T)
 
 
 def build_update_graph_batch(
@@ -55,7 +61,6 @@ def build_update_graph_batch(
         obs_state=obs_s.reshape(BT, obs_s.shape[2], obs_s.shape[3]),
         obs_radius=obs_radius,
     )
-
     det_agent_s = det_view["bTa_agent_state"][idx]
     det_goal_s = det_view["bTa_goal_state"][idx]
     det_obs_s = det_view["bTo_obs_state"][idx]
@@ -65,6 +70,8 @@ def build_update_graph_batch(
         obs_state=det_obs_s.reshape(BT, det_obs_s.shape[2], det_obs_s.shape[3]),
         obs_radius=obs_radius,
     )
+    rnn_states = view.get("bTa_rnn_states", None)
+    det_rnn_states = det_view.get("bTa_rnn_states", None)
 
     return UpdateGraphBatch(
         graph=graph,
@@ -74,6 +81,8 @@ def build_update_graph_batch(
         advantages=advantages[idx],
         ql_targets=ql[idx],
         qh_det_targets=qh_det[idx],
+        rnn_states=rnn_states[idx] if rnn_states is not None else None,
+        det_rnn_states=det_rnn_states[idx] if det_rnn_states is not None else None,
         b=b,
         T=T,
         A=A,
@@ -164,7 +173,7 @@ def compute_rollout_policy_loss(
             rnn_state = policy.initialize_carry(n_agents, device=actions.device) if policy.rnn is not None else None
             for r in range(R):
                 t = int(chunk_ids[c, r].item())
-                step_graph = graph_data_slice(graph, (b, t))
+                step_graph = rollout_graph_slice(graph, b, t, T=actions.shape[1])
                 step_action = actions[b, t].reshape(A, action_dim)
                 step_log_prob, step_entropy, rnn_state = policy.evaluate(
                     step_graph,
@@ -214,6 +223,13 @@ def scan_policy_rnn_states(
     return states
 
 
+def rollout_graph_slice(graph: GraphData, b: int, t: int, *, T: int) -> GraphData:
+    """Slice one ``(env, time)`` graph from either flat ``[B*T]`` or shaped ``[B, T]`` batches."""
+    if graph.n_nodes.ndim == 1:
+        return graph_data_slice(graph, b * T + t)
+    return graph_data_slice(graph, (b, t))
+
+
 def compute_value_losses(
     *,
     Vl: DGPPOValueNet,
@@ -225,9 +241,41 @@ def compute_value_losses(
     A: int,
     vl_loss_scale: float,
     vh_loss_scale: float,
+    rnn_states: Optional[torch.Tensor] = None,
+    det_rnn_states: Optional[torch.Tensor] = None,
+    chunk_ids: Optional[torch.Tensor] = None,
 ) -> dict[str, torch.Tensor]:
     """Compute the real low-level and safety critic losses for one minibatch."""
     b, T = ql_targets.shape
+
+    if Vl.rnn is not None or Vh.rnn is not None:
+        if chunk_ids is None:
+            chunk_ids = torch.arange(T, device=ql_targets.device).reshape(1, T)
+        vl_info = compute_rollout_vl_loss(
+            Vl=Vl,
+            graph=graph,
+            targets=ql_targets,
+            chunk_ids=chunk_ids,
+            A=A,
+            loss_scale=vl_loss_scale,
+        )
+        if det_rnn_states is None:
+            raise ValueError("Recurrent Vh update requires deterministic rollout RNN states")
+        vh_info = compute_rollout_vh_loss(
+            Vh=Vh,
+            graph=det_graph,
+            rnn_states=det_rnn_states,
+            targets=qh_det_targets,
+            chunk_ids=chunk_ids,
+            A=A,
+            loss_scale=vh_loss_scale,
+        )
+        return {
+            "vl": vl_info["vl"],
+            "vh": vh_info["vh"],
+            "loss_vl": vl_info["loss_vl"],
+            "loss_vh": vh_info["loss_vh"],
+        }
 
     vl, _ = Vl(graph, None, A)
     vl = vl.reshape(b, T)
@@ -268,7 +316,7 @@ def compute_rollout_vl_loss(
             rnn_state = Vl.rnn.initialize_carry(1, device=targets.device) if Vl.rnn is not None else None
             for r in range(R):
                 t = int(chunk_ids[c, r].item())
-                value, rnn_state = Vl(graph_data_slice(graph, (b, t)), rnn_state, A)
+                value, rnn_state = Vl(rollout_graph_slice(graph, b, t, T=targets.shape[1]), rnn_state, A)
                 values[b, c, r] = value.squeeze(0).squeeze(-1)
     targets_chunked = targets[:, chunk_ids.long()]
     return {
@@ -295,7 +343,7 @@ def compute_rollout_vh_loss(
         for c in range(C):
             for r in range(R):
                 t = int(chunk_ids[c, r].item())
-                value, _ = Vh(graph_data_slice(graph, (b, t)), rnn_states[b, t], A)
+                value, _ = Vh(rollout_graph_slice(graph, b, t, T=targets.shape[1]), rnn_states[b, t], A)
                 values[b, c, r] = value
     targets_chunked = targets[:, chunk_ids.long()]
     return {

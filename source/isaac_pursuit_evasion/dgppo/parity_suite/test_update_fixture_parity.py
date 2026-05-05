@@ -6,7 +6,7 @@ from .parity_test_utils import assert_parity_close, importorskip, load_update_fi
 
 torch = importorskip("torch")
 
-from dgppo.update_helpers import build_update_graph_batch
+from dgppo.update_helpers import build_update_graph_batch, rollout_graph_slice
 from dgppo.utils import compute_cbf_advantages, compute_policy_surrogate
 
 
@@ -122,3 +122,12 @@ def test_build_update_graph_batch_uses_production_graph_builder(num_envs: int) -
     assert batch.qh_det_targets.shape == (B, T, A, n_cost)
     assert batch.graph.n_graphs == B * T
     assert batch.graph.get_type_states(0, A).shape == (B * T, A, S)
+
+    for b in range(B):
+        for t in (0, T - 1):
+            graph = rollout_graph_slice(batch.graph, b, t, T=T)
+            assert graph.senders.numel() == graph.receivers.numel()
+            assert int(graph.senders.min()) >= 0
+            assert int(graph.receivers.min()) >= 0
+            assert int(graph.senders.max()) < graph.nodes.shape[0]
+            assert int(graph.receivers.max()) < graph.nodes.shape[0]

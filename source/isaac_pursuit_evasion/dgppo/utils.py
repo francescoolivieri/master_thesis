@@ -313,21 +313,26 @@ def graph_data_slice(graph: GraphData, index: tuple[int, ...] | int) -> GraphDat
 
     n_graphs = graph.n_graphs
     padded_nodes = graph.nodes.shape[0] // n_graphs
-    padded_edges = graph.receivers.shape[0] // n_graphs
     node_start = flat_index * padded_nodes
     node_stop = node_start + padded_nodes
-    edge_start = flat_index * padded_edges
-    edge_stop = edge_start + padded_edges
 
-    edges = None if graph.edges is None else graph.edges[edge_start:edge_stop]
+    # Edge blocks are grouped by edge type across the full batch, not by graph.
+    # Select local edges by endpoint range rather than assuming contiguous edge storage.
+    edge_mask = (
+        (graph.receivers >= node_start)
+        & (graph.receivers < node_stop)
+        & (graph.senders >= node_start)
+        & (graph.senders < node_stop)
+    )
+    edges = None if graph.edges is None else graph.edges[edge_mask]
     return GraphData(
         n_nodes=graph.n_nodes[index],
-        n_edges=graph.n_edges[index],
+        n_edges=edge_mask.sum(),
         nodes=graph.nodes[node_start:node_stop],
         edges=edges,
         states=graph.states[node_start:node_stop],
-        receivers=graph.receivers[edge_start:edge_stop] - node_start,
-        senders=graph.senders[edge_start:edge_stop] - node_start,
+        receivers=graph.receivers[edge_mask] - node_start,
+        senders=graph.senders[edge_mask] - node_start,
         node_types=graph.node_types[node_start:node_stop],
     )
 
