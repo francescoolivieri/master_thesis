@@ -62,15 +62,16 @@ agent:
     write_interval: auto
     checkpoint_interval: auto
     store_separately: false
-    wandb: false
+    wandb: true
     wandb_kwargs:
       project: "drones_dgppo"
       entity: ""
       name: ""
+      sync_tensorboard: false
 
 # - Trainer settings, read by skrl SequentialTrainer 
 trainer:
-  timesteps: 500000
+  timesteps: 15000
   environment_info: log
   headless: true
   disable_progressbar: false

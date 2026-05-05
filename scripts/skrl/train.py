@@ -629,6 +629,51 @@ def _safe_mean(value: Any) -> Optional[float]:
         return None
 
 
+def _tracked_scalar_value(tag: str, values: Any) -> Optional[float]:
+    if values is None:
+        return None
+    try:
+        if len(values) == 0:
+            return None
+    except Exception:
+        pass
+    try:
+        tensor = torch.as_tensor(values, dtype=torch.float32)
+        if tensor.numel() == 0:
+            return None
+        if tag.endswith("(min)"):
+            return float(torch.min(tensor).item())
+        if tag.endswith("(max)"):
+            return float(torch.max(tensor).item())
+        return float(torch.mean(tensor).item())
+    except Exception:
+        try:
+            arr = np.asarray(values, dtype=np.float32)
+            if arr.size == 0:
+                return None
+            if tag.endswith("(min)"):
+                return float(np.min(arr))
+            if tag.endswith("(max)"):
+                return float(np.max(arr))
+            return float(np.mean(arr))
+        except Exception:
+            return None
+
+
+def _tracking_data_to_wandb_metrics(agent: Any, timestep: int) -> dict[str, float]:
+    tracking_data = getattr(agent, "tracking_data", None)
+    if not tracking_data:
+        return {}
+    metrics: dict[str, float] = {}
+    for tag, values in list(tracking_data.items()):
+        scalar = _tracked_scalar_value(str(tag), values)
+        if scalar is not None:
+            metrics[str(tag)] = scalar
+    if metrics:
+        metrics["skrl/timestep"] = float(timestep)
+    return metrics
+
+
 def _reward_components_to_metrics(components: Any) -> dict[str, float]:
     if not isinstance(components, dict):
         return {}
@@ -1098,6 +1143,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # set directory into agent config
     agent_cfg["agent"]["experiment"]["directory"] = log_root_path
     agent_cfg["agent"]["experiment"]["experiment_name"] = log_dir
+    wandb_kwargs = agent_cfg["agent"]["experiment"].setdefault("wandb_kwargs", {})
+    if agent_cfg["agent"]["experiment"].get("wandb", False):
+        # Mirror skrl scalars directly to W&B below. This avoids relying on W&B's TensorBoard callback, which can
+        # silently miss skrl 2.x event files in this project.
+        wandb_kwargs.setdefault("sync_tensorboard", False)
+        if not wandb_kwargs.get("name"):
+            wandb_kwargs["name"] = log_dir
     # update log_dir
     log_dir = os.path.join(log_root_path, log_dir)
 
@@ -1291,11 +1343,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         runner.agent.post_interaction = types.MethodType(_post_interaction_with_monitoring, runner.agent)
 
+    if hasattr(runner, "agent") and hasattr(runner.agent, "write_tracking_data"):
+        original_write_tracking_data = runner.agent.write_tracking_data
+
+        def _write_tracking_data_with_wandb(self, timestep: int, timesteps: int) -> None:  # type: ignore[override]
+            metrics = _tracking_data_to_wandb_metrics(self, timestep)
+            original_write_tracking_data(timestep=timestep, timesteps=timesteps)
+            if metrics:
+                wandb_bridge.log(metrics, step=timestep)
+
+        runner.agent.write_tracking_data = types.MethodType(_write_tracking_data_with_wandb, runner.agent)
+
     if checkpoint_uploader is not None and hasattr(runner, "agent") and hasattr(runner.agent, "write_checkpoint"):
         original_write_checkpoint = runner.agent.write_checkpoint
 
         def _write_checkpoint_with_upload(self, timestep: int, timesteps: int) -> None:  # type: ignore[override]
-            original_write_checkpoint(timestep, timesteps)
+            original_write_checkpoint(timestep=timestep, timesteps=timesteps)
             try:
                 checkpoint_uploader.upload_new()
             except Exception:

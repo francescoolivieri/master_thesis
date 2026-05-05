@@ -75,6 +75,7 @@ agent:
       project: "drones_rpl"
       entity: ""
       name: ""
+      sync_tensorboard: false
 
 trainer:
   class: SequentialTrainer
