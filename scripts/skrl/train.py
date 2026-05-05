@@ -78,7 +78,7 @@ parser.add_argument(
     "--algorithm",
     type=str,
     default="PPO",
-    choices=["AMP", "PPO", "IPPO", "MAPPO"],
+    choices=["AMP", "PPO", "IPPO", "MAPPO", "DGPPO"],
     help="The RL algorithm used for training the skrl agent.",
 )
 parser.add_argument("--wandb-name", type=str, help="Override WandB run name (agent.agent.experiment.wandb_kwargs.name).")

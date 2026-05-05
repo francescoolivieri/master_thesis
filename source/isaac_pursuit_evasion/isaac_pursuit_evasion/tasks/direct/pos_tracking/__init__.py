@@ -12,6 +12,7 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.pos_tracking_env_cfg:pos_tracking_velocity_cfg",
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+        "skrl_dgppo_cfg_entry_point": f"{agents.__name__}:dgppo_cfg.yaml",
     },
 )
 
@@ -22,6 +23,7 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.pos_tracking_env_cfg:pos_tracking_velocity_cfg",
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+        "skrl_dgppo_cfg_entry_point": f"{agents.__name__}:dgppo_cfg.yaml",
     },
 )
 
@@ -32,5 +34,6 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.pos_tracking_env_cfg:pos_tracking_rates_cfg",
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+        "skrl_dgppo_cfg_entry_point": f"{agents.__name__}:dgppo_cfg.yaml",
     },
 )

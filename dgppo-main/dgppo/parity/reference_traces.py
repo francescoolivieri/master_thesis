@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import jax.tree_util as jtu
 import numpy as np
-
+import optax
 from dgppo.algo import make_algo
 from dgppo.algo.dgppo import DGPPO
 from dgppo.algo.utils import compute_dec_ocp_gae
@@ -18,6 +18,10 @@ from dgppo.trainer.data import Rollout
 from .determinism import DeterminismContract, apply_determinism_contract
 from .io import flatten_tree, save_json, save_npz, save_pickle, to_numpy_tree
 from .manifest import default_checkpoint_manifest
+
+if not hasattr(jax, "tree_map"):
+    # JAX removed the top-level alias in 0.6; the reference code still calls it in update paths.
+    jax.tree_map = jtu.tree_map
 
 
 @dataclass(frozen=True)
@@ -72,6 +76,10 @@ def _copy_params(tree: Any) -> Any:
     return jtu.tree_map(lambda x: jnp.array(x), tree)
 
 
+def _copy_optimizer_state(train_state: Any) -> Any:
+    return jtu.tree_map(lambda x: jnp.array(x), train_state.opt_state)
+
+
 def _clean_rollout_env_state(rollout: Rollout) -> Rollout:
     graph_clean = rollout.graph._replace(env_states=None)
     next_graph_clean = rollout.next_graph._replace(env_states=None)
@@ -102,13 +110,45 @@ def _build_rollout_batching(rollout: Rollout, batch_size: int, rnn_step: int, se
     return {"batch_idx": np.asarray(batch_idx), "rnn_chunk_ids": np.asarray(rnn_chunk_ids)}
 
 
+def _compute_rollout_actor_checkpoints(
+    algo: DGPPO,
+    rollout: Rollout,
+    fixed_noise: jax.Array,
+) -> dict[str, Any]:
+    def eval_one(graph, action, rnn_state, noise):
+        dist, _ = algo.policy.dist.apply(
+            algo.policy_train_state.params,
+            graph,
+            rnn_state,
+            n_agents=algo.n_agents,
+        )
+        base_normal = dist.distribution.distribution
+        mean = base_normal.loc
+        std = base_normal.scale
+        mode = dist.mode()
+        log_prob = dist.log_prob(action)
+        fixed_noise_action = jnp.tanh(mean + std * noise)
+        fixed_noise_log_prob = dist.log_prob(fixed_noise_action)
+        return {
+            "mean": mean,
+            "std": std,
+            "mode": mode,
+            "log_prob": log_prob,
+            "fixed_noise": noise,
+            "fixed_noise_action": fixed_noise_action,
+            "fixed_noise_log_prob": fixed_noise_log_prob,
+        }
+
+    return jax.vmap(jax.vmap(eval_one))(rollout.graph, rollout.actions, rollout.rnn_states, fixed_noise)
+
+
 def _compute_pre_update_checkpoints(
     algo: DGPPO,
     rollout: Rollout,
     batch_idx: jnp.ndarray,
     rnn_chunk_ids: jnp.ndarray,
     step: int,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], Rollout]:
     b, T, a, _ = rollout.actions.shape
 
     key_for_det, key_for_inner = jr.split(algo.key)
@@ -144,9 +184,7 @@ def _compute_pre_update_checkpoints(
     final_Vh = jax.vmap(final_Vh_fn_)(rollout.next_graph, rollout.rnn_states)
     bTp1ah_Vh = jnp.concatenate([bTah_Vh, final_Vh[:, None]], axis=1)
 
-    bTah_Qh, bT_Ql = jax.vmap(
-        ft.partial(compute_dec_ocp_gae, disc_gamma=algo.gamma, gae_lambda=algo.gae_lambda)
-    )(
+    bTah_Qh, bT_Ql = jax.vmap(ft.partial(compute_dec_ocp_gae, disc_gamma=algo.gamma, gae_lambda=algo.gae_lambda))(
         Tah_hs=rollout.costs,
         T_l=-rollout.rewards,
         Tp1ah_Vh=bTp1ah_Vh,
@@ -158,9 +196,7 @@ def _compute_pre_update_checkpoints(
     )
     final_Vh_det = jax.vmap(final_Vh_fn_)(det_rollout.next_graph, det_rollout.rnn_states)
     bTp1ah_Vh_det = jnp.concatenate([bTah_Vh_det, final_Vh_det[:, None]], axis=1)
-    bTah_Qh_det, _ = jax.vmap(
-        ft.partial(compute_dec_ocp_gae, disc_gamma=algo.gamma, gae_lambda=algo.gae_lambda)
-    )(
+    bTah_Qh_det, _ = jax.vmap(ft.partial(compute_dec_ocp_gae, disc_gamma=algo.gamma, gae_lambda=algo.gae_lambda))(
         Tah_hs=det_rollout.costs,
         T_l=-det_rollout.rewards,
         Tp1ah_Vh=bTp1ah_Vh_det,
@@ -175,9 +211,10 @@ def _compute_pre_update_checkpoints(
     bTa_is_safe = (bTah_cbf_deriv <= 0).min(axis=-1)
     bTa_A = jnp.where(bTa_is_safe, bTa_Al, jnp.zeros_like(bTa_Al))
     if algo.cbf_schedule:
-        bTa_A += bTah_Acbf.max(axis=-1) * algo.cbf_schedule_fn(jnp.asarray(step))
+        cbf_scale = algo.cbf_schedule_fn(jnp.asarray(step))
     else:
-        bTa_A += bTah_Acbf.max(axis=-1) * algo.cbf_weight
+        cbf_scale = algo.cbf_weight
+    bTa_A += bTah_Acbf.max(axis=-1) * cbf_scale
     bTa_A = -bTa_A
 
     bcT_graph = jax.tree_map(lambda x: x[:, rnn_chunk_ids], rollout.graph)
@@ -189,9 +226,15 @@ def _compute_pre_update_checkpoints(
     action_key = jr.fold_in(key_for_inner, algo.policy_train_state.step)
     action_keys = jr.split(action_key, b * T).reshape((b, T, 2))
     bcT_action_keys = jax.tree_map(lambda x: x[:, rnn_chunk_ids], action_keys)
+    actor_fixed_noise = jr.normal(jr.fold_in(key_for_inner, 0xD650), rollout.actions.shape)
+    actor_rollout = _compute_rollout_actor_checkpoints(algo, rollout, actor_fixed_noise)
 
-    bcTa_log_pis, bcTa_policy_entropy, _, _ = jax.vmap(jax.vmap(ft.partial(algo.scan_eval_action, actor_params=algo.policy_train_state.params)))(
-        bcT_graph, bcTa_action, bc_rnn_state_inits, bcT_action_keys
+    eval_action = ft.partial(algo.scan_eval_action, actor_params=algo.policy_train_state.params)
+    bcTa_log_pis, bcTa_policy_entropy, _, _ = jax.vmap(jax.vmap(eval_action))(
+        bcT_graph,
+        bcTa_action,
+        bc_rnn_state_inits,
+        bcT_action_keys,
     )
     ratio = jnp.exp(bcTa_log_pis - bcTa_log_pis_old)
     loss_policy1 = -ratio * bcTa_A
@@ -199,8 +242,18 @@ def _compute_pre_update_checkpoints(
     loss_policy = jnp.maximum(loss_policy1, loss_policy2).mean()
     clip_frac = jnp.mean(loss_policy2 > loss_policy1)
     entropy = bcTa_policy_entropy.mean()
+    policy_loss = loss_policy - algo.coef_ent * entropy
+    loss_Vl_global = optax.l2_loss(bT_Vl, bT_Ql).mean()
+    loss_Vh_det_global = optax.l2_loss(bTah_Vh_det, bTah_Qh_det).mean()
 
     pre = {
+        "actor/rollout/mean": actor_rollout["mean"],
+        "actor/rollout/std": actor_rollout["std"],
+        "actor/rollout/mode": actor_rollout["mode"],
+        "actor/rollout/log_prob": actor_rollout["log_prob"],
+        "actor/rollout/fixed_noise": actor_rollout["fixed_noise"],
+        "actor/rollout/fixed_noise_action": actor_rollout["fixed_noise_action"],
+        "actor/rollout/fixed_noise_log_prob": actor_rollout["fixed_noise_log_prob"],
         "update/value/bT_Vl": bT_Vl,
         "update/value/bTp1_Vl": bTp1_Vl,
         "update/value/bTah_Vh": bTah_Vh,
@@ -216,16 +269,20 @@ def _compute_pre_update_checkpoints(
         "update/adv/bTah_Acbf": bTah_Acbf,
         "update/adv/bTa_is_safe": bTa_is_safe,
         "update/adv/bTa_A": bTa_A,
+        "update/adv/cbf_scale": cbf_scale,
         "update/policy/ratio": ratio,
         "update/policy/loss_policy1": loss_policy1,
         "update/policy/loss_policy2": loss_policy2,
         "update/policy/loss_policy": loss_policy,
         "update/policy/clip_frac": clip_frac,
         "update/policy/entropy": entropy,
+        "update/policy/policy_loss": policy_loss,
+        "update/loss/Vl_global": loss_Vl_global,
+        "update/loss/Vh_det_global": loss_Vh_det_global,
         "aux/batch_idx": batch_idx,
         "aux/rnn_chunk_ids": rnn_chunk_ids,
     }
-    return pre
+    return pre, det_rollout
 
 
 def _build_algo(config: UpdateFixtureConfig) -> DGPPO:
@@ -303,7 +360,7 @@ def export_update_fixtures(
         rnn_step=config.rnn_step,
         seed=np_seed_for_update,
     )
-    pre = _compute_pre_update_checkpoints(
+    pre, det_rollout = _compute_pre_update_checkpoints(
         algo=algo,
         rollout=rollout,
         batch_idx=jnp.asarray(batching["batch_idx"]),
@@ -315,6 +372,11 @@ def export_update_fixtures(
         "policy": _copy_params(algo.policy_train_state.params),
         "Vl": _copy_params(algo.Vl_train_state.params),
         "Vh": _copy_params(algo.Vh_train_state.params),
+    }
+    optimizer_state_before = {
+        "policy": _copy_optimizer_state(algo.policy_train_state),
+        "Vl": _copy_optimizer_state(algo.Vl_train_state),
+        "Vh": _copy_optimizer_state(algo.Vh_train_state),
     }
     algo_key_before = np.asarray(algo.key)
     if contract.reset_numpy_seed_before_update:
@@ -333,9 +395,18 @@ def export_update_fixtures(
         "update/metrics/policy_grad_norm": update_info.get("policy/grad_norm"),
         "update/metrics/Vl_grad_norm": update_info.get("Vl/grad_norm"),
         "update/metrics/Vh_grad_Vh_norm": update_info.get("Vh/grad_Vh_norm"),
-        "update/param_delta/policy": np.asarray(_param_delta_norm(params_before["policy"], params_after["policy"]), dtype=np.float32),
-        "update/param_delta/Vl": np.asarray(_param_delta_norm(params_before["Vl"], params_after["Vl"]), dtype=np.float32),
-        "update/param_delta/Vh": np.asarray(_param_delta_norm(params_before["Vh"], params_after["Vh"]), dtype=np.float32),
+        "update/param_delta/policy": np.asarray(
+            _param_delta_norm(params_before["policy"], params_after["policy"]),
+            dtype=np.float32,
+        ),
+        "update/param_delta/Vl": np.asarray(
+            _param_delta_norm(params_before["Vl"], params_after["Vl"]),
+            dtype=np.float32,
+        ),
+        "update/param_delta/Vh": np.asarray(
+            _param_delta_norm(params_before["Vh"], params_after["Vh"]),
+            dtype=np.float32,
+        ),
     }
 
     payload = {
@@ -345,13 +416,47 @@ def export_update_fixtures(
             "determinism_contract": contract.to_dict(),
             "manifest": [spec.to_dict() for spec in default_checkpoint_manifest()],
             "numpy_seed_for_update": np_seed_for_update,
+            "optimizer": {
+                "policy": {
+                    "type": "optax.apply_if_finite(optax.adam)",
+                    "learning_rate": config.lr_actor,
+                    "b1": 0.9,
+                    "b2": 0.999,
+                    "eps": 1e-8,
+                    "eps_root": 0.0,
+                    "max_consecutive_errors": 1_000_000,
+                    "gradient_clipping": "compute_norm_and_clip before TrainState.apply_gradients",
+                },
+                "Vl": {
+                    "type": "optax.apply_if_finite(optax.adam)",
+                    "learning_rate": config.lr_Vl,
+                    "b1": 0.9,
+                    "b2": 0.999,
+                    "eps": 1e-8,
+                    "eps_root": 0.0,
+                    "max_consecutive_errors": 1_000_000,
+                    "gradient_clipping": "compute_norm_and_clip before TrainState.apply_gradients",
+                },
+                "Vh": {
+                    "type": "optax.apply_if_finite(optax.adam)",
+                    "learning_rate": config.lr_Vh,
+                    "b1": 0.9,
+                    "b2": 0.999,
+                    "eps": 1e-8,
+                    "eps_root": 0.0,
+                    "max_consecutive_errors": 1_000_000,
+                    "gradient_clipping": "compute_norm_and_clip before TrainState.apply_gradients",
+                },
+            },
         },
         "inputs": {
             "rollout": to_numpy_tree(_clean_rollout_env_state(rollout)),
+            "det_rollout": to_numpy_tree(det_rollout),
             "algo_key_before_update": algo_key_before,
             "trainer_key_after_collect": np.asarray(trainer_key),
             "batching": batching,
             "params_before_update": to_numpy_tree(params_before),
+            "optimizer_state_before_update": to_numpy_tree(optimizer_state_before),
         },
         "checkpoints": to_numpy_tree(pre | post_metrics),
         "raw_update_info": to_numpy_tree(update_info),
@@ -382,42 +487,95 @@ def export_drift_trace(
     for i in range(config.n_drift_updates):
         rollout, trainer_key = _collect_rollout(algo, config.n_env_train, trainer_key)
         np_seed_for_update = config.seed + i
-        if contract.reset_numpy_seed_before_update:
-            np.random.seed(np_seed_for_update)
+        batching = _build_rollout_batching(
+            rollout=rollout,
+            batch_size=config.batch_size,
+            rnn_step=config.rnn_step,
+            seed=np_seed_for_update,
+        )
+        pre, det_rollout = _compute_pre_update_checkpoints(
+            algo=algo,
+            rollout=rollout,
+            batch_idx=jnp.asarray(batching["batch_idx"]),
+            rnn_chunk_ids=jnp.asarray(batching["rnn_chunk_ids"]),
+            step=i,
+        )
         params_before = {
             "policy": _copy_params(algo.policy_train_state.params),
             "Vl": _copy_params(algo.Vl_train_state.params),
             "Vh": _copy_params(algo.Vh_train_state.params),
         }
+        optimizer_state_before = {
+            "policy": _copy_optimizer_state(algo.policy_train_state),
+            "Vl": _copy_optimizer_state(algo.Vl_train_state),
+            "Vh": _copy_optimizer_state(algo.Vh_train_state),
+        }
+        algo_key_before = np.asarray(algo.key)
+        if contract.reset_numpy_seed_before_update:
+            np.random.seed(np_seed_for_update)
         info = algo.update(rollout, step=i)
         params_after = {
             "policy": _copy_params(algo.policy_train_state.params),
             "Vl": _copy_params(algo.Vl_train_state.params),
             "Vh": _copy_params(algo.Vh_train_state.params),
         }
-        trace.append(
-            {
-                "step": i,
-                "numpy_seed_for_update": np_seed_for_update,
-                "update_info": to_numpy_tree(info),
-                "param_delta_norms": {
-                    "policy": _param_delta_norm(params_before["policy"], params_after["policy"]),
-                    "Vl": _param_delta_norm(params_before["Vl"], params_after["Vl"]),
-                    "Vh": _param_delta_norm(params_before["Vh"], params_after["Vh"]),
-                },
-                "param_norms_after": {
-                    "policy": _param_norm(params_after["policy"]),
-                    "Vl": _param_norm(params_after["Vl"]),
-                    "Vh": _param_norm(params_after["Vh"]),
-                },
-            }
-        )
+        post_metrics = {
+            "update/metrics/policy_loss": info.get("policy/loss"),
+            "update/metrics/Vl_loss": info.get("Vl/loss"),
+            "update/metrics/Vh_loss": info.get("Vh/loss_Vh"),
+            "update/metrics/policy_grad_norm": info.get("policy/grad_norm"),
+            "update/metrics/Vl_grad_norm": info.get("Vl/grad_norm"),
+            "update/metrics/Vh_grad_Vh_norm": info.get("Vh/grad_Vh_norm"),
+            "update/param_delta/policy": np.asarray(
+                _param_delta_norm(params_before["policy"], params_after["policy"]),
+                dtype=np.float32,
+            ),
+            "update/param_delta/Vl": np.asarray(
+                _param_delta_norm(params_before["Vl"], params_after["Vl"]),
+                dtype=np.float32,
+            ),
+            "update/param_delta/Vh": np.asarray(
+                _param_delta_norm(params_before["Vh"], params_after["Vh"]),
+                dtype=np.float32,
+            ),
+        }
+        trace.append({
+            "step": i,
+            "numpy_seed_for_update": np_seed_for_update,
+            "inputs": {
+                "rollout": to_numpy_tree(_clean_rollout_env_state(rollout)),
+                "det_rollout": to_numpy_tree(det_rollout),
+                "algo_key_before_update": algo_key_before,
+                "trainer_key_after_collect": np.asarray(trainer_key),
+                "batching": batching,
+                "params_before_update": to_numpy_tree(params_before),
+                "optimizer_state_before_update": to_numpy_tree(optimizer_state_before),
+            },
+            "checkpoints": to_numpy_tree(pre | post_metrics),
+            "update_info": to_numpy_tree(info),
+            "param_delta_norms": {
+                "policy": _param_delta_norm(params_before["policy"], params_after["policy"]),
+                "Vl": _param_delta_norm(params_before["Vl"], params_after["Vl"]),
+                "Vh": _param_delta_norm(params_before["Vh"], params_after["Vh"]),
+            },
+            "param_norms_after": {
+                "policy": _param_norm(params_after["policy"]),
+                "Vl": _param_norm(params_after["Vl"]),
+                "Vh": _param_norm(params_after["Vh"]),
+            },
+            "params_after_update": to_numpy_tree(params_after),
+        })
 
     payload = {
         "metadata": {
             "fixture_type": "drift_trace",
             "config": asdict(config),
             "determinism_contract": contract.to_dict(),
+            "derived": {
+                "num_envs_total": 2 * config.n_env_train,
+                "n_updates": config.n_drift_updates,
+            },
+            "manifest": [spec.to_dict() for spec in default_checkpoint_manifest()],
         },
         "trace": trace,
     }

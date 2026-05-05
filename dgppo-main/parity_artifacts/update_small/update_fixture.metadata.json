@@ -34,7 +34,7 @@
   },
   "determinism_contract": {
     "dtype": "float32",
-    "force_cpu": false,
+    "force_cpu": true,
     "jax_disable_jit": false,
     "note_entropy_rng": "Entropy in TanhTransformedDistribution samples with numpy.randint; compare entropy-sensitive metrics only when call order and NumPy seed resets match.",
     "reset_numpy_seed_before_update": true,
@@ -106,6 +106,62 @@
       "name": "kernel/grad/clipped_norm",
       "required": true,
       "rtol": 1e-05
+    },
+    {
+      "atol": 1e-05,
+      "description": "Policy Normal mean on rollout graphs",
+      "level": "update",
+      "name": "actor/rollout/mean",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Policy Normal std on rollout graphs",
+      "level": "update",
+      "name": "actor/rollout/std",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Squashed policy mode on rollout graphs",
+      "level": "update",
+      "name": "actor/rollout/mode",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Policy log-prob of rollout actions",
+      "level": "update",
+      "name": "actor/rollout/log_prob",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Deterministic standard-normal noise used for fixed-noise action checks",
+      "level": "update",
+      "name": "actor/rollout/fixed_noise",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Squashed action from rollout mean/std and fixed standard-normal noise",
+      "level": "update",
+      "name": "actor/rollout/fixed_noise_action",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Policy log-prob of the fixed-noise squashed action",
+      "level": "update",
+      "name": "actor/rollout/fixed_noise_log_prob",
+      "required": true,
+      "rtol": 0.0001
     },
     {
       "atol": 1e-05,
@@ -277,6 +333,30 @@
     },
     {
       "atol": 1e-05,
+      "description": "Batch policy loss with entropy term",
+      "level": "update",
+      "name": "update/policy/policy_loss",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Global pre-update Vl L2 loss",
+      "level": "update",
+      "name": "update/loss/Vl_global",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Global pre-update deterministic Vh L2 loss",
+      "level": "update",
+      "name": "update/loss/Vh_det_global",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
       "description": "Logged policy loss",
       "level": "update",
       "name": "update/metrics/policy_loss",
@@ -348,5 +428,37 @@
       "rtol": 0.0001
     }
   ],
-  "numpy_seed_for_update": 0
+  "numpy_seed_for_update": 0,
+  "optimizer": {
+    "Vh": {
+      "b1": 0.9,
+      "b2": 0.999,
+      "eps": 1e-08,
+      "eps_root": 0.0,
+      "gradient_clipping": "compute_norm_and_clip before TrainState.apply_gradients",
+      "learning_rate": 0.001,
+      "max_consecutive_errors": 1000000,
+      "type": "optax.apply_if_finite(optax.adam)"
+    },
+    "Vl": {
+      "b1": 0.9,
+      "b2": 0.999,
+      "eps": 1e-08,
+      "eps_root": 0.0,
+      "gradient_clipping": "compute_norm_and_clip before TrainState.apply_gradients",
+      "learning_rate": 0.001,
+      "max_consecutive_errors": 1000000,
+      "type": "optax.apply_if_finite(optax.adam)"
+    },
+    "policy": {
+      "b1": 0.9,
+      "b2": 0.999,
+      "eps": 1e-08,
+      "eps_root": 0.0,
+      "gradient_clipping": "compute_norm_and_clip before TrainState.apply_gradients",
+      "learning_rate": 0.0003,
+      "max_consecutive_errors": 1000000,
+      "type": "optax.apply_if_finite(optax.adam)"
+    }
+  }
 }

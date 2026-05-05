@@ -31,7 +31,7 @@ agent:
   obs_radius: 2.0
 
   # RNN
-  use_rnn: false
+  use_rnn: true
   rnn:
     cell:   gru
     hidden: 64

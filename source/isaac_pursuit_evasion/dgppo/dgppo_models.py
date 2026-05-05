@@ -109,6 +109,7 @@ class DGPPOValueNet(nn.Module):
         # Note: same backbone as the policy net, different heads
         self.gnn = GraphTransformerGNN(
             in_dim=node_dim,
+            edge_dim=edge_dim,
             msg_dim=gnn_msg_dim,
             out_dim=gnn_out_dim,
             n_heads=gnn_heads,
@@ -165,8 +166,12 @@ class TanhNormal:
         # average(pdf) = p / epsilon -> log(average(pdf)) = log(p) - log(epsilon)
         self.log_epsilon = math.log(1.0 - threshold)
 
-    def sample(self) -> torch.Tensor:
-        u = self.normal.rsample()
+    def sample(self, noise: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Sample with optional fixed standard-normal noise for parity tests."""
+        if noise is None:
+            u = self.normal.rsample()
+        else:
+            u = self.mean + self.std * noise
         return torch.tanh(u)
     
     def _log_cdf(self, x: float) -> torch.Tensor:
@@ -269,12 +274,14 @@ class DGPPOPolicy(nn.Module):
         self.device = torch.device(device) if device is not None else torch.device("cpu")
         self.std_dev_min = std_dev_min
         self.std_dev_init = std_dev_init
+        self.std_dev_init_inv = math.log(math.exp(std_dev_init) - 1.0)
 
         # Note: same backbone as the value net, different heads
         self.use_rnn = use_rnn
 
         self.gnn = GraphTransformerGNN(
             in_dim=node_dim,
+            edge_dim=edge_dim,
             msg_dim=gnn_msg_dim,
             out_dim=gnn_out_dim,
             n_heads=gnn_heads,
@@ -338,7 +345,7 @@ class DGPPOPolicy(nn.Module):
         h = self.scale_hid(x)
         
         mean = self.mean_head(h)
-        std = F.softplus(self.std_head(h) + self.std_dev_init) + self.std_dev_min
+        std = F.softplus(self.std_head(h) + self.std_dev_init_inv) + self.std_dev_min
         return TanhNormal(mean, std), rnn_state
     
     def act(
@@ -381,7 +388,7 @@ class DGPPOPolicy(nn.Module):
         dist, rnn_state = self.distribution(graph, rnn_state, n_agents_total)
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()
-        return log_prob, entropy, rnn_state    
+        return log_prob, entropy, rnn_state
     
     def enable_training_mode(self, enabled: bool = True) -> None:
         """Called by skrl Agent.enable_models_training_mode()."""
@@ -392,4 +399,3 @@ class DGPPOPolicy(nn.Module):
         if self.rnn is None:
             return None
         return self.rnn.initialize_carry(n_agents_total, device=device)
-        

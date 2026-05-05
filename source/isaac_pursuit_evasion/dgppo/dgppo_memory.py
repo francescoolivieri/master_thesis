@@ -91,6 +91,11 @@ class DGPPORolloutMemory(RandomMemory):
             "stc": torch.zeros(self.n_stc_envs, A, NH, dtype=torch.float32, device=device),
             "det": torch.zeros(self.n_det_envs, A, NH, dtype=torch.float32, device=device),
         }
+        self._cursor = 0
+
+    def _tensor(self, name: str) -> torch.Tensor:
+        """Return the flat per-step storage tensor created by skrl memory."""
+        return self.tensors[name].squeeze(1)
 
     # ------------------------------------------------------------------
     # Check from here
@@ -136,31 +141,31 @@ class DGPPORolloutMemory(RandomMemory):
         if t >= self.rollout_length:
             raise RuntimeError("DGPPORolloutMemory.add called past rollout_length")
 
-        getattr(self, "stc_agent_state")[t] = stc_agent_state.reshape(-1)
-        getattr(self, "stc_goal_state")[t] = stc_goal_state.reshape(-1)
-        getattr(self, "stc_obs_state")[t] = stc_obs_state.reshape(-1)
-        getattr(self, "stc_actions")[t] = stc_action.reshape(-1)
-        getattr(self, "stc_log_probs")[t] = stc_log_prob.reshape(-1)
-        getattr(self, "stc_rewards")[t] = stc_reward.reshape(-1)
-        getattr(self, "stc_costs")[t] = stc_cost.reshape(-1)
-        getattr(self, "stc_values_l")[t] = stc_value_l.reshape(-1)
-        getattr(self, "stc_values_h")[t] = stc_value_h.reshape(-1)
+        self._tensor("stc_agent_state")[t] = stc_agent_state.reshape(-1)
+        self._tensor("stc_goal_state")[t] = stc_goal_state.reshape(-1)
+        self._tensor("stc_obs_state")[t] = stc_obs_state.reshape(-1)
+        self._tensor("stc_actions")[t] = stc_action.reshape(-1)
+        self._tensor("stc_log_probs")[t] = stc_log_prob.reshape(-1)
+        self._tensor("stc_rewards")[t] = stc_reward.reshape(-1)
+        self._tensor("stc_costs")[t] = stc_cost.reshape(-1)
+        self._tensor("stc_values_l")[t] = stc_value_l.reshape(-1)
+        self._tensor("stc_values_h")[t] = stc_value_h.reshape(-1)
 
-        getattr(self, "det_agent_state")[t] = det_agent_state.reshape(-1)
-        getattr(self, "det_goal_state")[t] = det_goal_state.reshape(-1)
-        getattr(self, "det_obs_state")[t] = det_obs_state.reshape(-1)
-        getattr(self, "det_actions")[t] = det_action.reshape(-1)
-        getattr(self, "det_log_probs")[t] = det_log_prob.reshape(-1)
-        getattr(self, "det_rewards")[t] = det_reward.reshape(-1)
-        getattr(self, "det_costs")[t] = det_cost.reshape(-1)
-        getattr(self, "det_values_l")[t] = det_value_l.reshape(-1)
-        getattr(self, "det_values_h")[t] = det_value_h.reshape(-1)
+        self._tensor("det_agent_state")[t] = det_agent_state.reshape(-1)
+        self._tensor("det_goal_state")[t] = det_goal_state.reshape(-1)
+        self._tensor("det_obs_state")[t] = det_obs_state.reshape(-1)
+        self._tensor("det_actions")[t] = det_action.reshape(-1)
+        self._tensor("det_log_probs")[t] = det_log_prob.reshape(-1)
+        self._tensor("det_rewards")[t] = det_reward.reshape(-1)
+        self._tensor("det_costs")[t] = det_cost.reshape(-1)
+        self._tensor("det_values_l")[t] = det_value_l.reshape(-1)
+        self._tensor("det_values_h")[t] = det_value_h.reshape(-1)
         
         if self.use_rnn:
             if stc_rnn_state is not None:
-                getattr(self, "stc_rnn_states")[t] = stc_rnn_state.reshape(-1)
+                self._tensor("stc_rnn_states")[t] = stc_rnn_state.reshape(-1)
             if det_rnn_state is not None:
-                getattr(self, "det_rnn_states")[t] = det_rnn_state.reshape(-1)
+                self._tensor("det_rnn_states")[t] = det_rnn_state.reshape(-1)
 
         self._cursor += 1
 
@@ -187,15 +192,15 @@ class DGPPORolloutMemory(RandomMemory):
         O = self._n_obs
         T = self.rollout_length
 
-        agent_state = getattr(self, f"{split}_agent_state").reshape(T, B, A, self._state_dim)
-        goal_state = getattr(self, f"{split}_goal_state").reshape(T, B, A, self._state_dim)
-        obs_state = getattr(self, f"{split}_obs_state").reshape(T, B, O, self._state_dim)
-        actions = getattr(self, f"{split}_actions").reshape(T, B, A, self._action_dim)
-        log_probs = getattr(self, f"{split}_log_probs").reshape(T, B, A)
-        rewards = getattr(self, f"{split}_rewards").reshape(T, B)
-        costs = getattr(self, f"{split}_costs").reshape(T, B, A, self._n_constraints)
-        values_l = getattr(self, f"{split}_values_l").reshape(T, B)
-        values_h = getattr(self, f"{split}_values_h").reshape(T, B, A, self._n_constraints)
+        agent_state = self._tensor(f"{split}_agent_state").reshape(T, B, A, self._state_dim)
+        goal_state = self._tensor(f"{split}_goal_state").reshape(T, B, A, self._state_dim)
+        obs_state = self._tensor(f"{split}_obs_state").reshape(T, B, O, self._state_dim)
+        actions = self._tensor(f"{split}_actions").reshape(T, B, A, self._action_dim)
+        log_probs = self._tensor(f"{split}_log_probs").reshape(T, B, A)
+        rewards = self._tensor(f"{split}_rewards").reshape(T, B)
+        costs = self._tensor(f"{split}_costs").reshape(T, B, A, self._n_constraints)
+        values_l = self._tensor(f"{split}_values_l").reshape(T, B)
+        values_h = self._tensor(f"{split}_values_h").reshape(T, B, A, self._n_constraints)
         v_l_tp1 = torch.cat([values_l, self._final_values_l[split].unsqueeze(0)], dim=0)
         v_h_tp1 = torch.cat([values_h, self._final_values_h[split].unsqueeze(0)], dim=0)
 
@@ -217,7 +222,7 @@ class DGPPORolloutMemory(RandomMemory):
             # RNN state shape in memory: [T, B * A * L * C * H]
             # Transpose to [B, T, A, L, C, H]
             # Wait, N = B * A. The memory stores it as [T, N * L * C * H]
-            rnn_states = getattr(self, f"{split}_rnn_states").reshape(T, B, A, self.rnn_layers, self.rnn_carries, self.rnn_hidden)
+            rnn_states = self._tensor(f"{split}_rnn_states").reshape(T, B, A, self.rnn_layers, self.rnn_carries, self.rnn_hidden)
             data["bTa_rnn_states"] = rnn_states.transpose(0, 1) # [B, T, A, L, C, H]
             
         return data

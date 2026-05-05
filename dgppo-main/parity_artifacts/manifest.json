@@ -66,6 +66,62 @@
     },
     {
       "atol": 1e-05,
+      "description": "Policy Normal mean on rollout graphs",
+      "level": "update",
+      "name": "actor/rollout/mean",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Policy Normal std on rollout graphs",
+      "level": "update",
+      "name": "actor/rollout/std",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Squashed policy mode on rollout graphs",
+      "level": "update",
+      "name": "actor/rollout/mode",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Policy log-prob of rollout actions",
+      "level": "update",
+      "name": "actor/rollout/log_prob",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Deterministic standard-normal noise used for fixed-noise action checks",
+      "level": "update",
+      "name": "actor/rollout/fixed_noise",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Squashed action from rollout mean/std and fixed standard-normal noise",
+      "level": "update",
+      "name": "actor/rollout/fixed_noise_action",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Policy log-prob of the fixed-noise squashed action",
+      "level": "update",
+      "name": "actor/rollout/fixed_noise_log_prob",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
       "description": "Value sequence from Vl scan",
       "level": "update",
       "name": "update/value/bT_Vl",
@@ -229,6 +285,30 @@
       "description": "Batch policy entropy",
       "level": "update",
       "name": "update/policy/entropy",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Batch policy loss with entropy term",
+      "level": "update",
+      "name": "update/policy/policy_loss",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Global pre-update Vl L2 loss",
+      "level": "update",
+      "name": "update/loss/Vl_global",
+      "required": true,
+      "rtol": 0.0001
+    },
+    {
+      "atol": 1e-05,
+      "description": "Global pre-update deterministic Vh L2 loss",
+      "level": "update",
+      "name": "update/loss/Vh_det_global",
       "required": true,
       "rtol": 0.0001
     },

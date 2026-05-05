@@ -1,11 +1,23 @@
 import torch
 import time
-import torch.nn.functional as F
 from typing import Any, Mapping, Optional
 from skrl.agents.torch import Agent, AgentCfg
 from .dgppo_memory import DGPPORolloutMemory
 from .dgppo_models import DGPPOValueNet, DGPPOPolicy
-from .utils import compute_cbf_advantages, compute_dec_ocp_gae, compute_policy_surrogate, GraphData
+from .update_helpers import (
+    apply_policy_update,
+    apply_value_update,
+    build_update_graph_batch,
+    compute_policy_loss,
+    compute_value_losses,
+)
+from .utils import (
+    GraphData,
+    build_graph_data,
+    compute_cbf_advantages,
+    compute_dec_ocp_gae,
+    extract_graph_states_from_flat_obs,
+)
 
 
 class DGPPOAgent(Agent):
@@ -417,87 +429,65 @@ class DGPPOAgent(Agent):
         det_view: dict[str, torch.Tensor],
     ) -> dict[str, float]:
         """Single PPO minibatch step over one chunk of the ``B`` axis."""
-        # Gather the minibatch (axes: B first after ``as_bTah_view``).
-        agent_s = view["bTa_agent_state"][idx]       # (b, T, A, S)
-        goal_s = view["bTa_goal_state"][idx]
-        obs_s = view["bTo_obs_state"][idx]
-        actions = view["bTa_actions"][idx]           # (b, T, A, Da)
-        old_logp = view["bTa_logp"][idx]             # (b, T, A)
-        Qh_det_mb = Qh_det[idx]                      # (b, T, A, NH)
-        Ql_mb = Ql[idx]                              # (b, T)
-        adv_mb = bTa_A[idx]               
-    
-        b, T, A, _ = actions.shape
-        BT = b * T
-
-        # Flatten (B, T) -> (BT) sub-graphs and rebuild a single batched graph.
-        graph = build_graph_data(
-            agent_state=agent_s.reshape(BT, A, -1),
-            goal_state=goal_s.reshape(BT, A, -1),
-            obs_state=obs_s.reshape(BT, obs_s.shape[2], -1),
+        batch = build_update_graph_batch(
+            idx=idx,
+            view=view,
+            det_view=det_view,
+            qh_det=Qh_det,
+            ql=Ql,
+            advantages=bTa_A,
             obs_radius=self.obs_radius,
         )
-        n_agents_total = BT * A
 
         # ---- Policy ----
-        log_prob, entropy, _ = self.policy.evaluate(
-            graph,
-            action=actions.reshape(n_agents_total, -1),
+        policy_info = compute_policy_loss(
+            policy=self.policy,
+            graph=batch.graph,
+            actions=batch.actions,
+            old_logp=batch.old_logp,
+            advantages=batch.advantages,
+            clip_eps=self.clip_eps,
+            entropy_scale=self.entropy_scale,
+            n_agents_total=batch.n_agents_total,
             rnn_state=None,
-            n_agents_total=n_agents_total,
         )
-        log_prob = log_prob.reshape(b, T, A)
-        ratio = torch.exp(log_prob - old_logp.detach())
-        surrogate = compute_policy_surrogate(ratio, adv_mb, self.clip_eps)
-        loss_policy = surrogate["loss_policy"]
-        entropy_bonus = -self.entropy_scale * entropy.mean() if self.entropy_scale > 0 else 0.0
-        loss_p_total = loss_policy + entropy_bonus
-
-        self._policy_opt.zero_grad(set_to_none=True)
-        loss_p_total.backward()
-        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.grad_clip)
-        self._policy_opt.step()
-
-        # ---- Critic Vl ----
-        vl, _ = self.Vl(graph, None, A)
-        vl = vl.reshape(b, T)
-        loss_vl = self.vl_loss_scale * F.mse_loss(vl, Ql_mb)
-
-        self._vl_opt.zero_grad(set_to_none=True)
-        loss_vl.backward()
-        torch.nn.utils.clip_grad_norm_(
-            self._vl_grad_params,
-            self.grad_clip,
+        apply_policy_update(
+            optimizer=self._policy_opt,
+            loss=policy_info["loss_policy_total"],
+            parameters=self.policy.parameters(),
+            grad_clip=self.grad_clip,
         )
-        self._vl_opt.step()
 
-        # ---- Critic Vh ----
-        det_agent_s = det_view["bTa_agent_state"][idx]
-        det_goal_s = det_view["bTa_goal_state"][idx]
-        det_obs_s = det_view["bTo_obs_state"][idx]
-        det_graph = build_graph_data(
-            agent_state=det_agent_s.reshape(BT, A, -1),
-            goal_state=det_goal_s.reshape(BT, A, -1),
-            obs_state=det_obs_s.reshape(BT, det_obs_s.shape[2], -1),
-            obs_radius=self.obs_radius,
+        # ---- Critics ----
+        value_info = compute_value_losses(
+            Vl=self.Vl,
+            Vh=self.Vh,
+            graph=batch.graph,
+            det_graph=batch.det_graph,
+            ql_targets=batch.ql_targets,
+            qh_det_targets=batch.qh_det_targets,
+            A=batch.A,
+            vl_loss_scale=self.vl_loss_scale,
+            vh_loss_scale=self.vh_loss_scale,
         )
-        vh, _ = self.Vh(det_graph, None, A)
-        vh = vh.reshape(b, T, A, -1)
-        loss_vh = self.vh_loss_scale * F.mse_loss(vh, Qh_det_mb)
-
-        self._vh_opt.zero_grad(set_to_none=True)
-        loss_vh.backward()
-        torch.nn.utils.clip_grad_norm_(
-            self._vh_grad_params,
-            self.grad_clip,
+        apply_value_update(
+            optimizer=self._vl_opt,
+            loss=value_info["loss_vl"],
+            parameters=self._vl_grad_params,
+            grad_clip=self.grad_clip,
         )
-        self._vh_opt.step()
+        apply_value_update(
+            optimizer=self._vh_opt,
+            loss=value_info["loss_vh"],
+            parameters=self._vh_grad_params,
+            grad_clip=self.grad_clip,
+        )
 
         return {
-            "loss_p": float(loss_policy.item()),
-            "loss_vl": float(loss_vl.item()),
-            "loss_vh": float(loss_vh.item()),
-            "clip_frac": float(surrogate["clip_frac"].item()),
+            "loss_p": float(policy_info["loss_policy"].item()),
+            "loss_vl": float(value_info["loss_vl"].item()),
+            "loss_vh": float(value_info["loss_vh"].item()),
+            "clip_frac": float(policy_info["clip_frac"].item()),
         }
     
     def load_dgppo_hyperparameters(self) -> None:
@@ -538,27 +528,11 @@ class DGPPOAgent(Agent):
         self, observations: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Decode flat policy observations into graph node state tensors."""
-        layout: dict = self.env.unwrapped.graph_obs_layout
-        E = observations.shape[0]
-        S = int(layout["state_dim"])
-        A = int(layout.get("n_agents", self.env.num_agents))
-        O = int(layout["n_obstacles"])
-
-        agent_flat = observations[:, : layout["agent_end"]]
-        agent_state = agent_flat.reshape(E, A, S)
-
-        goal_pos_flat = observations[:, layout["agent_end"] : layout["goal_end"]]
-        goal_pos = goal_pos_flat.reshape(E, A, 3)
-        goal_state = torch.cat([goal_pos, goal_pos.new_zeros(E, A, S - 3)], dim=-1)
-
-        if O > 0:
-            obstacle_xy = observations[:, layout["goal_end"] : layout["obstacles_end"]]
-            obstacle_xy = obstacle_xy.reshape(E, O, 2)
-            obs_state = torch.cat([obstacle_xy, obstacle_xy.new_zeros(E, O, S - 2)], dim=-1)
-        else:
-            obs_state = observations.new_zeros(E, 0, S)
-
-        return agent_state, goal_state, obs_state
+        return extract_graph_states_from_flat_obs(
+            observations,
+            self.env.unwrapped.graph_obs_layout,
+            n_agents=self.env.num_agents,
+        )
 
     def _build_graph(self, observations: torch.Tensor, states: torch.Tensor | None) -> GraphData:
         """Parse the flat policy-obs tensor into structured node states and build the graph."""
@@ -570,235 +544,3 @@ class DGPPOAgent(Agent):
             obs_state=obs_state,
             obs_radius=self.obs_radius,
         )
-
-
-
-
-# ---------------------------------------------------------------------------
-# Graph construction
-# ---------------------------------------------------------------------------
-
-# Node-type integer IDs
-AGENT_TYPE: int = 0   # moving agents
-GOAL_TYPE:  int = 1   # goal positions (one per agent)
-OBS_TYPE:   int = 2   # static obstacles
-PAD_TYPE:   int = -1  # dummy padding node (absorbs masked-out edges)
-
-# One-hot indicator length; order: [obstacle_bit, goal_bit, agent_bit]
-NUM_TYPE_INDICATORS: int = 3
-
-
-def build_graph_data(
-    agent_state: torch.Tensor,         # (E, A, S)
-    goal_state:  torch.Tensor,         # (E, A, S)  one goal per agent
-    obs_state:   torch.Tensor | None,  # (E, O, S)  or None when no obstacles
-    *,
-    obs_radius: float,
-) -> GraphData:
-    """Build a batched GraphData for E parallel environments.
-
-    Node ordering within each sub-graph: [agents | goals | obstacles | pad].
-    Sub-graphs are concatenated along the leading node/edge axis so the whole
-    batch is represented by a single flat GraphData (jraph convention).
-    
-    Vectorized approach for efficiency.
-
-    Args:
-        agent_state: Per-agent physical state (E, A, S).
-        goal_state:  Goal state, one per agent (E, A, S).
-        obs_state:   Obstacle states (E, O, S), or None.
-        obs_radius:  Proximity radius for A-A and A-O edge activation.
-    """
-    assert agent_state.dim() == 3 and goal_state.dim() == 3
-    assert agent_state.shape[0] == goal_state.shape[0], "E must match"
-    assert agent_state.shape[1] == goal_state.shape[1], "need one goal per agent"
-    assert agent_state.shape[2] == goal_state.shape[2], "state dim must match"
-
-    E, A, S = agent_state.shape
-    device = agent_state.device
-
-    # Normalise: absent obstacles -> empty tensor 
-    if obs_state is None:
-        obs_state = agent_state.new_zeros(E, 0, S)
-    assert obs_state.shape[0] == E and obs_state.shape[2] == S
-    O = obs_state.shape[1]
-
-    # 1. Node features  (E, N_per, node_dim) — then flattened to (E*N_per, node_dim)  
-    N_per = A + A + O + 1 # N_per = A agents + A goals + O obstacles + 1 padding node
-    nodes, states, node_types = _make_node_features(agent_state, goal_state, obs_state)
-    
-    nodes_flat      = nodes.reshape(E * N_per, -1)
-    states_flat     = states.reshape(E * N_per, -1)
-    node_types_flat = node_types.reshape(E * N_per)
-
-    # 2. Edges
-    # Global node ids: each env e owns a contiguous block [e*N_per, (e+1)*N_per).
-    # Local ids are broadcast across E via env_offsets.
-    env_offsets = (torch.arange(E, device=device) * N_per).unsqueeze(1)  # (E, 1)
-
-    agent_ids = torch.arange(A,          device=device).unsqueeze(0) + env_offsets   # (E, A)
-    goal_ids  = torch.arange(A,  2*A,    device=device).unsqueeze(0) + env_offsets   # (E, A)
-    obs_ids   = torch.arange(2*A, 2*A+O, device=device).unsqueeze(0) + env_offsets   # (E, O)
-    pad_ids   = (N_per - 1 + env_offsets.squeeze(1)).long()                          # (E,)
-
-    edges_flat, recvs_flat, sends_flat, n_edges_per_env = _make_edge_list(
-        agent_state, goal_state, obs_state,
-        agent_ids, goal_ids, obs_ids, pad_ids,
-        obs_radius=obs_radius,
-    )
-
-    n_nodes = torch.full((E,), N_per,           dtype=torch.long, device=device)
-    n_edges = torch.full((E,), n_edges_per_env, dtype=torch.long, device=device)
-
-    return GraphData(
-        n_nodes=n_nodes,
-        n_edges=n_edges,
-        nodes=nodes_flat,
-        edges=edges_flat,
-        states=states_flat,
-        receivers=recvs_flat.long(),
-        senders=sends_flat.long(),
-        node_types=node_types_flat,
-    )
-
-
-def _make_node_features(
-    agent_state: torch.Tensor,   # (E, A, S)
-    goal_state:  torch.Tensor,   # (E, A, S)
-    obs_state:   torch.Tensor,   # (E, O, S)
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Assemble batched node feature, state and node-type tensors.
-
-    Returns:
-        nodes:      (E, N_per, S+3)  state vector concatenated with type indicator
-        states:     (E, N_per, S)    states (used by CBF)
-        node_types: (E, N_per)       integer type ids 
-    """
-    E, A, S = agent_state.shape
-    G = goal_state.shape[1]   # == A
-    O = obs_state.shape[1]
-    device, dtype = agent_state.device, agent_state.dtype
-
-    # Physical states: concat agents | goals | obstacles | pad(-1 sentinel)
-    state_pad = torch.full((E, 1, S), -1.0, dtype=dtype, device=device)
-    states = torch.cat([agent_state, goal_state, obs_state, state_pad], dim=1)  # (E, N, S)
-
-    # One-hot type indicators, appended to the state vector.
-    N = A + G + O + 1
-    indicator = torch.zeros(E, N, NUM_TYPE_INDICATORS, dtype=dtype, device=device)
-    indicator[:, :A,        2] = 1.0   # agent    bit
-    indicator[:, A:A+G,     1] = 1.0   # goal     bit
-    indicator[:, A+G:A+G+O, 0] = 1.0   # obstacle bit
-    # pad row stays all-zero
-
-    # nodes = [  x, y, vx, vy, ...  |  obs_bit, goal_bit, agent_bit  ]
-    #         <── state (dim S) ──>  <── type indicator (dim 3) ──>
-    nodes = torch.cat([states, indicator], dim=-1)  # (E, N, S+3)
-
-    # Integer node-type ids (used by GNN's get_type_nodes)
-    node_types = torch.full((E, N), PAD_TYPE, dtype=torch.long, device=device)
-    node_types[:, :A]        = AGENT_TYPE
-    node_types[:, A:A+G]     = GOAL_TYPE
-    node_types[:, A+G:A+G+O] = OBS_TYPE
-
-    return nodes, states, node_types
-
-
-def _make_edge_list(
-    agent_state: torch.Tensor,   # (E, A, S)
-    goal_state:  torch.Tensor,   # (E, A, S)
-    obs_state:   torch.Tensor,   # (E, O, S)
-    agent_ids:   torch.Tensor,   # (E, A)  global node ids
-    goal_ids:    torch.Tensor,   # (E, A)
-    obs_ids:     torch.Tensor,   # (E, O)
-    pad_ids:     torch.Tensor,   # (E,)    id of each env's padding node
-    *,
-    obs_radius: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """Build the flat edge list for all E environments in one vectorized pass.
-
-    Returns:
-        edges_flat:      (E * n_edges_per_env, node_dim)
-        recvs_flat:      (E * n_edges_per_env,)
-        sends_flat:      (E * n_edges_per_env,)
-        n_edges_per_env: fixed edge count per sub-graph (masked ones route to pad)
-
-    Inactive edges (outside obs_radius, non-diagonal A-G pairs) are redirected to the
-    per-env pad node so the edge count is identical across all environments.
-    """
-    E, A, S = agent_state.shape
-    O = obs_state.shape[1]
-    device = agent_state.device
-
-    a_pos = agent_state[..., :2]   # (E, A, 2) — 2-D positions for cdist
-
-    # -- Agent → Agent: within obs_radius, no self-loops --
-    dist_aa  = torch.cdist(a_pos, a_pos)                                       # (E, A, A)
-    aa_mask  = (dist_aa < obs_radius) & ~torch.eye(A, dtype=torch.bool, device=device)
-    aa_feats = agent_state[:, :, None, :] - agent_state[:, None, :, :]        # (E, A, A, S)
-    aa_f, aa_r, aa_s = _flatten_dense_edge_block(aa_feats, aa_mask, agent_ids, agent_ids, pad_ids)
-
-    # -- Agent → Goal: identity pairing only (agent i → goal i) --
-    diag     = torch.arange(A, device=device)
-    ag_feats = agent_state.new_zeros(E, A, A, S)
-    ag_feats[:, diag, diag, :] = agent_state - goal_state                      # diagonal only
-    ag_mask  = torch.eye(A, dtype=torch.bool, device=device).unsqueeze(0)      # (1, A, A) broadcasts
-    ag_f, ag_r, ag_s = _flatten_dense_edge_block(ag_feats, ag_mask, agent_ids, goal_ids, pad_ids)
-
-    edge_f_parts    = [aa_f, ag_f]
-    recv_parts      = [aa_r, ag_r]
-    send_parts      = [aa_s, ag_s]
-    n_edges_per_env = A * A + A * A   # fixed; masked entries route to pad
-
-    # -- Agent → Obstacle: within obs_radius (skipped when O == 0) --
-    if O > 0:
-        o_pos    = obs_state[..., :2]
-        dist_ao  = torch.cdist(a_pos, o_pos)                                   # (E, A, O)
-        ao_mask  = dist_ao < obs_radius
-        ao_feats = agent_state[:, :, None, :] - obs_state[:, None, :, :]      # (E, A, O, S)
-        ao_f, ao_r, ao_s = _flatten_dense_edge_block(ao_feats, ao_mask, agent_ids, obs_ids, pad_ids)
-        edge_f_parts.append(ao_f)
-        recv_parts.append(ao_r)
-        send_parts.append(ao_s)
-        n_edges_per_env += A * O
-
-    edges_flat = torch.cat(edge_f_parts, dim=0)
-    recvs_flat = torch.cat(recv_parts,   dim=0)
-    sends_flat = torch.cat(send_parts,   dim=0)
-
-    # Zero-pad edge features to node_dim (type-indicator slots stay 0)
-    edges_flat = torch.cat(
-        [edges_flat, edges_flat.new_zeros(edges_flat.shape[0], NUM_TYPE_INDICATORS)],
-        dim=-1,
-    )
-
-    return edges_flat, recvs_flat, sends_flat, n_edges_per_env
-
-
-def _flatten_dense_edge_block(
-    edge_feats: torch.Tensor,   # (E, n_recv, n_send, F)  dense feature grid
-    edge_mask:  torch.Tensor,   # (E, n_recv, n_send)     True = active edge
-    recv_ids:   torch.Tensor,   # (E, n_recv)             global receiver node ids
-    send_ids:   torch.Tensor,   # (E, n_send)             global sender node ids
-    pad_ids:    torch.Tensor,   # (E,)                    id of each env's pad node
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Flatten a batched dense edge block; redirect inactive edges to the pad node.
-
-    This is the batched analogue of EdgeBlock.make_edges: same mask→pad contract,
-    but applied to all E environments in a single set of tensor ops.
-
-    Returns flat tensors of shape (E * n_recv * n_send, ...).
-    """
-    E, R, Sn, F = edge_feats.shape
-
-    # Broadcast receiver/sender ids and pad_ids to an (E, R, Sn) grid
-    recv_grid = recv_ids[:, :,    None].expand(E, R, Sn)
-    send_grid = send_ids[:, None, :   ].expand(E, R, Sn)
-    pad_grid  = pad_ids[:,  None, None].expand(E, R, Sn)
-
-    # Inactive edges → pad node; active edges → their actual receiver/sender
-    recv_flat  = torch.where(edge_mask, recv_grid, pad_grid).reshape(-1)
-    send_flat  = torch.where(edge_mask, send_grid, pad_grid).reshape(-1)
-    feats_flat = edge_feats.reshape(E * R * Sn, F)
-
-    return feats_flat, recv_flat, send_flat

@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 import torch
-from typing import Optional, Sequence
+from typing import Optional, Sequence, cast
 
 """
 Variables naming convention :
@@ -133,8 +135,7 @@ def compute_cbf_advantages(
 
     Reward advantage is standardized across time, and the constraint term
     (``V_{t+1} - V_t) / dt + alpha * V_t``) enters as an additive penalty
-    whenever any head is unsafe. The env fixture uses ``dt = 1/3``, hence
-    the factor of 3 on the finite difference.
+    whenever any head is unsafe.
     """
     
     # calculate cost advantage and normalize
@@ -224,7 +225,7 @@ class GraphData:
         # number of sub-graphs (i.e. parallel simulations) in this batch
         if self.n_nodes.ndim == 0:
             return 1
-        return int(self.n_nodes.shape[0])
+        return int(self.n_nodes.numel())
 
     @property
     def batch_shape(self) -> torch.Size:
@@ -272,11 +273,271 @@ class GraphData:
         """
         Get the graphs for the given environment ids.
         """
-        return GraphData(n_nodes=self.n_nodes[env_ids], n_edges=self.n_edges[env_ids], nodes=self.nodes[env_ids], edges=self.edges[env_ids], states=self.states[env_ids], receivers=self.receivers[env_ids], senders=self.senders[env_ids], node_types=self.node_types[env_ids])
+        edges = None if self.edges is None else self.edges[env_ids]
+        return GraphData(
+            n_nodes=self.n_nodes[env_ids],
+            n_edges=self.n_edges[env_ids],
+            nodes=self.nodes[env_ids],
+            edges=edges,
+            states=self.states[env_ids],
+            receivers=self.receivers[env_ids],
+            senders=self.senders[env_ids],
+            node_types=self.node_types[env_ids],
+        )
     
 
     def _replace(self, **kwargs):
         return replace(self, **kwargs)
+
+
+def graph_data_slice(graph: GraphData, index: tuple[int, ...] | int) -> GraphData:
+    """Return one local sub-graph from a padded, flattened ``GraphData`` batch."""
+    if isinstance(index, int):
+        index = (index,)
+    if graph.n_nodes.ndim == 0:
+        if index not in ((), (0,)):
+            raise IndexError(f"cannot slice scalar GraphData with index={index}")
+        return graph
+
+    if len(index) != graph.n_nodes.ndim:
+        raise IndexError(f"GraphData index rank {len(index)} does not match batch rank {graph.n_nodes.ndim}")
+
+    flat_index = 0
+    for axis, idx in enumerate(index):
+        axis_size = int(graph.n_nodes.shape[axis])
+        if idx < 0:
+            idx += axis_size
+        if idx < 0 or idx >= axis_size:
+            raise IndexError(f"GraphData index {index} is out of bounds for batch shape {tuple(graph.n_nodes.shape)}")
+        flat_index = flat_index * axis_size + idx
+
+    n_graphs = graph.n_graphs
+    padded_nodes = graph.nodes.shape[0] // n_graphs
+    padded_edges = graph.receivers.shape[0] // n_graphs
+    node_start = flat_index * padded_nodes
+    node_stop = node_start + padded_nodes
+    edge_start = flat_index * padded_edges
+    edge_stop = edge_start + padded_edges
+
+    edges = None if graph.edges is None else graph.edges[edge_start:edge_stop]
+    return GraphData(
+        n_nodes=graph.n_nodes[index],
+        n_edges=graph.n_edges[index],
+        nodes=graph.nodes[node_start:node_stop],
+        edges=edges,
+        states=graph.states[node_start:node_stop],
+        receivers=graph.receivers[edge_start:edge_stop] - node_start,
+        senders=graph.senders[edge_start:edge_stop] - node_start,
+        node_types=graph.node_types[node_start:node_stop],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Graph construction
+# ---------------------------------------------------------------------------
+
+# Node-type integer IDs.
+AGENT_TYPE: int = 0
+GOAL_TYPE: int = 1
+OBS_TYPE: int = 2
+PAD_TYPE: int = -1
+
+# One-hot indicator length; order: [obstacle_bit, goal_bit, agent_bit].
+NUM_TYPE_INDICATORS: int = 3
+
+
+def extract_graph_states_from_flat_obs(
+    observations: torch.Tensor,
+    layout: dict,
+    *,
+    n_agents: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Decode IsaacLab flat policy observations into graph state tensors."""
+    E = observations.shape[0]
+    S = int(layout["state_dim"])
+    A = int(layout.get("n_agents", n_agents))
+    O = int(layout["n_obstacles"])
+
+    agent_flat = observations[:, : layout["agent_end"]]
+    agent_state = agent_flat.reshape(E, A, S)
+
+    goal_pos_flat = observations[:, layout["agent_end"] : layout["goal_end"]]
+    goal_pos = goal_pos_flat.reshape(E, A, 3)
+    goal_state = torch.cat([goal_pos, goal_pos.new_zeros(E, A, S - 3)], dim=-1)
+
+    if O > 0:
+        obstacle_xy = observations[:, layout["goal_end"] : layout["obstacles_end"]]
+        obstacle_xy = obstacle_xy.reshape(E, O, 2)
+        obs_state = torch.cat([obstacle_xy, obstacle_xy.new_zeros(E, O, S - 2)], dim=-1)
+    else:
+        obs_state = observations.new_zeros(E, 0, S)
+
+    return agent_state, goal_state, obs_state
+
+
+def build_graph_data(
+    agent_state: torch.Tensor,
+    goal_state: torch.Tensor,
+    obs_state: torch.Tensor | None,
+    *,
+    obs_radius: float,
+) -> GraphData:
+    """Build a batched ``GraphData`` with jraph-style concatenated sub-graphs."""
+    assert agent_state.dim() == 3 and goal_state.dim() == 3
+    assert agent_state.shape[0] == goal_state.shape[0], "E must match"
+    assert agent_state.shape[1] == goal_state.shape[1], "need one goal per agent"
+    assert agent_state.shape[2] == goal_state.shape[2], "state dim must match"
+
+    E, A, S = agent_state.shape
+    device = agent_state.device
+
+    if obs_state is None:
+        obs_state = agent_state.new_zeros(E, 0, S)
+    assert obs_state.shape[0] == E and obs_state.shape[2] == S
+    O = obs_state.shape[1]
+
+    N_per = A + A + O + 1
+    nodes, states, node_types = _make_node_features(agent_state, goal_state, obs_state)
+
+    nodes_flat = nodes.reshape(E * N_per, -1)
+    states_flat = states.reshape(E * N_per, -1)
+    node_types_flat = node_types.reshape(E * N_per)
+
+    env_offsets = (torch.arange(E, device=device) * N_per).unsqueeze(1)
+    agent_ids = torch.arange(A, device=device).unsqueeze(0) + env_offsets
+    goal_ids = torch.arange(A, 2 * A, device=device).unsqueeze(0) + env_offsets
+    obs_ids = torch.arange(2 * A, 2 * A + O, device=device).unsqueeze(0) + env_offsets
+    pad_ids = (N_per - 1 + env_offsets.squeeze(1)).long()
+
+    edges_flat, recvs_flat, sends_flat, n_edges_per_env = _make_edge_list(
+        agent_state,
+        goal_state,
+        obs_state,
+        agent_ids,
+        goal_ids,
+        obs_ids,
+        pad_ids,
+        obs_radius=obs_radius,
+    )
+
+    n_nodes = torch.full((E,), N_per, dtype=torch.long, device=device)
+    n_edges = torch.full((E,), n_edges_per_env, dtype=torch.long, device=device)
+
+    return GraphData(
+        n_nodes=n_nodes,
+        n_edges=n_edges,
+        nodes=nodes_flat,
+        edges=edges_flat,
+        states=states_flat,
+        receivers=recvs_flat.long(),
+        senders=sends_flat.long(),
+        node_types=node_types_flat,
+    )
+
+
+def _make_node_features(
+    agent_state: torch.Tensor,
+    goal_state: torch.Tensor,
+    obs_state: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Assemble batched node features, physical states, and node-type ids."""
+    E, A, S = agent_state.shape
+    G = goal_state.shape[1]
+    O = obs_state.shape[1]
+    device, dtype = agent_state.device, agent_state.dtype
+
+    state_pad = torch.full((E, 1, S), -1.0, dtype=dtype, device=device)
+    states = torch.cat([agent_state, goal_state, obs_state, state_pad], dim=1)
+
+    N = A + G + O + 1
+    indicator = torch.zeros(E, N, NUM_TYPE_INDICATORS, dtype=dtype, device=device)
+    indicator[:, :A, 2] = 1.0
+    indicator[:, A : A + G, 1] = 1.0
+    indicator[:, A + G : A + G + O, 0] = 1.0
+    nodes = torch.cat([states, indicator], dim=-1)
+
+    node_types = torch.full((E, N), PAD_TYPE, dtype=torch.long, device=device)
+    node_types[:, :A] = AGENT_TYPE
+    node_types[:, A : A + G] = GOAL_TYPE
+    node_types[:, A + G : A + G + O] = OBS_TYPE
+
+    return nodes, states, node_types
+
+
+def _make_edge_list(
+    agent_state: torch.Tensor,
+    goal_state: torch.Tensor,
+    obs_state: torch.Tensor,
+    agent_ids: torch.Tensor,
+    goal_ids: torch.Tensor,
+    obs_ids: torch.Tensor,
+    pad_ids: torch.Tensor,
+    *,
+    obs_radius: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Build fixed-size edge blocks, redirecting inactive edges to padding nodes."""
+    E, A, S = agent_state.shape
+    O = obs_state.shape[1]
+    device = agent_state.device
+
+    a_pos = agent_state[..., :2]
+
+    dist_aa = torch.cdist(a_pos, a_pos)
+    aa_mask = (dist_aa < obs_radius) & ~torch.eye(A, dtype=torch.bool, device=device)
+    aa_feats = agent_state[:, :, None, :] - agent_state[:, None, :, :]
+    aa_f, aa_r, aa_s = _flatten_dense_edge_block(aa_feats, aa_mask, agent_ids, agent_ids, pad_ids)
+
+    diag = torch.arange(A, device=device)
+    ag_feats = agent_state.new_zeros(E, A, A, S)
+    ag_feats[:, diag, diag, :] = agent_state - goal_state
+    ag_mask = torch.eye(A, dtype=torch.bool, device=device).unsqueeze(0)
+    ag_f, ag_r, ag_s = _flatten_dense_edge_block(ag_feats, ag_mask, agent_ids, goal_ids, pad_ids)
+
+    edge_f_parts = [aa_f, ag_f]
+    recv_parts = [aa_r, ag_r]
+    send_parts = [aa_s, ag_s]
+    n_edges_per_env = A * A + A * A
+
+    if O > 0:
+        o_pos = obs_state[..., :2]
+        dist_ao = torch.cdist(a_pos, o_pos)
+        ao_mask = dist_ao < obs_radius
+        ao_feats = agent_state[:, :, None, :] - obs_state[:, None, :, :]
+        ao_f, ao_r, ao_s = _flatten_dense_edge_block(ao_feats, ao_mask, agent_ids, obs_ids, pad_ids)
+        edge_f_parts.append(ao_f)
+        recv_parts.append(ao_r)
+        send_parts.append(ao_s)
+        n_edges_per_env += A * O
+
+    edges_flat = torch.cat(edge_f_parts, dim=0)
+    recvs_flat = torch.cat(recv_parts, dim=0)
+    sends_flat = torch.cat(send_parts, dim=0)
+    edges_flat = torch.cat(
+        [edges_flat, edges_flat.new_zeros(edges_flat.shape[0], NUM_TYPE_INDICATORS)],
+        dim=-1,
+    )
+
+    return edges_flat, recvs_flat, sends_flat, n_edges_per_env
+
+
+def _flatten_dense_edge_block(
+    edge_feats: torch.Tensor,
+    edge_mask: torch.Tensor,
+    recv_ids: torch.Tensor,
+    send_ids: torch.Tensor,
+    pad_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Flatten a dense edge grid and route inactive entries to each env's pad node."""
+    E, R, Sn, F = edge_feats.shape
+    recv_grid = recv_ids[:, :, None].expand(E, R, Sn)
+    send_grid = send_ids[:, None, :].expand(E, R, Sn)
+    pad_grid = pad_ids[:, None, None].expand(E, R, Sn)
+
+    recv_flat = torch.where(edge_mask, recv_grid, pad_grid).reshape(-1)
+    send_flat = torch.where(edge_mask, send_grid, pad_grid).reshape(-1)
+    feats_flat = edge_feats.reshape(E * R * Sn, F)
+
+    return feats_flat, recv_flat, send_flat
 
 
 class GraphTransformer(MessagePassing):
@@ -290,7 +551,14 @@ class GraphTransformer(MessagePassing):
     A residual-style 'node_proj' branch is added to the aggregated messages before the activation.
     """
 
-    def __init__(self, in_dim: int, out_dim: int, n_heads: int, act: Callable = torch.relu):
+    def __init__(
+        self,
+        in_dim: int,
+        edge_dim: int,
+        out_dim: int,
+        n_heads: int,
+        act: Callable = torch.relu,
+    ):
         super().__init__(aggr='add')  # "Add" aggregation. (equal to "sum"?)
         self.in_dim = in_dim
         self.out_dim = out_dim
@@ -305,7 +573,7 @@ class GraphTransformer(MessagePassing):
         self.query = nn.Linear(in_dim, out_dim * n_heads)
         self.key = nn.Linear(in_dim, out_dim * n_heads)
         self.value = nn.Linear(in_dim, out_dim * n_heads)
-        self.edge_feats = nn.Linear(in_dim, out_dim * n_heads, bias=False)
+        self.edge_feats = nn.Linear(edge_dim, out_dim * n_heads, bias=False)
         
         self.node_proj = nn.Linear(in_dim, out_dim)
 
@@ -320,7 +588,7 @@ class GraphTransformer(MessagePassing):
         out = self.act(self.node_proj(graph.nodes) + msgs)
         return graph._replace(nodes=out)
 
-    def message(
+    def message(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         x_i: torch.Tensor,       # receiver features (pyg convention)
         x_j: torch.Tensor,       # sender features
@@ -350,9 +618,10 @@ class GraphTransformerGNN(nn.Module):
     reshaped per sub-graph as '(batch_shape, n_type, out_dim)'.
     """
 
-    def __init__(self, in_dim: int, msg_dim: int, out_dim: int, n_heads: int, n_layers: int):
+    def __init__(self, in_dim: int, edge_dim: int, msg_dim: int, out_dim: int, n_heads: int, n_layers: int):
         super().__init__()
         self.in_dim = in_dim
+        self.edge_dim = edge_dim
         self.msg_dim = msg_dim
         self.out_dim = out_dim
         self.n_heads = n_heads
@@ -362,7 +631,7 @@ class GraphTransformerGNN(nn.Module):
         cur_dim = in_dim
         for i in range(n_layers):
             layer_out_dim = out_dim if i == n_layers - 1 else msg_dim
-            layers.append(GraphTransformer(cur_dim, layer_out_dim, n_heads, torch.relu))
+            layers.append(GraphTransformer(cur_dim, edge_dim, layer_out_dim, n_heads, torch.relu))
             cur_dim = layer_out_dim
         self.gnn_layers = nn.ModuleList(layers)
 
@@ -421,6 +690,7 @@ class MLP(nn.Module):
 
     def reset_parameters(self) -> None:
         for i, layer in enumerate(self.layers):
+            layer = cast(nn.Linear, layer)
             is_last = i == len(self.layers) - 1
             nn.init.orthogonal_(layer.weight)
             
@@ -436,6 +706,7 @@ class MLP(nn.Module):
             no_activation = is_last and not self.act_final
             if not no_activation:
                 if self.use_layernorm:
+                    assert self.layer_norms is not None
                     x = self.layer_norms[i](x)
                 x = self.act(x)
         return x
@@ -492,4 +763,3 @@ class RNN(nn.Module):
         device = device or next(self.parameters()).device
         n_carries = 1 if self.rnn_cell == "gru" else 2
         return torch.zeros(self.rnn_layers, n_agents, n_carries, self.hidden_size, device=device)
-
