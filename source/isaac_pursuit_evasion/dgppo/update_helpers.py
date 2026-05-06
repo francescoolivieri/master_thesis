@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -132,24 +134,27 @@ def compute_policy_loss(
     entropy_scale: float,
     n_agents_total: int,
     rnn_state: torch.Tensor | None = None,
+    profiler: Any | None = None,
 ) -> dict[str, torch.Tensor]:
     """Evaluate the real policy and compute the clipped DG-PPO policy loss."""
-    log_prob, entropy, _ = policy.evaluate(
-        graph,
-        action=actions.reshape(n_agents_total, -1),
-        rnn_state=rnn_state,
-        n_agents_total=n_agents_total,
-        compute_entropy=entropy_scale > 0,
-    )
+    with _profile_phase(profiler, "policy_loss/evaluate"):
+        log_prob, entropy, _ = policy.evaluate(
+            graph,
+            action=actions.reshape(n_agents_total, -1),
+            rnn_state=rnn_state,
+            n_agents_total=n_agents_total,
+            compute_entropy=entropy_scale > 0,
+        )
     log_prob = log_prob.reshape_as(old_logp)
-    loss_info = compute_policy_loss_from_log_prob(
-        log_prob=log_prob,
-        old_logp=old_logp,
-        advantages=advantages,
-        entropy=entropy,
-        clip_eps=clip_eps,
-        entropy_scale=entropy_scale,
-    )
+    with _profile_phase(profiler, "policy_loss/surrogate"):
+        loss_info = compute_policy_loss_from_log_prob(
+            log_prob=log_prob,
+            old_logp=old_logp,
+            advantages=advantages,
+            entropy=entropy,
+            clip_eps=clip_eps,
+            entropy_scale=entropy_scale,
+        )
 
     return {
         **loss_info,
@@ -194,43 +199,39 @@ def compute_rollout_policy_loss(
     clip_eps: float,
     entropy_scale: float,
     n_agents: int,
+    profiler: Any | None = None,
 ) -> dict[str, torch.Tensor]:
     """Evaluate policy loss over rollout envs and RNN chunks using production policy code."""
-    B, _T, A, action_dim = actions.shape
+    B, _T, A, _action_dim = actions.shape
     chunk_ids_index = chunk_ids.to(device=actions.device, dtype=torch.long)
-    chunk_ids_list = chunk_ids.detach().cpu().tolist()
     C, R = chunk_ids_index.shape
     log_prob = old_logp.new_empty((B, C, R, A))
     entropy = old_logp.new_zeros((B, C, R, A))
     compute_entropy = entropy_scale > 0
 
-    for c in range(C):
-        rnn_state = policy.initialize_carry(B * A, device=actions.device) if policy.rnn is not None else None
+    with _profile_phase(profiler, "policy_loss/rnn_scan"):
+        features = policy.encode(graph, n_agents).reshape(B, actions.shape[1], A, -1)
+        features_chunked = features[:, chunk_ids_index]
+        actions_chunked = actions[:, chunk_ids_index]
+        rnn_state = policy.initialize_carry(B * C * A, device=actions.device) if policy.rnn is not None else None
         for r in range(R):
-            t = int(chunk_ids_list[c][r])
-            step_graph = rollout_graph_timestep(graph, t=t, T=actions.shape[1], B=B)
-            step_action = actions[:, t].reshape(B * A, action_dim)
-            step_log_prob, step_entropy, rnn_state = policy.evaluate(
-                step_graph,
-                action=step_action,
-                rnn_state=rnn_state,
-                n_agents_total=n_agents,
-                compute_entropy=compute_entropy,
-            )
-            log_prob[:, c, r] = step_log_prob.reshape(B, A)
+            dist, rnn_state = policy.distribution_from_features(features_chunked[:, :, r], rnn_state)
+            step_log_prob = dist.log_prob(actions_chunked[:, :, r].reshape(dist.mean.shape))
+            log_prob[:, :, r] = step_log_prob
             if compute_entropy:
-                entropy[:, c, r] = step_entropy.reshape(B, A)
+                entropy[:, :, r] = dist.entropy()
 
     old_logp_chunked = old_logp[:, chunk_ids_index]
     advantages_chunked = advantages[:, chunk_ids_index]
-    loss_info = compute_policy_loss_from_log_prob(
-        log_prob=log_prob,
-        old_logp=old_logp_chunked,
-        advantages=advantages_chunked,
-        entropy=entropy,
-        clip_eps=clip_eps,
-        entropy_scale=entropy_scale,
-    )
+    with _profile_phase(profiler, "policy_loss/surrogate"):
+        loss_info = compute_policy_loss_from_log_prob(
+            log_prob=log_prob,
+            old_logp=old_logp_chunked,
+            advantages=advantages_chunked,
+            entropy=entropy,
+            clip_eps=clip_eps,
+            entropy_scale=entropy_scale,
+        )
     return {
         **loss_info,
         "log_prob": log_prob,
@@ -288,6 +289,7 @@ def compute_value_losses(
     rnn_states: torch.Tensor | None = None,
     det_rnn_states: torch.Tensor | None = None,
     chunk_ids: torch.Tensor | None = None,
+    profiler: Any | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute the real low-level and safety critic losses for one minibatch."""
     b, T = ql_targets.shape
@@ -302,6 +304,7 @@ def compute_value_losses(
             chunk_ids=chunk_ids,
             A=A,
             loss_scale=vl_loss_scale,
+            profiler=profiler,
         )
         if det_rnn_states is None:
             raise ValueError("Recurrent Vh update requires deterministic rollout RNN states")
@@ -313,6 +316,7 @@ def compute_value_losses(
             chunk_ids=chunk_ids,
             A=A,
             loss_scale=vh_loss_scale,
+            profiler=profiler,
         )
         return {
             "vl": vl_info["vl"],
@@ -321,13 +325,17 @@ def compute_value_losses(
             "loss_vh": vh_info["loss_vh"],
         }
 
-    vl, _ = Vl(graph, None, A)
-    vl = vl.reshape(b, T)
-    loss_vl = compute_value_l2_loss(vl, ql_targets, scale=vl_loss_scale)
+    with _profile_phase(profiler, "vl_loss/evaluate"):
+        vl, _ = Vl(graph, None, A)
+        vl = vl.reshape(b, T)
+    with _profile_phase(profiler, "vl_loss/l2"):
+        loss_vl = compute_value_l2_loss(vl, ql_targets, scale=vl_loss_scale)
 
-    vh, _ = Vh(det_graph, None, A)
-    vh = vh.reshape(b, T, A, -1)
-    loss_vh = compute_value_l2_loss(vh, qh_det_targets, scale=vh_loss_scale)
+    with _profile_phase(profiler, "vh_loss/evaluate"):
+        vh, _ = Vh(det_graph, None, A)
+        vh = vh.reshape(b, T, A, -1)
+    with _profile_phase(profiler, "vh_loss/l2"):
+        loss_vh = compute_value_l2_loss(vh, qh_det_targets, scale=vh_loss_scale)
 
     return {
         "vl": vl,
@@ -350,23 +358,26 @@ def compute_rollout_vl_loss(
     chunk_ids: torch.Tensor,
     A: int,
     loss_scale: float = 1.0,
+    profiler: Any | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute the Vl update loss over rollout chunks using zero RNN chunk starts."""
     B, _T = targets.shape
     chunk_ids_index = chunk_ids.to(device=targets.device, dtype=torch.long)
-    chunk_ids_list = chunk_ids.detach().cpu().tolist()
     C, R = chunk_ids_index.shape
     values = targets.new_empty((B, C, R))
-    for c in range(C):
-        rnn_state = Vl.rnn.initialize_carry(B, device=targets.device) if Vl.rnn is not None else None
+    with _profile_phase(profiler, "vl_loss/rnn_scan"):
+        features = Vl.encode(graph, A).reshape(B, targets.shape[1], -1)
+        features_chunked = features[:, chunk_ids_index]
+        rnn_state = Vl.rnn.initialize_carry(B * C, device=targets.device) if Vl.rnn is not None else None
         for r in range(R):
-            t = int(chunk_ids_list[c][r])
-            value, rnn_state = Vl(rollout_graph_timestep(graph, t=t, T=targets.shape[1], B=B), rnn_state, A)
-            values[:, c, r] = value.squeeze(-1)
+            value, rnn_state = Vl.value_from_features(features_chunked[:, :, r], rnn_state, A)
+            values[:, :, r] = value.squeeze(-1)
     targets_chunked = targets[:, chunk_ids_index]
+    with _profile_phase(profiler, "vl_loss/l2"):
+        loss_vl = compute_value_l2_loss(values, targets_chunked, scale=loss_scale)
     return {
         "vl": values,
-        "loss_vl": compute_value_l2_loss(values, targets_chunked, scale=loss_scale),
+        "loss_vl": loss_vl,
     }
 
 
@@ -379,23 +390,25 @@ def compute_rollout_vh_loss(
     chunk_ids: torch.Tensor,
     A: int,
     loss_scale: float = 1.0,
+    profiler: Any | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute the deterministic Vh update loss over rollout chunks."""
     B, _T, _A, n_cost = targets.shape
     chunk_ids_index = chunk_ids.to(device=targets.device, dtype=torch.long)
-    chunk_ids_list = chunk_ids.detach().cpu().tolist()
     C, R = chunk_ids_index.shape
     values = targets.new_empty((B, C, R, A, n_cost))
-    for c in range(C):
-        for r in range(R):
-            t = int(chunk_ids_list[c][r])
-            step_rnn_states = _flatten_agent_rnn_states(rnn_states[:, t])
-            value, _ = Vh(rollout_graph_timestep(graph, t=t, T=targets.shape[1], B=B), step_rnn_states, A)
-            values[:, c, r] = value
+    with _profile_phase(profiler, "vh_loss/rnn_scan"):
+        features = Vh.encode(graph, A).reshape(B, targets.shape[1], A, -1)
+        features_chunked = features[:, chunk_ids_index]
+        rnn_states_chunked = rnn_states[:, chunk_ids_index]
+        value, _ = Vh.value_from_features(features_chunked, _flatten_agent_rnn_states(rnn_states_chunked), A)
+        values = value
     targets_chunked = targets[:, chunk_ids_index]
+    with _profile_phase(profiler, "vh_loss/l2"):
+        loss_vh = compute_value_l2_loss(values, targets_chunked, scale=loss_scale)
     return {
         "vh": values,
-        "loss_vh": compute_value_l2_loss(values, targets_chunked, scale=loss_scale),
+        "loss_vh": loss_vh,
     }
 
 
@@ -437,9 +450,9 @@ def evaluate_vh_values(
 
 
 def _flatten_agent_rnn_states(rnn_states: torch.Tensor) -> torch.Tensor:
-    """Convert ``[B, L, A, C, H]`` states to model carry ``[L, B*A, C, H]``."""
-    B, L, A, C, H = rnn_states.shape
-    return rnn_states.permute(1, 0, 2, 3, 4).reshape(L, B * A, C, H)
+    """Convert ``[..., L, A, C, H]`` states to model carry ``[L, prod(...)*A, C, H]``."""
+    L, A, C, H = rnn_states.shape[-4:]
+    return rnn_states.reshape(-1, L, A, C, H).permute(1, 0, 2, 3, 4).reshape(L, -1, C, H)
 
 
 def apply_policy_update(
@@ -477,3 +490,9 @@ def _apply_optimizer_update(
     grad_norm = torch.nn.utils.clip_grad_norm_(params, grad_clip)
     optimizer.step()
     return torch.as_tensor(grad_norm, device=loss.device, dtype=loss.dtype)
+
+
+def _profile_phase(profiler: Any | None, name: str) -> Any:
+    if profiler is None:
+        return contextlib.nullcontext()
+    return profiler.phase(name)

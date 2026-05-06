@@ -138,6 +138,42 @@ class DGPPOValueNet(nn.Module):
         # GNN -> MLP -> RNN (optional) -> Final projection
         return self.net(graph, rnn_state, n_agents)
 
+    def encode(self, graph: GraphData, n_agents: int) -> torch.Tensor:
+        """Run the graph and MLP parts before the recurrent/value projection."""
+        x = self.gnn(graph, node_type=0, n_type=n_agents)
+        if self.decompose:
+            batch_shape = x.shape[:-2]
+            x = self.head(x).reshape(batch_shape + (n_agents, self.head.hid_sizes[-1]))
+        else:
+            x = x.mean(dim=-2)
+            batch_shape = x.shape[:-1]
+            x = self.head(x).reshape(batch_shape + (self.head.hid_sizes[-1],))
+        return x
+
+    def value_from_features(
+        self,
+        features: torch.Tensor,
+        rnn_state: torch.Tensor | None,
+        n_agents: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Apply the recurrent/value projection to precomputed features."""
+        if self.decompose:
+            batch_shape = features.shape[:-2]
+            x = features.reshape(-1, features.shape[-1])
+        else:
+            batch_shape = features.shape[:-1]
+            x = features.reshape(-1, features.shape[-1])
+
+        if self.rnn is not None:
+            x, rnn_state = self.rnn(x, rnn_state)
+
+        x = self.net.value_out(x)
+        if self.decompose:
+            x = x.reshape(batch_shape + (n_agents, self.net.n_out))
+        else:
+            x = x.reshape(batch_shape + (self.net.n_out,))
+        return x, rnn_state
+
     def enable_training_mode(self, enabled: bool = True) -> None:
         """Called by skrl Agent.enable_models_training_mode()."""
         self.train(enabled)
@@ -334,6 +370,34 @@ class DGPPOPolicy(nn.Module):
         x = self.gnn(graph, node_type=0, n_type=n_agents)
         batch_shape = x.shape[:-2]
         x = self.mlp(x).reshape(-1, self.mlp.hid_sizes[-1])
+        if self.rnn is not None:
+            x, rnn_state = self.rnn(x, rnn_state)
+        else:
+            rnn_state = None
+        h = self.scale_hid(x)
+
+        mean = self.mean_head(h)
+        std = F.softplus(self.std_head(h) + self.std_dev_init_inv) + self.std_dev_min
+        mean = mean.reshape(batch_shape + (n_agents, -1))
+        std = std.reshape(batch_shape + (n_agents, -1))
+        return TanhNormal(mean, std), rnn_state
+
+    def encode(self, graph: GraphData, n_agents: int) -> torch.Tensor:
+        """Run the graph and MLP parts before the recurrent/policy heads."""
+        x = self.gnn(graph, node_type=0, n_type=n_agents)
+        batch_shape = x.shape[:-2]
+        x = self.mlp(x).reshape(batch_shape + (n_agents, self.mlp.hid_sizes[-1]))
+        return x
+
+    def distribution_from_features(
+        self,
+        features: torch.Tensor,
+        rnn_state: torch.Tensor | None,
+    ) -> tuple[TanhNormal, torch.Tensor | None]:
+        """Build a policy distribution from precomputed per-agent features."""
+        batch_shape = features.shape[:-2]
+        n_agents = features.shape[-2]
+        x = features.reshape(-1, features.shape[-1])
         if self.rnn is not None:
             x, rnn_state = self.rnn(x, rnn_state)
         else:

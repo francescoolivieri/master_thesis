@@ -28,11 +28,11 @@ agent:
   lr_vh:     1.0e-3
 
   # Graph / observation radius for graph builder
-  obs_radius: 2.0
+  obs_radius: 8.0
 
   # RNN
   use_rnn: true
-  rnn_step: 16
+  rnn_step: 32
   rnn:
     cell:   gru
     hidden: 64
@@ -63,7 +63,7 @@ agent:
     write_interval: auto
     checkpoint_interval: auto
     store_separately: false
-    wandb: true
+    wandb: false
     wandb_kwargs:
       project: "drones_dgppo"
       entity: ""

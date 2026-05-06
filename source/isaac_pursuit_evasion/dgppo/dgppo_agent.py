@@ -1,4 +1,6 @@
+import contextlib
 import dataclasses
+import os
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -25,6 +27,116 @@ from .utils import (
     compute_dec_ocp_gae,
     extract_graph_states_from_flat_obs,
 )
+
+
+class _UpdateProfiler:
+    """Small opt-in wall-clock profiler for the expensive DG-PPO update phase."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        detail: bool,
+        sync_cuda: bool,
+        device: torch.device,
+        update_index: int,
+        timestep: int,
+        cfg: Mapping[str, Any],
+    ) -> None:
+        self.enabled = enabled
+        self.detail = detail
+        self.sync_cuda = sync_cuda and device.type == "cuda" and torch.cuda.is_available()
+        self.device = device
+        self.update_index = update_index
+        self.timestep = timestep
+        self.cfg = cfg
+        self.phase_ms: dict[str, float] = {}
+        self.phase_calls: dict[str, int] = {}
+        self.minibatches: list[dict[str, float | int]] = []
+
+    @contextlib.contextmanager
+    def phase(self, name: str):
+        if not self.enabled:
+            yield
+            return
+
+        self._sync()
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._sync()
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            self.phase_ms[name] = self.phase_ms.get(name, 0.0) + elapsed_ms
+            self.phase_calls[name] = self.phase_calls.get(name, 0) + 1
+
+    def record_minibatch(self, *, epoch: int, minibatch: int, batch_size: int, elapsed_ms: float) -> None:
+        if not self.enabled:
+            return
+        self.minibatches.append(
+            {
+                "epoch": epoch,
+                "minibatch": minibatch,
+                "batch_size": batch_size,
+                "elapsed_ms": elapsed_ms,
+            }
+        )
+
+    def emit(self, *, track_data: Any | None = None) -> None:
+        if not self.enabled:
+            return
+
+        total_ms = self.phase_ms.get("update/total", sum(self.phase_ms.values()))
+        header = (
+            f"[DGPPO][profile] update={self.update_index} timestep={self.timestep} "
+            f"device={self.device} sync_cuda={self.sync_cuda} "
+            f"rollouts={self.cfg['rollouts']} epochs={self.cfg['learning_epochs']} "
+            f"mini_batches={self.cfg['mini_batches']} rnn_step={self.cfg['rnn_step']} "
+            f"stc_envs={self.cfg['stc_envs']} det_envs={self.cfg['det_envs']} total_ms={total_ms:.3f}"
+        )
+        print(header)
+
+        for name, elapsed_ms in sorted(self.phase_ms.items(), key=lambda item: item[1], reverse=True):
+            calls = self.phase_calls.get(name, 1)
+            pct = (elapsed_ms / total_ms * 100.0) if total_ms > 0 else 0.0
+            print(
+                f"[DGPPO][profile] phase={name} calls={calls} total_ms={elapsed_ms:.3f} "
+                f"mean_ms={elapsed_ms / calls:.3f} pct_total={pct:.1f}"
+            )
+            if track_data is not None and name != "update/total":
+                track_key = "DGPPO/update_profile/" + name.replace("/", "_") + "_ms"
+                track_data(track_key, float(elapsed_ms))
+
+        if self.minibatches:
+            times = torch.tensor([float(item["elapsed_ms"]) for item in self.minibatches], dtype=torch.float64)
+            print(
+                "[DGPPO][profile] minibatches="
+                f"{len(self.minibatches)} mean_ms={times.mean().item():.3f} "
+                f"min_ms={times.min().item():.3f} max_ms={times.max().item():.3f}"
+            )
+            if track_data is not None:
+                track_data("DGPPO/update_profile/minibatch_mean_ms", float(times.mean().item()))
+                track_data("DGPPO/update_profile/minibatch_max_ms", float(times.max().item()))
+
+        if self.detail:
+            for item in self.minibatches:
+                print(
+                    f"[DGPPO][profile][minibatch] update={self.update_index} "
+                    f"epoch={int(item['epoch'])} minibatch={int(item['minibatch'])} "
+                    f"batch_size={int(item['batch_size'])} total_ms={float(item['elapsed_ms']):.3f}"
+                )
+
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            allocated_mb = torch.cuda.max_memory_allocated(self.device) / (1024.0**2)
+            reserved_mb = torch.cuda.max_memory_reserved(self.device) / (1024.0**2)
+            print(
+                f"[DGPPO][profile] cuda_peak_allocated_mb={allocated_mb:.1f} "
+                f"cuda_peak_reserved_mb={reserved_mb:.1f}"
+            )
+
+    def _sync(self) -> None:
+        if self.sync_cuda:
+            torch.cuda.synchronize(self.device)
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -218,6 +330,7 @@ class DGPPOAgent(Agent):
         self._current_Vl = None
         self._current_Vh = None
         self._current_next_observations = None
+        self._dgppo_update_index = 0
 
     def init(self, *, trainer_cfg: Any | None = None) -> None:
         """
@@ -488,88 +601,108 @@ class DGPPOAgent(Agent):
         if self.memory is None or self.memory.cursor < self.rollouts:
             return
 
-        view = self.memory.as_bTah_view("stc")
-        det_view = self.memory.as_bTah_view("det")
+        self._dgppo_update_index += 1
+        profiler = self._make_update_profiler(timestep=timestep)
+        if profiler.enabled and self.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(self.device)
 
-        # Compute returns and advantages.
-        _Qh_stc, Ql = compute_dec_ocp_gae(
-            Tah_hs=view["bTah_hs"],
-            T_l=view["bT_l"],
-            Tp1ah_Vh=view["bTp1ah_Vh"],
-            Tp1_Vl=view["bTp1_Vl"],
-            disc_gamma=self.gamma,
-            gae_lambda=self.gae_lambda,
-        )
+        with profiler.phase("update/total"):
+            with profiler.phase("update/memory_views"):
+                view = self.memory.as_bTah_view("stc")
+                det_view = self.memory.as_bTah_view("det")
 
-        Qh_det, _ = compute_dec_ocp_gae(
-            Tah_hs=det_view["bTah_hs"],
-            T_l=det_view["bT_l"],
-            Tp1ah_Vh=det_view["bTp1ah_Vh"],
-            Tp1_Vl=view["bTp1_Vl"],
-            disc_gamma=self.gamma,
-            gae_lambda=self.gae_lambda,
-        )
-
-        # flipped for PPO use
-        adv_info = compute_cbf_advantages(
-            bT_Ql=Ql,
-            bT_Vl=view["bT_Vl"],
-            bTah_Vh=view["bTah_Vh"],
-            bTp1ah_Vh=view["bTp1ah_Vh"],
-            alpha=self.alpha,
-            cbf_eps=self.cbf_eps,
-            cbf_weight=self.cbf_weight,
-            dt=self.env._step_dt,
-            cbf_scale=self._cbf_scale(timestep=timestep, timesteps=timesteps),
-        )
-        bTa_A = adv_info["bTa_A"].detach()
-        self.track_data("DGPPO/safe_rate", float(adv_info["bTa_is_safe"].float().mean().item()))
-        self.track_data("DGPPO/adv_raw_mean", float(adv_info["bT_Al_raw"].mean().item()))
-
-        graph = build_rollout_graph(view=view, obs_radius=self.obs_radius)
-        det_graph = build_rollout_graph(view=det_view, obs_radius=self.obs_radius)
-        chunk_ids = self._rnn_chunk_ids(T=view["bTa_actions"].shape[1], device=torch.device("cpu"))
-
-        loss_p_acc = bTa_A.new_zeros(())
-        loss_vl_acc = bTa_A.new_zeros(())
-        loss_vh_acc = bTa_A.new_zeros(())
-        clipfrac_acc = bTa_A.new_zeros(())
-        n_minibatches = 0
-
-        # Learning epochs.
-        for _ in range(self.learning_epochs):
-            sampled_batches = self.memory.sample_minibatches(self.mini_batches)
-            for idx in sampled_batches:
-                info = self._update_minibatch(
-                    idx=idx,
-                    Qh_det=Qh_det,
-                    Ql=Ql,
-                    bTa_A=bTa_A,
-                    view=view,
-                    det_view=det_view,
-                    graph=graph,
-                    det_graph=det_graph,
-                    chunk_ids=chunk_ids,
+            # Compute returns and advantages.
+            with profiler.phase("update/gae_stochastic"):
+                _Qh_stc, Ql = compute_dec_ocp_gae(
+                    Tah_hs=view["bTah_hs"],
+                    T_l=view["bT_l"],
+                    Tp1ah_Vh=view["bTp1ah_Vh"],
+                    Tp1_Vl=view["bTp1_Vl"],
+                    disc_gamma=self.gamma,
+                    gae_lambda=self.gae_lambda,
                 )
-                loss_p_acc += info["loss_p"]
-                loss_vl_acc += info["loss_vl"]
-                loss_vh_acc += info["loss_vh"]
-                clipfrac_acc += info["clip_frac"]
-                n_minibatches += 1
 
-        if n_minibatches == 0:
-            return
+            with profiler.phase("update/gae_deterministic"):
+                Qh_det, _ = compute_dec_ocp_gae(
+                    Tah_hs=det_view["bTah_hs"],
+                    T_l=det_view["bT_l"],
+                    Tp1ah_Vh=det_view["bTp1ah_Vh"],
+                    Tp1_Vl=view["bTp1_Vl"],
+                    disc_gamma=self.gamma,
+                    gae_lambda=self.gae_lambda,
+                )
 
-        inv_n = 1.0 / float(n_minibatches)
-        self.track_data("DGPPO/loss_policy", float((loss_p_acc * inv_n).item()))
-        self.track_data("DGPPO/loss_value_l", float((loss_vl_acc * inv_n).item()))
-        self.track_data("DGPPO/loss_value_h", float((loss_vh_acc * inv_n).item()))
-        self.track_data("DGPPO/clip_frac", float((clipfrac_acc * inv_n).item()))
-        self.track_data("DGPPO/lr_policy", float(self._policy_opt.param_groups[0]["lr"]))
-        self.track_data("DGPPO/lr_vl", float(self._vl_opt.param_groups[0]["lr"]))
-        self.track_data("DGPPO/lr_vh", float(self._vh_opt.param_groups[0]["lr"]))
+            # flipped for PPO use
+            with profiler.phase("update/cbf_advantages"):
+                adv_info = compute_cbf_advantages(
+                    bT_Ql=Ql,
+                    bT_Vl=view["bT_Vl"],
+                    bTah_Vh=view["bTah_Vh"],
+                    bTp1ah_Vh=view["bTp1ah_Vh"],
+                    alpha=self.alpha,
+                    cbf_eps=self.cbf_eps,
+                    cbf_weight=self.cbf_weight,
+                    dt=self.env._step_dt,
+                    cbf_scale=self._cbf_scale(timestep=timestep, timesteps=timesteps),
+                )
+                bTa_A = adv_info["bTa_A"].detach()
+            self.track_data("DGPPO/safe_rate", float(adv_info["bTa_is_safe"].float().mean().item()))
+            self.track_data("DGPPO/adv_raw_mean", float(adv_info["bT_Al_raw"].mean().item()))
 
-        self.memory.reset()
+            with profiler.phase("update/build_stochastic_rollout_graph"):
+                graph = build_rollout_graph(view=view, obs_radius=self.obs_radius)
+            with profiler.phase("update/build_deterministic_rollout_graph"):
+                det_graph = build_rollout_graph(view=det_view, obs_radius=self.obs_radius)
+            with profiler.phase("update/chunk_ids"):
+                chunk_ids = self._rnn_chunk_ids(T=view["bTa_actions"].shape[1], device=torch.device("cpu"))
+
+            loss_p_acc = bTa_A.new_zeros(())
+            loss_vl_acc = bTa_A.new_zeros(())
+            loss_vh_acc = bTa_A.new_zeros(())
+            clipfrac_acc = bTa_A.new_zeros(())
+            n_minibatches = 0
+
+            # Learning epochs.
+            for epoch in range(1, self.learning_epochs + 1):
+                with profiler.phase("update/sample_minibatches"):
+                    sampled_batches = self.memory.sample_minibatches(self.mini_batches)
+                for minibatch, idx in enumerate(sampled_batches, start=1):
+                    info = self._update_minibatch(
+                        idx=idx,
+                        Qh_det=Qh_det,
+                        Ql=Ql,
+                        bTa_A=bTa_A,
+                        view=view,
+                        det_view=det_view,
+                        graph=graph,
+                        det_graph=det_graph,
+                        chunk_ids=chunk_ids,
+                        profiler=profiler,
+                        epoch=epoch,
+                        minibatch=minibatch,
+                    )
+                    loss_p_acc += info["loss_p"]
+                    loss_vl_acc += info["loss_vl"]
+                    loss_vh_acc += info["loss_vh"]
+                    clipfrac_acc += info["clip_frac"]
+                    n_minibatches += 1
+
+            if n_minibatches == 0:
+                return
+
+            with profiler.phase("update/metrics_and_reset"):
+                inv_n = 1.0 / float(n_minibatches)
+                self.track_data("DGPPO/loss_policy", float((loss_p_acc * inv_n).item()))
+                self.track_data("DGPPO/loss_value_l", float((loss_vl_acc * inv_n).item()))
+                self.track_data("DGPPO/loss_value_h", float((loss_vh_acc * inv_n).item()))
+                self.track_data("DGPPO/clip_frac", float((clipfrac_acc * inv_n).item()))
+                self.track_data("DGPPO/lr_policy", float(self._policy_opt.param_groups[0]["lr"]))
+                self.track_data("DGPPO/lr_vl", float(self._vl_opt.param_groups[0]["lr"]))
+                self.track_data("DGPPO/lr_vh", float(self._vh_opt.param_groups[0]["lr"]))
+
+                self.memory.reset()
+
+        profiler.emit(track_data=self.track_data)
 
     def _update_minibatch(
         self,
@@ -583,79 +716,100 @@ class DGPPOAgent(Agent):
         graph: GraphData,
         det_graph: GraphData,
         chunk_ids: torch.Tensor,
+        profiler: _UpdateProfiler | None = None,
+        epoch: int = 0,
+        minibatch: int = 0,
     ) -> dict[str, torch.Tensor]:
         """Single PPO minibatch step over one chunk of the ``B`` axis."""
-        batch = build_update_graph_batch(
-            idx=idx,
-            view=view,
-            det_view=det_view,
-            qh_det=Qh_det,
-            ql=Ql,
-            advantages=bTa_A,
-            obs_radius=self.obs_radius,
-            graph=graph,
-            det_graph=det_graph,
-        )
+        mb_t0 = time.perf_counter()
+        with self._profile_phase(profiler, "minibatch/build_batch"):
+            batch = build_update_graph_batch(
+                idx=idx,
+                view=view,
+                det_view=det_view,
+                qh_det=Qh_det,
+                ql=Ql,
+                advantages=bTa_A,
+                obs_radius=self.obs_radius,
+                graph=graph,
+                det_graph=det_graph,
+            )
 
         # ---- Policy ----
-        if self.policy.rnn is not None:
-            policy_info = compute_rollout_policy_loss(
-                policy=self.policy,
-                graph=batch.graph,
-                actions=batch.actions,
-                old_logp=batch.old_logp,
-                advantages=batch.advantages,
-                chunk_ids=chunk_ids,
-                clip_eps=self.clip_eps,
-                entropy_scale=self.entropy_scale,
-                n_agents=batch.A,
+        with self._profile_phase(profiler, "minibatch/policy_loss"):
+            if self.policy.rnn is not None:
+                policy_info = compute_rollout_policy_loss(
+                    policy=self.policy,
+                    graph=batch.graph,
+                    actions=batch.actions,
+                    old_logp=batch.old_logp,
+                    advantages=batch.advantages,
+                    chunk_ids=chunk_ids,
+                    clip_eps=self.clip_eps,
+                    entropy_scale=self.entropy_scale,
+                    n_agents=batch.A,
+                    profiler=profiler,
+                )
+            else:
+                policy_info = compute_policy_loss(
+                    policy=self.policy,
+                    graph=batch.graph,
+                    actions=batch.actions,
+                    old_logp=batch.old_logp,
+                    advantages=batch.advantages,
+                    clip_eps=self.clip_eps,
+                    entropy_scale=self.entropy_scale,
+                    n_agents_total=batch.A,
+                    rnn_state=None,
+                    profiler=profiler,
+                )
+        with self._profile_phase(profiler, "minibatch/policy_optimizer"):
+            apply_policy_update(
+                optimizer=self._policy_opt,
+                loss=policy_info["loss_policy_total"],
+                parameters=self.policy.parameters(),
+                grad_clip=self.grad_clip,
             )
-        else:
-            policy_info = compute_policy_loss(
-                policy=self.policy,
-                graph=batch.graph,
-                actions=batch.actions,
-                old_logp=batch.old_logp,
-                advantages=batch.advantages,
-                clip_eps=self.clip_eps,
-                entropy_scale=self.entropy_scale,
-                n_agents_total=batch.A,
-                rnn_state=None,
-            )
-        apply_policy_update(
-            optimizer=self._policy_opt,
-            loss=policy_info["loss_policy_total"],
-            parameters=self.policy.parameters(),
-            grad_clip=self.grad_clip,
-        )
 
         # ---- Critics ----
-        value_info = compute_value_losses(
-            Vl=self.Vl,
-            Vh=self.Vh,
-            graph=batch.graph,
-            det_graph=batch.det_graph,
-            ql_targets=batch.ql_targets,
-            qh_det_targets=batch.qh_det_targets,
-            A=batch.A,
-            vl_loss_scale=self.vl_loss_scale,
-            vh_loss_scale=self.vh_loss_scale,
-            rnn_states=batch.rnn_states,
-            det_rnn_states=batch.det_rnn_states,
-            chunk_ids=chunk_ids,
-        )
-        apply_value_update(
-            optimizer=self._vl_opt,
-            loss=value_info["loss_vl"],
-            parameters=self._vl_grad_params,
-            grad_clip=self.grad_clip,
-        )
-        apply_value_update(
-            optimizer=self._vh_opt,
-            loss=value_info["loss_vh"],
-            parameters=self._vh_grad_params,
-            grad_clip=self.grad_clip,
-        )
+        with self._profile_phase(profiler, "minibatch/value_losses"):
+            value_info = compute_value_losses(
+                Vl=self.Vl,
+                Vh=self.Vh,
+                graph=batch.graph,
+                det_graph=batch.det_graph,
+                ql_targets=batch.ql_targets,
+                qh_det_targets=batch.qh_det_targets,
+                A=batch.A,
+                vl_loss_scale=self.vl_loss_scale,
+                vh_loss_scale=self.vh_loss_scale,
+                rnn_states=batch.rnn_states,
+                det_rnn_states=batch.det_rnn_states,
+                chunk_ids=chunk_ids,
+                profiler=profiler,
+            )
+        with self._profile_phase(profiler, "minibatch/vl_optimizer"):
+            apply_value_update(
+                optimizer=self._vl_opt,
+                loss=value_info["loss_vl"],
+                parameters=self._vl_grad_params,
+                grad_clip=self.grad_clip,
+            )
+        with self._profile_phase(profiler, "minibatch/vh_optimizer"):
+            apply_value_update(
+                optimizer=self._vh_opt,
+                loss=value_info["loss_vh"],
+                parameters=self._vh_grad_params,
+                grad_clip=self.grad_clip,
+            )
+
+        if profiler is not None:
+            profiler.record_minibatch(
+                epoch=epoch,
+                minibatch=minibatch,
+                batch_size=int(idx.numel()),
+                elapsed_ms=(time.perf_counter() - mb_t0) * 1000.0,
+            )
 
         return {
             "loss_p": policy_info["loss_policy"].detach(),
@@ -685,6 +839,49 @@ class DGPPOAgent(Agent):
         self.lr_policy: float = float(self.cfg.get("lr_policy", 3e-4))
         self.lr_vl: float = float(self.cfg.get("lr_vl", 1e-3))
         self.lr_vh: float = float(self.cfg.get("lr_vh", 1e-3))
+        self.profile_update: bool = self._bool_cfg_or_env("profile_update", "DGPPO_PROFILE_UPDATE", False)
+        self.profile_update_detail: bool = self._bool_cfg_or_env(
+            "profile_update_detail", "DGPPO_PROFILE_UPDATE_DETAIL", False
+        )
+        self.profile_update_sync_cuda: bool = self._bool_cfg_or_env(
+            "profile_update_sync_cuda", "DGPPO_PROFILE_UPDATE_SYNC_CUDA", True
+        )
+
+    def _make_update_profiler(self, *, timestep: int) -> _UpdateProfiler:
+        stc_envs = int(self._stoch_env_ids.numel()) if self._stoch_env_ids is not None else 0
+        det_envs = int(self._det_env_ids.numel()) if self._det_env_ids is not None else 0
+        return _UpdateProfiler(
+            enabled=self.profile_update,
+            detail=self.profile_update_detail,
+            sync_cuda=self.profile_update_sync_cuda,
+            device=self.device,
+            update_index=self._dgppo_update_index,
+            timestep=timestep,
+            cfg={
+                "rollouts": self.rollouts,
+                "learning_epochs": self.learning_epochs,
+                "mini_batches": self.mini_batches,
+                "rnn_step": self.rnn_step,
+                "stc_envs": stc_envs,
+                "det_envs": det_envs,
+            },
+        )
+
+    @staticmethod
+    def _profile_phase(profiler: _UpdateProfiler | None, name: str) -> Any:
+        if profiler is None:
+            return contextlib.nullcontext()
+        return profiler.phase(name)
+
+    def _bool_cfg_or_env(self, cfg_key: str, env_key: str, default: bool) -> bool:
+        value = os.getenv(env_key)
+        if value is None:
+            value = self.cfg.get(cfg_key, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
     def _cbf_scale(self, *, timestep: int, timesteps: int) -> float:
         """Piecewise-constant CBF weight schedule."""
