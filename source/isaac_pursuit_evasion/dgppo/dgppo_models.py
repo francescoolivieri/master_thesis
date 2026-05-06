@@ -1,16 +1,12 @@
 from __future__ import annotations
 
 import math
-from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .utils import GraphData, GraphTransformerGNN
-from .utils import MLP, RNN
-
-
+from .utils import MLP, RNN, GraphData, GraphTransformerGNN
 
 # ---------------------------------------------------------------------------
 # Value networks
@@ -19,33 +15,33 @@ from .utils import MLP, RNN
 
 class DecStateFn(nn.Module):
     """
-    Decentralized head: one output per agent. 
-    
+    Decentralized head: one output per agent.
+
     Applies the shared GNN, filters to agent nodes, passes each agent through the shared MLP/RNN,
     and projects to ``n_out``.
     """
 
-    def __init__(self, gnn: nn.Module, mlp: nn.Module, rnn: Optional[nn.Module] = None, n_out: int = 1):
+    def __init__(self, gnn: nn.Module, mlp: nn.Module, rnn: nn.Module | None = None, n_out: int = 1):
         super().__init__()
         self.gnn = gnn
         self.mlp = mlp
         self.rnn = rnn
         self.n_out = n_out
 
-        # final projection 
+        # final projection
         self.value_out = nn.Linear(mlp.hid_sizes[-1], n_out)
         nn.init.orthogonal_(self.value_out.weight)
         nn.init.zeros_(self.value_out.bias)
 
     def forward(self, graph, rnn_state: torch.Tensor, n_agents: int):
-        x = self.gnn(graph, node_type=0, n_type=n_agents)    # (n_agents, gnn_out_dim)
+        x = self.gnn(graph, node_type=0, n_type=n_agents)  # (n_agents, gnn_out_dim)
         batch_shape = x.shape[:-2]
-        x = self.mlp(x).reshape(-1, self.mlp.hid_sizes[-1])   # (B*n_agents, hid)
+        x = self.mlp(x).reshape(-1, self.mlp.hid_sizes[-1])  # (B*n_agents, hid)
 
         if self.rnn is not None:
             x, rnn_state = self.rnn(x, rnn_state)
 
-        x = self.value_out(x)                                 # (n_agents, n_out)
+        x = self.value_out(x)  # (n_agents, n_out)
         x = x.reshape(batch_shape + (n_agents, self.n_out))
         return x, rnn_state
 
@@ -53,11 +49,11 @@ class DecStateFn(nn.Module):
 class RStateFn(nn.Module):
     """
     Centralized head: one output per sub-graph.
-    
+
     Same as 'DecStateFn' but aggregates per-agent GNN outputs with a mean before the MLP/RNN.
     """
 
-    def __init__(self, gnn: nn.Module, mlp: nn.Module, rnn: Optional[nn.Module] = None, n_out: int = 1):
+    def __init__(self, gnn: nn.Module, mlp: nn.Module, rnn: nn.Module | None = None, n_out: int = 1):
         super().__init__()
         self.gnn = gnn
         self.mlp = mlp
@@ -69,20 +65,21 @@ class RStateFn(nn.Module):
         nn.init.zeros_(self.value_out.bias)
 
     def forward(self, graph, rnn_state: torch.Tensor, n_agents: int):
-        x = self.gnn(graph, node_type=0, n_type=n_agents)    # (n_agents, gnn_out_dim)
+        x = self.gnn(graph, node_type=0, n_type=n_agents)  # (n_agents, gnn_out_dim)
         batch_shape = x.shape[:-2]
-        x = x.mean(dim=-2)                                    # (..., gnn_out_dim)
+        x = x.mean(dim=-2)  # (..., gnn_out_dim)
         x = self.mlp(x).reshape(-1, self.mlp.hid_sizes[-1])
 
         if self.rnn is not None:
             x, rnn_state = self.rnn(x, rnn_state)
 
-        x = self.value_out(x)                                 # (1, n_out)
+        x = self.value_out(x)  # (1, n_out)
         x = x.reshape(batch_shape + (self.n_out,))
         return x, rnn_state
 
+
 class DGPPOValueNet(nn.Module):
-    
+
     def __init__(
         self,
         node_dim: int,
@@ -144,13 +141,14 @@ class DGPPOValueNet(nn.Module):
     def enable_training_mode(self, enabled: bool = True) -> None:
         """Called by skrl Agent.enable_models_training_mode()."""
         self.train(enabled)
-    
+
 
 # ---------------------------------------------------------------------------
 # Policy network
 # --------------------------------------------------------------------------
 
 from torch.distributions import Normal
+
 
 class TanhNormal:
     """
@@ -161,21 +159,21 @@ class TanhNormal:
         self.mean = mean
         self.std = std
         self.normal = Normal(mean, std)
-        
+
         self.threshold = threshold
         self.inverse_threshold = math.atanh(threshold)
-        
+
         # average(pdf) = p / epsilon -> log(average(pdf)) = log(p) - log(epsilon)
         self.log_epsilon = math.log(1.0 - threshold)
 
-    def sample(self, noise: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def sample(self, noise: torch.Tensor | None = None) -> torch.Tensor:
         """Sample with optional fixed standard-normal noise for parity tests."""
         if noise is None:
             u = self.normal.rsample()
         else:
             u = self.mean + self.std * noise
         return torch.tanh(u)
-    
+
     def _log_cdf(self, x: float) -> torch.Tensor:
         """Numerically stable log CDF of the Normal distribution."""
         z = (x - self.mean) / self.std
@@ -196,29 +194,25 @@ class TanhNormal:
         """
         # Clip to avoid atanh(+/-1) -> inf.
         a_clipped = torch.clamp(action, -self.threshold, self.threshold)
-        
+
         # Calculate inner log-prob
         u = torch.atanh(a_clipped)
         log_p_u = self.normal.log_prob(u)
         # Inverse log det Jacobian: -log(1 - y^2)
         log_det_inv = torch.log(torch.clamp(1.0 - a_clipped.pow(2), min=eps))
         inner_log_prob = log_p_u - log_det_inv
-        
+
         # Calculate the left and right tail log-probs
         log_prob_left = self._log_cdf(-self.inverse_threshold) - self.log_epsilon
         log_prob_right = self._log_survival(self.inverse_threshold) - self.log_epsilon
-        
+
         # Route the calculation based on the clipped boundaries
         log_prob_components = torch.where(
             a_clipped <= -self.threshold,
             log_prob_left,
-            torch.where(
-                a_clipped >= self.threshold, 
-                log_prob_right, 
-                inner_log_prob
-            )
+            torch.where(a_clipped >= self.threshold, log_prob_right, inner_log_prob),
         )
-        
+
         # Sum over the action dimensions
         return log_prob_components.sum(dim=-1)
 
@@ -230,13 +224,13 @@ class TanhNormal:
         """
         # Exact analytical entropy of the underlying Normal distribution
         base_entropy = self.normal.entropy()
-        
+
         # Single sample MC estimate of the forward log-det-Jacobian
         # Tanh Jacobian: log(1 - tanh(u)^2) evaluated on a sample from the base distribution
         u = self.normal.rsample()
         a = torch.tanh(u)
         log_det_jacobian = torch.log(torch.clamp(1.0 - a.pow(2), min=1e-8))
-        
+
         # Combine and sum over the action dimensions
         return (base_entropy + log_det_jacobian).sum(dim=-1)
 
@@ -305,39 +299,38 @@ class DGPPOPolicy(nn.Module):
             if use_rnn
             else None
         )
-        
+
         # end backbone
-        
+
         # This layer squashes the initial weights to prevent gradient vanishing
         self.scale_hid = nn.Linear(rnn_hidden if use_rnn else mlp_hid[-1], scale_hid)
-        nn.init.orthogonal_(self.scale_hid.weight) # preserve norm of vectors
+        nn.init.orthogonal_(self.scale_hid.weight)  # preserve norm of vectors
         with torch.no_grad():
             self.scale_hid.weight.mul_(scale_final)
         nn.init.zeros_(self.scale_hid.bias)
-        
-        ## Should be part of TanhNormal class, but nice to have here the networks
-        # predict optimal raw action 
+
+        # Should be part of TanhNormal class, but nice to have here the networks
+        # predict optimal raw action
         self.mean_head = nn.Linear(scale_hid, action_dim)
         # intended action std
-        self.std_head = nn.Linear(scale_hid, action_dim) # will apply softplus to ensure positivity
+        self.std_head = nn.Linear(scale_hid, action_dim)  # will apply softplus to ensure positivity
         for layer in (self.mean_head, self.std_head):
-            nn.init.orthogonal_(layer.weight) 
+            nn.init.orthogonal_(layer.weight)
             nn.init.zeros_(layer.bias)
-            
-    
+
     def distribution(
         self,
         graph: GraphData,
-        rnn_state: Optional[torch.Tensor],
+        rnn_state: torch.Tensor | None,
         n_agents: int,
-    ) -> tuple[TanhNormal, Optional[torch.Tensor]]:
+    ) -> tuple[TanhNormal, torch.Tensor | None]:
         """
-           Forward the policy network to get a TanhNormal distribution over actions.
-           Returns :
-            - TanhNormal distribution
-            - rnn_state
+        Forward the policy network to get a TanhNormal distribution over actions.
+        Returns :
+         - TanhNormal distribution
+         - rnn_state
         """
-        
+
         x = self.gnn(graph, node_type=0, n_type=n_agents)
         batch_shape = x.shape[:-2]
         x = self.mlp(x).reshape(-1, self.mlp.hid_sizes[-1])
@@ -346,21 +339,21 @@ class DGPPOPolicy(nn.Module):
         else:
             rnn_state = None
         h = self.scale_hid(x)
-        
+
         mean = self.mean_head(h)
         std = F.softplus(self.std_head(h) + self.std_dev_init_inv) + self.std_dev_min
         mean = mean.reshape(batch_shape + (n_agents, -1))
         std = std.reshape(batch_shape + (n_agents, -1))
         return TanhNormal(mean, std), rnn_state
-    
+
     def act(
         self,
         graph: GraphData,
-        rnn_state: Optional[torch.Tensor],
+        rnn_state: torch.Tensor | None,
         n_agents_total: int,
         *,
         deterministic: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Sample an action (or take the mode) and return :
             - action
@@ -380,16 +373,17 @@ class DGPPOPolicy(nn.Module):
             dist.mode().reshape(-1, action.shape[-1]),
             rnn_state,
         )
-        
-    
+
     def evaluate(
         self,
         graph: GraphData,
         action: torch.Tensor,
-        rnn_state: Optional[torch.Tensor],
+        rnn_state: torch.Tensor | None,
         n_agents_total: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """ 
+        *,
+        compute_entropy: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """
         Evaluates a taken action. Returns :
             - log_prob of the action
             - entropy of the generated distribution
@@ -398,15 +392,18 @@ class DGPPOPolicy(nn.Module):
         dist, rnn_state = self.distribution(graph, rnn_state, n_agents_total)
         action = action.reshape(dist.mean.shape)
         log_prob = dist.log_prob(action).reshape(-1)
-        entropy = dist.entropy().reshape(-1)
+        if compute_entropy:
+            entropy = dist.entropy().reshape(-1)
+        else:
+            entropy = log_prob.new_zeros(log_prob.shape)
         return log_prob, entropy, rnn_state
-    
+
     def enable_training_mode(self, enabled: bool = True) -> None:
         """Called by skrl Agent.enable_models_training_mode()."""
         self.train(enabled)
 
     @torch.no_grad()
-    def initialize_carry(self, n_agents_total: int, device=None) -> Optional[torch.Tensor]:
+    def initialize_carry(self, n_agents_total: int, device=None) -> torch.Tensor | None:
         if self.rnn is None:
             return None
         return self.rnn.initialize_carry(n_agents_total, device=device)

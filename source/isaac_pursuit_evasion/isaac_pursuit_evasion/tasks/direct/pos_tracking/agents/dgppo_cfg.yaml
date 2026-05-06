@@ -32,6 +32,7 @@ agent:
 
   # RNN
   use_rnn: true
+  rnn_step: 16
   rnn:
     cell:   gru
     hidden: 64
@@ -69,7 +70,7 @@ agent:
       name: ""
       sync_tensorboard: false
 
-# - Trainer settings, read by skrl SequentialTrainer 
+# - Trainer settings, read by skrl SequentialTrainer
 trainer:
   timesteps: 15000
   environment_info: log
