@@ -17,6 +17,7 @@ from .update_helpers import (
     compute_policy_loss,
     compute_rollout_policy_loss,
     compute_value_losses,
+    rollout_graph_chunks,
 )
 from .utils import (
     GraphData,
@@ -596,6 +597,11 @@ class DGPPOAgent(Agent):
             graph=graph,
             det_graph=det_graph,
         )
+        chunk_graph = None
+        det_chunk_graph = None
+        if self.policy.rnn is not None or self.Vl.rnn is not None or self.Vh.rnn is not None:
+            chunk_graph = rollout_graph_chunks(batch.graph, chunk_ids=chunk_ids, T=batch.T, B=batch.b)
+            det_chunk_graph = rollout_graph_chunks(batch.det_graph, chunk_ids=chunk_ids, T=batch.T, B=batch.b)
 
         # ---- Policy ----
         if self.policy.rnn is not None:
@@ -609,6 +615,7 @@ class DGPPOAgent(Agent):
                 clip_eps=self.clip_eps,
                 entropy_scale=self.entropy_scale,
                 n_agents=batch.A,
+                chunk_graph=chunk_graph,
             )
         else:
             policy_info = compute_policy_loss(
@@ -643,6 +650,8 @@ class DGPPOAgent(Agent):
             rnn_states=batch.rnn_states,
             det_rnn_states=batch.det_rnn_states,
             chunk_ids=chunk_ids,
+            chunk_graph=chunk_graph,
+            det_chunk_graph=det_chunk_graph,
         )
         apply_value_update(
             optimizer=self._vl_opt,
