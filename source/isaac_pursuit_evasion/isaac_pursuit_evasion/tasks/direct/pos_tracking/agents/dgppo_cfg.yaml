@@ -16,19 +16,28 @@ agent:
   learning_epochs:  4
   learning_starts:  0
   mini_batches:     8
-  ratio_clip:       0.2
+  
   entropy_loss_scale: 0.0
   vl_loss_scale:    1.0
   vh_loss_scale:    1.0
+
+  ratio_clip:       0.2
   grad_norm_clip:   2.0
+  # TODO: add value_clip (skrl's clip_predicted_values) option
 
   # Learning rates
   lr_policy: 2.0e-4
   lr_vl:     1.0e-3
   lr_vh:     1.0e-3
 
+  # TODO: add learning rate schedulers (e.g. KLAdaptiveLR)
+
+
+  # TODO: time_limit_bootstrap
+
   # Graph / observation radius for graph builder
   obs_radius: 10.0
+  # TODO: observation and value preprocessors (e.g. RunningStandardScaler)
 
   # RNN
   use_rnn: true
@@ -53,8 +62,9 @@ agent:
     critic_mlp_hid: [128, 64]
     scale_hid: 64
     scale_final: 0.01
-    std_dev_init: 0.5
-    std_dev_min: 1.0e-5
+    std_dev_init: 0.5    # shouldn t choose min, max and init (in log space)?
+    std_dev_min: 1.0e-5 
+    # TODO: choose activation function (e.g. elu, relu, etc.)
 
   # skrl experiment logging
   experiment:

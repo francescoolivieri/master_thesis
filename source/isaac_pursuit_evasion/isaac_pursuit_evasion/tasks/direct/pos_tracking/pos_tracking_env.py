@@ -1,26 +1,30 @@
 """Single-drone position tracking environment for Crazyflie Brushless."""
+
 from __future__ import annotations
 
 import math
 from pathlib import Path
-import torch
-from tensordict import TensorDict
 
 import isaaclab.sim as sim_utils
+import isaacsim.core.utils.prims as prim_utils
+import torch
 from isaaclab.assets import Articulation, ArticulationData
 from isaaclab.envs import DirectRLEnv
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.sensors import TiledCamera
 from isaaclab.sensors.camera.utils import save_images_to_file
 from isaaclab.utils import math as math_utils
-import isaacsim.core.utils.prims as prim_utils
+from tensordict import TensorDict
 
 from source.isaac_pursuit_evasion.assets.crazyflie_brushless import (
     CrazyflieBrushlessPursuer,
-    fpv_camera_cfg,
     fpv_camera_center_line,
+    fpv_camera_cfg,
 )
-from source.isaac_pursuit_evasion.controllers.crazy_controller import DEFAULT_GAINS, build_crazyflie_pid
+from source.isaac_pursuit_evasion.controllers.crazy_controller import (
+    DEFAULT_GAINS,
+    build_crazyflie_pid,
+)
 from source.isaac_pursuit_evasion.controllers.rl_controllers import (
     CrazyflieRLBodyRatesWrapper,
     CrazyflieRLVelocityWrapper,
@@ -134,7 +138,9 @@ class PosTrackingEnv(DirectRLEnv):
         self._pillar_collision_radius = float(self.cfg.pillar_radius + self.cfg.drone_collision_radius)
         self._pillar_top_z = float(self.cfg.arena_min[2] + self.cfg.pillar_height)
         if len(self.cfg.pillar_positions_xy) > 0:
-            self._pillar_positions_xy = torch.tensor(self.cfg.pillar_positions_xy, device=self.device, dtype=torch.float32)
+            self._pillar_positions_xy = torch.tensor(
+                self.cfg.pillar_positions_xy, device=self.device, dtype=torch.float32
+            )
         else:
             self._pillar_positions_xy = torch.zeros((0, 2), device=self.device, dtype=torch.float32)
         self._num_pillars = int(self._pillar_positions_xy.shape[0])
@@ -155,6 +161,12 @@ class PosTrackingEnv(DirectRLEnv):
 
         self._last_rewards = torch.zeros(self.num_envs, device=self.device)
         self._last_reward_components: dict[str, torch.Tensor] = {}
+        self._last_constraint_costs = torch.zeros(
+            self.num_envs,
+            self.num_agents,
+            self.n_constraints,
+            device=self.device,
+        )
         self._last_done_reason = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
 
         self._body_x_axis = torch.tensor([1.0, 0.0, 0.0], device=self.device)
@@ -248,16 +260,15 @@ class PosTrackingEnv(DirectRLEnv):
 
         # Agent state: pos (3) + vel (3)
         agent_pos = self._robot.data.root_pos_w - env_origins  # (E, 3)
-        agent_vel = self._robot.data.root_lin_vel_w             # (E, 3)
+        agent_vel = self._robot.data.root_lin_vel_w  # (E, 3)
 
         # Goal state: pos only (3) — vel is always zero, omitted
-        goal_pos = self._reference_pos                          # (E, 3)
+        goal_pos = self._reference_pos  # (E, 3)
 
         # Obstacle state: xy only, flattened — vel/z always zero, omitted
         if self._num_pillars > 0:
             obstacle_xy_flat = (
-                self._pillar_positions_xy.unsqueeze(0).expand(self.num_envs, -1, -1)
-                .reshape(self.num_envs, -1)
+                self._pillar_positions_xy.unsqueeze(0).expand(self.num_envs, -1, -1).reshape(self.num_envs, -1)
             )  # (E, O*2)
         else:
             obstacle_xy_flat = agent_pos.new_empty(self.num_envs, 0)
@@ -265,12 +276,12 @@ class PosTrackingEnv(DirectRLEnv):
         # Layout: [agent_pos(3), agent_vel(3), goal_pos(3), obstacle_xy(O*2)]
         obs = torch.cat([agent_pos, agent_vel, goal_pos, obstacle_xy_flat], dim=-1)
         return {"policy": obs}
-    
 
     def _get_rewards(self) -> torch.Tensor:
         env_origins = self._terrain.env_origins
         pos_local = self._robot.data.root_pos_w - env_origins
         pos_error = torch.norm(self._reference_pos - pos_local, dim=-1)
+        constraint_costs = self.compute_constraint_costs(pos_local)
 
         pos_reward = self.cfg.reward_pos * torch.exp(-self.cfg.reward_pos_scale * pos_error)
         rewards = pos_reward.clone()
@@ -335,6 +346,8 @@ class PosTrackingEnv(DirectRLEnv):
 
         self._last_rewards = rewards
         self._last_reward_components = components
+        self._last_constraint_costs = constraint_costs
+        self.extras["costs"] = constraint_costs
         self._maybe_save_camera_images()
         return rewards
 
@@ -403,32 +416,31 @@ class PosTrackingEnv(DirectRLEnv):
     # Helpers
     # ---------------------------------------------------------------------
 
-
     # Graph observation helpers (used by DGPPOAgent._build_graph)
     _GRAPH_STATE_DIM: int = 6  # (x, y, z, vx, vy, vz)
 
     @property
     def num_agents(self) -> int:
         return 1
-    
+
     @property
     def n_constraints(self) -> int:
-        return self._num_pillars # pairwise constraint
+        return self._num_pillars  # pairwise constraint
 
     @property
     def graph_obs_layout(self) -> dict:
         """Return the layout of the flat policy-obs vector for graph construction."""
-        agent_end = self._GRAPH_STATE_DIM              # 6
-        goal_end  = agent_end + 3                      # 9  (goal pos only)
-        obstacles_end   = goal_end  + self._num_pillars * 2  # 9 + O*2
-        
+        agent_end = self._GRAPH_STATE_DIM  # 6
+        goal_end = agent_end + 3  # 9  (goal pos only)
+        obstacles_end = goal_end + self._num_pillars * 2  # 9 + O*2
+
         return {
-            "state_dim"   : self._GRAPH_STATE_DIM,
-            "n_agents"    : self.num_agents,
-            "n_obstacles" : self._num_pillars,
-            "agent_end"   : agent_end,
-            "goal_end"    : goal_end,
-            "obstacles_end"     : obstacles_end,
+            "state_dim": self._GRAPH_STATE_DIM,
+            "n_agents": self.num_agents,
+            "n_obstacles": self._num_pillars,
+            "agent_end": agent_end,
+            "goal_end": goal_end,
+            "obstacles_end": obstacles_end,
         }
 
     @staticmethod
@@ -509,6 +521,29 @@ class PosTrackingEnv(DirectRLEnv):
         inside_height = (pos_local[:, 2] >= self.cfg.arena_min[2]) & (pos_local[:, 2] <= self._pillar_top_z)
         return torch.any(inside_radius, dim=1) & inside_height
 
+    def compute_constraint_costs(self, agent_pos_local: torch.Tensor | None = None) -> torch.Tensor:
+        """Signed pillar-clearance costs shaped ``[E, 1, n_pillars]`` for DG-PPO."""
+        if agent_pos_local is None:
+            env_origins = self._terrain.env_origins
+            agent_pos_local = self._robot.data.root_pos_w - env_origins
+        if agent_pos_local.ndim == 3:
+            agent_pos_local = agent_pos_local[:, 0, :3]
+        else:
+            agent_pos_local = agent_pos_local[:, :3]
+
+        if (not self.cfg.enable_pillars) or self._pillar_positions_xy.shape[0] == 0:
+            return agent_pos_local.new_zeros(agent_pos_local.shape[0], self.num_agents, 0)
+
+        dxy = torch.norm(agent_pos_local[:, None, :2] - self._pillar_positions_xy[None, :, :], dim=-1)
+        signed_clearance = self._pillar_collision_radius - dxy
+        inside_height = (agent_pos_local[:, 2] >= self.cfg.arena_min[2]) & (agent_pos_local[:, 2] <= self._pillar_top_z)
+        signed_clearance = torch.where(
+            inside_height[:, None],
+            signed_clearance,
+            -signed_clearance.abs().clamp_min(1.0e-3),
+        )
+        return signed_clearance.clamp(min=-1.0, max=1.0).unsqueeze(1)
+
     def _update_success_flags(self, pos_local: torch.Tensor) -> torch.Tensor:
         pos_error = torch.norm(self._reference_pos - pos_local, dim=-1)
         within = pos_error < self.cfg.pos_tolerance
@@ -561,7 +596,9 @@ class PosTrackingEnv(DirectRLEnv):
                 nearest_pillars = self._pillar_positions_xy[nearest_idx]
                 vectors = pos[colliding, :2] - nearest_pillars
                 norms = torch.norm(vectors, dim=1, keepdim=True)
-                unit = torch.where(norms > 1e-6, vectors / norms.clamp_min(1e-6), default_dirs.expand(vectors.shape[0], -1))
+                unit = torch.where(
+                    norms > 1e-6, vectors / norms.clamp_min(1e-6), default_dirs.expand(vectors.shape[0], -1)
+                )
                 projected = nearest_pillars + unit * safe_radius
                 pos[colliding, :2] = torch.clamp(projected, min=low[:2], max=high[:2])
 
@@ -575,7 +612,8 @@ class PosTrackingEnv(DirectRLEnv):
                 safe_candidates = candidate_xy[torch.all(candidate_dxy > safety_radius, dim=1)]
                 if safe_candidates.shape[0] == 0:
                     raise RuntimeError(
-                        "Reference sampling failed: no feasible XY location satisfies pillar clearance in current bounds."
+                        "Reference sampling failed: no feasible XY location satisfies pillar clearance in current"
+                        " bounds."
                     )
                 count = int(final_colliding.sum().item())
                 pick_idx = torch.randint(0, safe_candidates.shape[0], (count,), device=self.device)
@@ -672,26 +710,44 @@ class PosTrackingEnv(DirectRLEnv):
             k_aero_z = torch.full((n,), self._dr_nominal_k_aero_z, device=self.device)
 
         if self._dr_cfg.randomize_rate_gains:
-            kp_rp = torch.empty(n, device=self.device).uniform_(
-                self._dr_cfg.rate_kp_min_scale, self._dr_cfg.rate_kp_max_scale
-            ) * self._dr_rate_kp_nominal[0]
-            kp_y = torch.empty(n, device=self.device).uniform_(
-                self._dr_cfg.rate_kp_min_scale, self._dr_cfg.rate_kp_max_scale
-            ) * self._dr_rate_kp_nominal[2]
+            kp_rp = (
+                torch.empty(n, device=self.device).uniform_(
+                    self._dr_cfg.rate_kp_min_scale, self._dr_cfg.rate_kp_max_scale
+                )
+                * self._dr_rate_kp_nominal[0]
+            )
+            kp_y = (
+                torch.empty(n, device=self.device).uniform_(
+                    self._dr_cfg.rate_kp_min_scale, self._dr_cfg.rate_kp_max_scale
+                )
+                * self._dr_rate_kp_nominal[2]
+            )
 
-            ki_rp = torch.empty(n, device=self.device).uniform_(
-                self._dr_cfg.rate_ki_min_scale, self._dr_cfg.rate_ki_max_scale
-            ) * self._dr_rate_ki_nominal[0]
-            ki_y = torch.empty(n, device=self.device).uniform_(
-                self._dr_cfg.rate_ki_min_scale, self._dr_cfg.rate_ki_max_scale
-            ) * self._dr_rate_ki_nominal[2]
+            ki_rp = (
+                torch.empty(n, device=self.device).uniform_(
+                    self._dr_cfg.rate_ki_min_scale, self._dr_cfg.rate_ki_max_scale
+                )
+                * self._dr_rate_ki_nominal[0]
+            )
+            ki_y = (
+                torch.empty(n, device=self.device).uniform_(
+                    self._dr_cfg.rate_ki_min_scale, self._dr_cfg.rate_ki_max_scale
+                )
+                * self._dr_rate_ki_nominal[2]
+            )
 
-            kd_rp = torch.empty(n, device=self.device).uniform_(
-                self._dr_cfg.rate_kd_min_scale, self._dr_cfg.rate_kd_max_scale
-            ) * self._dr_rate_kd_nominal[0]
-            kd_y = torch.empty(n, device=self.device).uniform_(
-                self._dr_cfg.rate_kd_min_scale, self._dr_cfg.rate_kd_max_scale
-            ) * self._dr_rate_kd_nominal[2]
+            kd_rp = (
+                torch.empty(n, device=self.device).uniform_(
+                    self._dr_cfg.rate_kd_min_scale, self._dr_cfg.rate_kd_max_scale
+                )
+                * self._dr_rate_kd_nominal[0]
+            )
+            kd_y = (
+                torch.empty(n, device=self.device).uniform_(
+                    self._dr_cfg.rate_kd_min_scale, self._dr_cfg.rate_kd_max_scale
+                )
+                * self._dr_rate_kd_nominal[2]
+            )
         else:
             kp_rp = self._dr_rate_kp_nominal[0].expand(n)
             kp_y = self._dr_rate_kp_nominal[2].expand(n)
@@ -830,7 +886,7 @@ class PosTrackingEnv(DirectRLEnv):
         if self._camera_save_stride > 1:
             if int(self.common_step_counter) % self._camera_save_stride != 0:
                 return
-        images = self._camera.data.output.get("rgb", None)
+        images = self._camera.data.output.get("rgb")
         if images is None:
             return
         img = images.detach().clone()
@@ -954,6 +1010,9 @@ class PosTrackingEnv(DirectRLEnv):
 
     def get_last_reward_components(self) -> dict[str, torch.Tensor]:
         return self._last_reward_components
+
+    def get_last_constraint_costs(self) -> torch.Tensor:
+        return self._last_constraint_costs
 
     def get_last_done_reasons(self) -> torch.Tensor:
         return self._last_done_reason

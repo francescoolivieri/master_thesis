@@ -408,21 +408,11 @@ class DGPPOAgent(Agent):
             agent_state, goal_state, obs_state = self._extract_graph_states(observations)
             actions = actions.reshape(n_envs, n_agents, action_dim)
             rewards = rewards.reshape(n_envs)
+            dones = (terminated | truncated).reshape(n_envs)
             log_prob = self._last_log_prob.reshape(n_envs, n_agents)
             value_l_all = self._current_Vl.reshape(n_envs, -1).squeeze(-1)
             value_h_all = self._current_Vh.reshape(n_envs, n_agents, n_constraints)
-            costs_all = None
-            if isinstance(infos, Mapping):
-                costs_all = infos.get("costs", infos.get("cost"))
-            if costs_all is None:
-                costs_all = torch.zeros(n_envs, n_agents, n_constraints, device=self.device, dtype=torch.float32)
-            else:
-                costs_all = torch.as_tensor(costs_all, device=self.device, dtype=torch.float32)
-                if costs_all.ndim == 1:
-                    costs_all = costs_all[:, None, None]
-                elif costs_all.ndim == 2:
-                    costs_all = costs_all[:, :, None]
-                costs_all = costs_all.reshape(n_envs, n_agents, n_constraints)
+            costs_all = self._constraint_costs(agent_state=agent_state, infos=infos, n_constraints=n_constraints)
 
             stc_rnn_state = self._select_policy_rnn_envs(self._last_policy_rnn_state, self._stoch_env_ids)
             det_rnn_state = self._select_policy_rnn_envs(self._last_policy_rnn_state, self._det_env_ids)
@@ -437,6 +427,7 @@ class DGPPOAgent(Agent):
                 stc_cost=costs_all[self._stoch_env_ids],
                 stc_value_l=value_l_all[self._stoch_env_ids],
                 stc_value_h=value_h_all[self._stoch_env_ids],
+                stc_done=dones[self._stoch_env_ids],
                 det_agent_state=agent_state[self._det_env_ids],
                 det_goal_state=goal_state[self._det_env_ids],
                 det_obs_state=obs_state[self._det_env_ids],
@@ -446,6 +437,7 @@ class DGPPOAgent(Agent):
                 det_cost=costs_all[self._det_env_ids],
                 det_value_l=value_l_all[self._det_env_ids],
                 det_value_h=value_h_all[self._det_env_ids],
+                det_done=dones[self._det_env_ids],
                 stc_rnn_state=stc_rnn_state,
                 det_rnn_state=det_rnn_state,
             )
@@ -457,6 +449,8 @@ class DGPPOAgent(Agent):
                     vh_boot, _ = self.Vh(next_graph, self._policy_rnn_state, self.env.num_agents)
                 self.memory.set_final_values("stc", vl_boot[self._stoch_env_ids], vh_boot[self._stoch_env_ids])
                 self.memory.set_final_values("det", vl_boot[self._det_env_ids], vh_boot[self._det_env_ids])
+
+            self._reset_rnn_states_for_done(dones)
 
     def pre_interaction(self, *, timestep: int, timesteps: int) -> None:
         pass  # or super() — in any case does nothing for on-policy
@@ -500,6 +494,7 @@ class DGPPOAgent(Agent):
             Tp1_Vl=view["bTp1_Vl"],
             disc_gamma=self.gamma,
             gae_lambda=self.gae_lambda,
+            T_done=view["bT_dones"],
         )
 
         Qh_det, _ = compute_dec_ocp_gae(
@@ -509,6 +504,7 @@ class DGPPOAgent(Agent):
             Tp1_Vl=view["bTp1_Vl"],
             disc_gamma=self.gamma,
             gae_lambda=self.gae_lambda,
+            T_done=det_view["bT_dones"],
         )
 
         # flipped for PPO use
@@ -735,6 +731,33 @@ class DGPPOAgent(Agent):
             obs_radius=self.obs_radius,
         )
 
+    def _constraint_costs(
+        self,
+        *,
+        agent_state: torch.Tensor,
+        infos: Any,
+        n_constraints: int,
+    ) -> torch.Tensor:
+        """Return constraint costs as ``[E, A, H]`` for the current observation graph."""
+        base_env = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
+        cost_fn = getattr(base_env, "compute_constraint_costs", None)
+        costs_all = cost_fn(agent_state) if callable(cost_fn) else None
+
+        if costs_all is None and isinstance(infos, Mapping):
+            costs_all = infos.get("costs", infos.get("cost"))
+
+        n_envs = self.env.num_envs
+        n_agents = self.env.num_agents
+        if costs_all is None:
+            return torch.zeros(n_envs, n_agents, n_constraints, device=self.device, dtype=torch.float32)
+
+        costs_all = torch.as_tensor(costs_all, device=self.device, dtype=torch.float32)
+        if costs_all.ndim == 1:
+            costs_all = costs_all[:, None, None]
+        elif costs_all.ndim == 2:
+            costs_all = costs_all[:, None, :] if costs_all.shape[-1] == n_constraints else costs_all[:, :, None]
+        return costs_all.reshape(n_envs, n_agents, n_constraints)
+
     def _select_policy_rnn_envs(
         self, rnn_state: torch.Tensor | None, env_ids: torch.Tensor | None
     ) -> torch.Tensor | None:
@@ -745,3 +768,17 @@ class DGPPOAgent(Agent):
         A = self.env.num_agents
         state = rnn_state.reshape(L, self.env.num_envs, A, C, H)
         return state[:, env_ids].reshape(L, int(env_ids.numel()) * A, C, H)
+
+    def _reset_rnn_states_for_done(self, dones: torch.Tensor) -> None:
+        """Clear recurrent carries for envs that IsaacLab reset after this transition."""
+        if not torch.any(dones):
+            return
+        done_ids = torch.nonzero(dones.to(device=self.device, dtype=torch.bool), as_tuple=False).flatten()
+        if self._policy_rnn_state is not None:
+            L, _N, C, H = self._policy_rnn_state.shape
+            A = self.env.num_agents
+            state = self._policy_rnn_state.reshape(L, self.env.num_envs, A, C, H)
+            state[:, done_ids] = 0.0
+            self._policy_rnn_state = state.reshape(L, self.env.num_envs * A, C, H)
+        if self._vl_rnn_state is not None:
+            self._vl_rnn_state[:, done_ids] = 0.0

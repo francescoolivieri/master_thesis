@@ -28,6 +28,7 @@ def compute_dec_ocp_gae(
     disc_gamma: float,
     gae_lambda: float,
     discount_to_max: bool = True,
+    T_done: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Computes the decomposed-OCP GAE target for both the constraint (high-level)
@@ -42,6 +43,8 @@ def compute_dec_ocp_gae(
         gae_lambda: GAE lambda.
         discount_to_max: if True, bootstrap ``Vh`` towards the max over heads
             (standard in DGPPO); otherwise per-head.
+        T_done: optional ``[B, T]`` episode-boundary mask. When true, future
+            values are not bootstrapped through that transition.
 
     Returns:
         ``Qh`` with shape ``[B, T, A, NH]`` and ``Ql`` with shape ``[B, T]``.
@@ -51,6 +54,10 @@ def compute_dec_ocp_gae(
 
     Qs = torch.zeros((B, T, A, NH + 1), device=device, dtype=dtype)
     time_ids = torch.arange(T + 1, device=device)
+    if T_done is None:
+        T_continue = torch.ones((B, T), device=device, dtype=dtype)
+    else:
+        T_continue = (~T_done.to(device=device, dtype=torch.bool)).to(dtype)
 
     # Rolling buffers over the whole batch. Position 0 contains the latest
     # bootstrap; later positions hold values collected by previous reverse-time
@@ -68,6 +75,7 @@ def compute_dec_ocp_gae(
         cost_l = T_l[:, t]
         Vhs = Tp1ah_Vh[:, t]
         Vl = Tp1_Vl[:, t, None].expand(B, A)
+        continue_t = T_continue[:, t]
 
         mask = (time_ids <= step).to(dtype)
         mask_h = mask[None, :, None, None]
@@ -78,9 +86,11 @@ def compute_dec_ocp_gae(
         else:
             h_disc = hs
 
-        disc_to_h = (1.0 - disc_gamma) * h_disc[:, None] + disc_gamma * next_Vhs_row
+        cont_h = continue_t[:, None, None, None]
+        cont_l = continue_t[:, None, None]
+        disc_to_h = (1.0 - disc_gamma) * h_disc[:, None] + disc_gamma * next_Vhs_row * cont_h
         Vhs_row = mask_h * torch.maximum(hs[:, None], disc_to_h)
-        Vl_row = mask_l * (cost_l[:, None, None] + disc_gamma * next_Vl_row)
+        Vl_row = mask_l * (cost_l[:, None, None] + disc_gamma * next_Vl_row * cont_l)
 
         cat_V_row = torch.cat([Vhs_row, Vl_row[:, :, :, None]], dim=-1)
         Qs[:, t] = torch.einsum("btah,t->bah", cat_V_row, gae_coeffs)

@@ -61,7 +61,7 @@ agent:
 
   kl_threshold: 0.0
 
-  rewards_shaper_scale: 1.0
+  rewards_shaper_scale: 1.0  
   time_limit_bootstrap: True
 
   experiment:

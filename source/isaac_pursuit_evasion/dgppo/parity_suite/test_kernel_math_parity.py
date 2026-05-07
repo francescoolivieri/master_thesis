@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 from .parity_test_utils import assert_parity_close, importorskip, load_kernel_fixture
 
 torch = importorskip("torch")
@@ -24,6 +22,21 @@ def test_dec_ocp_gae_matches_jax_kernel_fixture() -> None:
 
     assert_parity_close(qh.squeeze(0), fixture.arrays["checkpoints/kernel/gae/Qhs"], stage="kernel", tensor_name="Qhs")
     assert_parity_close(ql.squeeze(0), fixture.arrays["checkpoints/kernel/gae/Ql"], stage="kernel", tensor_name="Ql")
+
+
+def test_dec_ocp_gae_respects_episode_boundaries() -> None:
+    qh, ql = compute_dec_ocp_gae(
+        Tah_hs=torch.zeros(1, 2, 1, 1),
+        T_l=torch.tensor([[1.0, 10.0]]),
+        Tp1ah_Vh=torch.zeros(1, 3, 1, 1),
+        Tp1_Vl=torch.tensor([[0.0, 7.0, 100.0]]),
+        disc_gamma=0.9,
+        gae_lambda=0.5,
+        T_done=torch.tensor([[True, False]]),
+    )
+
+    assert_parity_close(qh, torch.zeros_like(qh), stage="kernel/dones", tensor_name="Qh")
+    assert_parity_close(ql[:, 0], torch.tensor([1.0]), stage="kernel/dones", tensor_name="Ql_done")
 
 
 def test_ppo_surrogate_matches_jax_kernel_fixture() -> None:
