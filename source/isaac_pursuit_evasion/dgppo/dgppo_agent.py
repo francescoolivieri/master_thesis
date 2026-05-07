@@ -214,6 +214,7 @@ class DGPPOAgent(Agent):
         self._stoch_env_ids = None
         self._det_env_ids = None
         self._last_graph = None
+        self._last_graph_states = None
         self._last_log_prob = None
         self._last_policy_rnn_state = None
         self._current_Vl = None
@@ -277,10 +278,9 @@ class DGPPOAgent(Agent):
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Sample actions (and compute values if training) for the current environment step.
 
-        Note: the graph is built by querying the env for structured states (agent / goal /
-        obstacle positions), not from the flat `observations` blob passed by skrl.
-        This mirrors the reference DGPPO design: `build_graph_data` needs three separate
-        (E, A/O, S) tensors; the flat observation vector does not provide that structure.
+        Note: when the env exposes structured graph states, the graph is built from those
+        states rather than the flat PPO observation blob passed by skrl. This keeps the PPO
+        observation contract independent from DG-PPO's graph adapter.
 
         :param observations: Per-agent observations (E*A, obs_dim) — unused directly.
         :param states:       Global env state (E, state_dim)       — unused directly.
@@ -291,7 +291,18 @@ class DGPPOAgent(Agent):
         n_agents = self.env.num_agents
 
         with torch.no_grad():  # Saves memory
-            graph = self._build_graph(observations, states)
+            agent_state, goal_state, obs_state = self._extract_graph_states(observations, prefer_env=True)
+            self._last_graph_states = (
+                agent_state.detach(),
+                goal_state.detach(),
+                obs_state.detach(),
+            )
+            graph = build_graph_data(
+                agent_state=agent_state,
+                goal_state=goal_state,
+                obs_state=obs_state,
+                obs_radius=self.obs_radius,
+            )
             self._last_graph = graph
             self._last_policy_rnn_state = (
                 None if self._policy_rnn_state is None else self._policy_rnn_state.detach().clone()
@@ -405,7 +416,10 @@ class DGPPOAgent(Agent):
             n_agents = self.env.num_agents
             action_dim = self.env.action_space.shape[0]
             n_constraints = int(getattr(self.env, "n_constraints", getattr(self.env.unwrapped, "n_constraints", 1)))
-            agent_state, goal_state, obs_state = self._extract_graph_states(observations)
+            if self._last_graph_states is None:
+                agent_state, goal_state, obs_state = self._extract_graph_states(observations, prefer_env=False)
+            else:
+                agent_state, goal_state, obs_state = self._last_graph_states
             actions = actions.reshape(n_envs, n_agents, action_dim)
             rewards = rewards.reshape(n_envs)
             dones = (terminated | truncated).reshape(n_envs)
@@ -451,6 +465,7 @@ class DGPPOAgent(Agent):
                 self.memory.set_final_values("det", vl_boot[self._det_env_ids], vh_boot[self._det_env_ids])
 
             self._reset_rnn_states_for_done(dones)
+            self._last_graph_states = None
 
     def pre_interaction(self, *, timestep: int, timesteps: int) -> None:
         pass  # or super() — in any case does nothing for on-policy
@@ -714,17 +729,40 @@ class DGPPOAgent(Agent):
             rnn_step = T
         return torch.arange(T, device=device, dtype=torch.long).reshape(-1, rnn_step)
 
-    def _extract_graph_states(self, observations: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Decode flat policy observations into graph node state tensors."""
+    def _extract_graph_states(
+        self,
+        observations: torch.Tensor,
+        *,
+        prefer_env: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Get graph node state tensors from the env when available, otherwise from a flat graph-prefix obs."""
+        if prefer_env:
+            env_states = self._extract_graph_states_from_env()
+            if env_states is not None:
+                return env_states
+
         return extract_graph_states_from_flat_obs(
             observations,
             self.env.unwrapped.graph_obs_layout,
             n_agents=self.env.num_agents,
         )
 
+    def _extract_graph_states_from_env(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        base_env = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
+        graph_state_fn = getattr(base_env, "get_graph_states", None)
+        if not callable(graph_state_fn):
+            return None
+
+        agent_state, goal_state, obs_state = graph_state_fn()
+        return (
+            torch.as_tensor(agent_state, device=self.device, dtype=torch.float32),
+            torch.as_tensor(goal_state, device=self.device, dtype=torch.float32),
+            torch.as_tensor(obs_state, device=self.device, dtype=torch.float32),
+        )
+
     def _build_graph(self, observations: torch.Tensor, states: torch.Tensor | None) -> GraphData:
-        """Parse the flat policy-obs tensor into structured node states and build the graph."""
-        agent_state, goal_state, obs_state = self._extract_graph_states(observations)
+        """Build a graph from structured env state, falling back to flat graph-prefix observations."""
+        agent_state, goal_state, obs_state = self._extract_graph_states(observations, prefer_env=True)
 
         return build_graph_data(
             agent_state=agent_state,
