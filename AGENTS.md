@@ -31,8 +31,8 @@ Common commands:
 
 - Train PPO:
   `python scripts/skrl/train.py --task PosTracking-RL-rates-v0 --num_envs 2048 --total_frames 20000000 --algorithm PPO --headless`
-- Train DG-PPO after confirming its Hydra agent entrypoint is registered:
-  `python scripts/skrl/train.py --task PosTracking-RL-rates-v0 --agent <dgppo_cfg_entry_point> --num_envs 512 --headless`
+- Train DG-PPO:
+  `python scripts/skrl/train.py --task PosTracking-RL-rates-v0 --num_envs 512 --algorithm DGPPO --headless`
 - List registered environments:
   `python scripts/list_envs.py`
 - Run pre-commit on touched files when making Python/YAML/TOML changes:
@@ -46,6 +46,8 @@ If IsaacLab imports fail, first report that the IsaacLab environment appears ina
 - For Python changes outside Isaac-dependent runtime paths, prefer a targeted import or unit-style smoke test when possible.
 - For IsaacLab environment or training changes, run the smallest practical headless smoke test and state if the local environment prevents it.
 - For DG-PPO algorithm changes, prefer parity checks or focused tensor-shape/kernel checks before long training runs.
+- For DG-PPO runtime integration changes, run the parity suite and then a short headless `DGPPO`
+  smoke test with a small even number of environments.
 
 ## DG-PPO Port Goal
 

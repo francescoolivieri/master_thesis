@@ -10,6 +10,8 @@ This directory is primarily a source reference for the PyTorch/skrl port in `sou
 - Prefer reading these files to understand intended behavior, tensor shapes, schedules, and parity checkpoints.
 - Keep parity artifacts and logs as generated/reference data. Do not delete or rewrite them without an explicit cleanup request.
 - If exporting new fixtures, keep outputs under `dgppo-main/parity_artifacts/` and record the command used.
+- Runtime IsaacLab integration behavior, such as done-mask handling and task constraint-cost extraction,
+  belongs in `source/isaac_pursuit_evasion/dgppo/` unless the user explicitly asks to change the JAX reference.
 
 ## Useful Entry Points
 

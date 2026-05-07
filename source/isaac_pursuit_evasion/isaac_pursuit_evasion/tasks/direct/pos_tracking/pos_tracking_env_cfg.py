@@ -1,9 +1,12 @@
 """Configuration for the Crazyflie position-tracking environment."""
+
 from __future__ import annotations
 
 import math
 from typing import Literal
 
+import gymnasium as gym
+import numpy as np
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
@@ -56,7 +59,12 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     pid_loop_rate_hz = 500
     pid_posvel_loop_rate_hz = 100
     decimation = sim_frequency // policy_rate_hz
-    action_space = 4
+    action_dim: int = 4
+    action_space = gym.spaces.Box(
+        low=np.full(action_dim, -1.0, dtype=np.float32),
+        high=np.full(action_dim, 1.0, dtype=np.float32),
+        dtype=np.float32,
+    )
     observation_space = 0  # computed in env
     state_space = 0
 
@@ -68,8 +76,8 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     )
 
     # Arena bounds [min, max] for [x, y, z]
-    arena_min = (-2.5, -2.0, 0.0) 
-    arena_max = (2.5, 2.0, 2.0)   
+    arena_min = (-2.5, -2.0, 0.0)
+    arena_max = (2.5, 2.0, 2.0)
     collision_altitude: float = 0.2
     arena_margin: float = 0.0
 
@@ -142,7 +150,7 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     # Success criteria
     pos_tolerance: float = 0.15
     yaw_tolerance: float = 0.25
-    success_hold_time_s: float = 1.0 # prev: 0.5
+    success_hold_time_s: float = 1.0  # prev: 0.5
     terminate_on_success: bool = True
 
     total_timesteps = episode_length_s * sim_frequency

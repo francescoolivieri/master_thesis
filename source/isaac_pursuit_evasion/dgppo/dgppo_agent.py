@@ -612,6 +612,7 @@ class DGPPOAgent(Agent):
                 entropy_scale=self.entropy_scale,
                 n_agents=batch.A,
                 chunk_graph=chunk_graph,
+                dones=batch.dones,
             )
         else:
             policy_info = compute_policy_loss(
@@ -645,6 +646,7 @@ class DGPPOAgent(Agent):
             vh_loss_scale=self.vh_loss_scale,
             rnn_states=batch.rnn_states,
             det_rnn_states=batch.det_rnn_states,
+            dones=batch.dones,
             chunk_ids=chunk_ids,
             chunk_graph=chunk_graph,
             det_chunk_graph=det_chunk_graph,
