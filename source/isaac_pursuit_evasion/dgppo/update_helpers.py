@@ -28,6 +28,7 @@ class UpdateGraphBatch:
     ql_targets: torch.Tensor
     qh_det_targets: torch.Tensor
     rnn_states: torch.Tensor | None
+    vl_rnn_states: torch.Tensor | None
     det_rnn_states: torch.Tensor | None
     b: int
     T: int
@@ -81,6 +82,7 @@ def build_update_graph_batch(
         det_graph = select_rollout_envs(det_graph, idx=idx, T=T)
 
     rnn_states = view.get("bTa_rnn_states")
+    vl_rnn_states = view.get("bT_vl_rnn_states")
     det_rnn_states = det_view.get("bTa_rnn_states")
 
     return UpdateGraphBatch(
@@ -92,6 +94,7 @@ def build_update_graph_batch(
         ql_targets=ql[idx],
         qh_det_targets=qh_det[idx],
         rnn_states=rnn_states[idx] if rnn_states is not None else None,
+        vl_rnn_states=vl_rnn_states[idx] if vl_rnn_states is not None else None,
         det_rnn_states=det_rnn_states[idx] if det_rnn_states is not None else None,
         b=b,
         T=T,
@@ -195,8 +198,14 @@ def compute_rollout_policy_loss(
     entropy_scale: float,
     n_agents: int,
     chunk_graph: GraphData | None = None,
+    rnn_states: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Evaluate policy loss over rollout envs and RNN chunks using production policy code."""
+    """Evaluate policy loss over rollout envs and RNN chunks using production policy code.
+
+    If ``rnn_states`` is provided, it is expected as incoming per-step policy
+    carries shaped ``[B, T, L, A, C, H]``. Chunk evaluation starts from the
+    stored carry at each chunk's first timestep.
+    """
     B, T, A, action_dim = actions.shape
     chunk_ids_index = _canonical_chunk_ids(chunk_ids, device=actions.device)
     C, R = chunk_ids_index.shape
@@ -221,6 +230,7 @@ def compute_rollout_policy_loss(
             policy=policy,
             graph=chunk_graph,
             action_chunks=action_chunks,
+            rnn_states=rnn_states[:, chunk_ids_index[:, 0]] if rnn_states is not None else None,
             B=B,
             C=C,
             R=R,
@@ -306,6 +316,7 @@ def compute_value_losses(
     vl_loss_scale: float,
     vh_loss_scale: float,
     rnn_states: torch.Tensor | None = None,
+    vl_rnn_states: torch.Tensor | None = None,
     det_rnn_states: torch.Tensor | None = None,
     chunk_ids: torch.Tensor | None = None,
     chunk_graph: GraphData | None = None,
@@ -324,6 +335,7 @@ def compute_value_losses(
             chunk_ids=chunk_ids,
             A=A,
             loss_scale=vl_loss_scale,
+            rnn_states=vl_rnn_states,
             chunk_graph=chunk_graph,
         )
         if det_rnn_states is None:
@@ -374,15 +386,25 @@ def compute_rollout_vl_loss(
     chunk_ids: torch.Tensor,
     A: int,
     loss_scale: float = 1.0,
+    rnn_states: torch.Tensor | None = None,
     chunk_graph: GraphData | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Compute the Vl update loss over rollout chunks using zero RNN chunk starts."""
+    """Compute the Vl update loss over rollout chunks using stored chunk-start RNN states when available."""
     B, T = targets.shape
     chunk_ids_index = _canonical_chunk_ids(chunk_ids, device=targets.device)
     C, R = chunk_ids_index.shape
     if chunk_graph is None:
         chunk_graph = rollout_graph_chunks(graph, chunk_ids=chunk_ids_index, T=T, B=B)
-    values = _evaluate_vl_chunks(Vl=Vl, graph=chunk_graph, B=B, C=C, R=R, A=A, device=targets.device)
+    values = _evaluate_vl_chunks(
+        Vl=Vl,
+        graph=chunk_graph,
+        rnn_states=rnn_states[:, chunk_ids_index[:, 0]] if rnn_states is not None else None,
+        B=B,
+        C=C,
+        R=R,
+        A=A,
+        device=targets.device,
+    )
     targets_chunked = targets[:, chunk_ids_index]
     return {
         "vl": values,
@@ -495,6 +517,7 @@ def _evaluate_policy_chunks(
     policy: DGPPOPolicy,
     graph: GraphData,
     action_chunks: torch.Tensor,
+    rnn_states: torch.Tensor | None,
     B: int,
     C: int,
     R: int,
@@ -507,7 +530,10 @@ def _evaluate_policy_chunks(
     x = policy.mlp(x).reshape(B, C, R, A, policy.mlp.hid_sizes[-1])
     x = x.permute(2, 0, 1, 3, 4).reshape(R, B * C * A, policy.mlp.hid_sizes[-1])
 
-    rnn_state = policy.initialize_carry(B * C * A, device=action_chunks.device)
+    if rnn_states is None:
+        rnn_state = policy.initialize_carry(B * C * A, device=action_chunks.device)
+    else:
+        rnn_state = _flatten_agent_rnn_states(rnn_states)
     log_prob = action_chunks.new_empty((B, C, R, A))
     entropy = action_chunks.new_zeros((B, C, R, A))
 
@@ -529,6 +555,7 @@ def _evaluate_vl_chunks(
     *,
     Vl: DGPPOValueNet,
     graph: GraphData,
+    rnn_states: torch.Tensor | None,
     B: int,
     C: int,
     R: int,
@@ -545,12 +572,29 @@ def _evaluate_vl_chunks(
     x = Vl.head(x).reshape(B, C, R, Vl.head.hid_sizes[-1])
     x = x.permute(2, 0, 1, 3).reshape(R, B * C, Vl.head.hid_sizes[-1])
 
-    rnn_state = Vl.rnn.initialize_carry(B * C, device=device)
+    if rnn_states is None:
+        rnn_state = Vl.rnn.initialize_carry(B * C, device=device)
+    else:
+        rnn_state = _flatten_env_rnn_states(rnn_states)
     values = x.new_empty((B, C, R, Vl.net.n_out))
     for r in range(R):
         x_r, rnn_state = Vl.rnn(x[r], rnn_state)
         values[:, :, r] = Vl.net.value_out(x_r).reshape(B, C, Vl.net.n_out)
     return values.squeeze(-1)
+
+
+def _flatten_env_rnn_states(rnn_states: torch.Tensor) -> torch.Tensor:
+    """Convert ``[..., L, C, H]`` states to model carry ``[L, prod(...), C, H]``."""
+    if rnn_states.ndim < 4:
+        raise ValueError(f"expected at least 4 RNN-state dims, got shape {tuple(rnn_states.shape)}")
+    prefix_shape = tuple(int(size) for size in rnn_states.shape[:-3])
+    L, n_carries, H = (int(size) for size in rnn_states.shape[-3:])
+    n_prefix = 1
+    for size in prefix_shape:
+        n_prefix *= size
+    prefix_ndim = len(prefix_shape)
+    permute_order = (prefix_ndim, *range(prefix_ndim), prefix_ndim + 1, prefix_ndim + 2)
+    return rnn_states.permute(permute_order).reshape(L, n_prefix, n_carries, H)
 
 
 def _evaluate_vh_chunks(

@@ -158,6 +158,74 @@ def test_rollout_memory_stores_split_done_masks() -> None:
     assert torch.equal(stc_view["bT_done"], stc_view["bT_terminated"] | stc_view["bT_truncated"])
 
 
+def test_rollout_memory_stores_policy_and_vl_rnn_carries() -> None:
+    importorskip("skrl.memories.torch")
+    from dgppo.dgppo_memory import DGPPORolloutMemory
+
+    T, B, A, S, O, Da, NH = 2, 3, 2, 4, 1, 2, 1
+    L, C, H = 1, 1, 5
+    memory = DGPPORolloutMemory(
+        rollout_length=T,
+        num_det_envs=B,
+        num_stc_envs=B,
+        n_agents=A,
+        n_obs=O,
+        state_dim=S,
+        action_dim=Da,
+        n_constraints=NH,
+        device=torch.device("cpu"),
+        use_rnn=True,
+        use_vl_rnn=True,
+        rnn_layers=L,
+        rnn_hidden=H,
+        rnn_cell="gru",
+    )
+
+    zeros_agent = torch.zeros(B, A, S)
+    zeros_obs = torch.zeros(B, O, S)
+    zeros_action = torch.zeros(B, A, Da)
+    zeros_cost = torch.zeros(B, A, NH)
+    zeros_value_h = torch.zeros(B, A, NH)
+    zeros_env = torch.zeros(B)
+    zeros_logp = torch.zeros(B, A)
+
+    stc_policy_states = []
+    stc_vl_states = []
+    for t in range(T):
+        policy_state = torch.arange(L * B * A * C * H, dtype=torch.float32).reshape(L, B * A, C, H) + 100 * t
+        vl_state = torch.arange(L * B * C * H, dtype=torch.float32).reshape(L, B, C, H) + 1000 * t
+        stc_policy_states.append(policy_state.reshape(L, B, A, C, H).permute(1, 0, 2, 3, 4))
+        stc_vl_states.append(vl_state.permute(1, 0, 2, 3))
+        memory.add(
+            stc_agent_state=zeros_agent,
+            stc_goal_state=zeros_agent,
+            stc_obs_state=zeros_obs,
+            stc_action=zeros_action,
+            stc_log_prob=zeros_logp,
+            stc_reward=zeros_env,
+            stc_cost=zeros_cost,
+            stc_value_l=zeros_env,
+            stc_value_h=zeros_value_h,
+            det_agent_state=zeros_agent,
+            det_goal_state=zeros_agent,
+            det_obs_state=zeros_obs,
+            det_action=zeros_action,
+            det_log_prob=zeros_logp,
+            det_reward=zeros_env,
+            det_cost=zeros_cost,
+            det_value_l=zeros_env,
+            det_value_h=zeros_value_h,
+            stc_rnn_state=policy_state,
+            det_rnn_state=policy_state,
+            stc_vl_rnn_state=vl_state,
+            det_vl_rnn_state=vl_state,
+        )
+
+    view = memory.as_bTah_view("stc")
+    assert torch.equal(view["bTa_rnn_states"], torch.stack(stc_policy_states, dim=1))
+    assert torch.equal(view["bT_vl_rnn_states"], torch.stack(stc_vl_states, dim=1))
+
+
 @pytest.mark.parametrize("num_envs", [2, 6])
 def test_flat_observation_adapter_and_graph_shapes(num_envs: int) -> None:
     n_agents = 3

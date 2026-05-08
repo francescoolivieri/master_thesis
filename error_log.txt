@@ -1,1 +1,0 @@
-'DataModel' object has no attribute 'set_quadratic_coefficients'

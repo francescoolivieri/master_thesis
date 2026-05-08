@@ -250,6 +250,7 @@ class DGPPOAgent(Agent):
         self._last_graph = None
         self._last_log_prob = None
         self._last_policy_rnn_state = None
+        self._last_vl_rnn_state = None
         self._current_Vl = None
         self._current_Vh = None
         self._current_next_observations = None
@@ -299,6 +300,7 @@ class DGPPOAgent(Agent):
             n_constraints=n_constraints,
             device=self.device,
             use_rnn=use_rnn,
+            use_vl_rnn=self.Vl.rnn is not None,
             rnn_layers=int(self.cfg.rnn.get("layers", 1)),
             rnn_hidden=int(self.cfg.rnn.get("hidden", 64)),
             rnn_cell=str(self.cfg.rnn.get("cell", "gru")),
@@ -346,6 +348,7 @@ class DGPPOAgent(Agent):
             )
 
             if self.training:
+                self._last_vl_rnn_state = None if self._vl_rnn_state is None else self._vl_rnn_state.detach().clone()
                 vl, self._vl_rnn_state = self.Vl(graph, self._vl_rnn_state, n_agents)
                 vh, _ = self.Vh(graph, self._last_policy_rnn_state, n_agents)
                 self._current_Vl = vl
@@ -470,6 +473,8 @@ class DGPPOAgent(Agent):
 
             stc_rnn_state = self._select_policy_rnn_envs(self._last_policy_rnn_state, self._stoch_env_ids)
             det_rnn_state = self._select_policy_rnn_envs(self._last_policy_rnn_state, self._det_env_ids)
+            stc_vl_rnn_state = self._select_env_rnn_envs(self._last_vl_rnn_state, self._stoch_env_ids)
+            det_vl_rnn_state = self._select_env_rnn_envs(self._last_vl_rnn_state, self._det_env_ids)
 
             self.memory.add(
                 stc_agent_state=agent_state[self._stoch_env_ids],
@@ -496,6 +501,8 @@ class DGPPOAgent(Agent):
                 det_truncated=truncated_1d[self._det_env_ids],
                 stc_rnn_state=stc_rnn_state,
                 det_rnn_state=det_rnn_state,
+                stc_vl_rnn_state=stc_vl_rnn_state,
+                det_vl_rnn_state=det_vl_rnn_state,
             )
 
             # DGPPO DEBUG FIX START: skrl PPO_RNN-style recurrent reset.
@@ -757,6 +764,7 @@ class DGPPOAgent(Agent):
                 entropy_scale=self.entropy_scale,
                 n_agents=batch.A,
                 chunk_graph=chunk_graph,
+                rnn_states=batch.rnn_states,
             )
         else:
             policy_info = compute_policy_loss(
@@ -790,6 +798,7 @@ class DGPPOAgent(Agent):
             vh_loss_scale=self.vh_loss_scale,
             rnn_states=batch.rnn_states,
             det_rnn_states=batch.det_rnn_states,
+            vl_rnn_states=batch.vl_rnn_states,
             chunk_ids=chunk_ids,
             chunk_graph=chunk_graph,
             det_chunk_graph=det_chunk_graph,
@@ -894,6 +903,11 @@ class DGPPOAgent(Agent):
         A = self.env.num_agents
         state = rnn_state.reshape(L, self.env.num_envs, A, C, H)
         return state[:, env_ids].reshape(L, int(env_ids.numel()) * A, C, H)
+
+    def _select_env_rnn_envs(self, rnn_state: torch.Tensor | None, env_ids: torch.Tensor | None) -> torch.Tensor | None:
+        if rnn_state is None or env_ids is None:
+            return None
+        return rnn_state[:, env_ids]
 
     # DGPPO DEBUG FIX START: live rollout mask/cost/RNN helpers.
     def _env_done_mask(self, mask: torch.Tensor, n_envs: int) -> torch.Tensor:

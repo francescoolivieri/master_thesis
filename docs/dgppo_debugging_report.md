@@ -43,6 +43,18 @@ Implemented fixes, in the order requested:
    - `source/isaac_pursuit_evasion/dgppo/parity_suite/test_memory_and_adapter_parity.py`: added tests for split
      terminated/truncated mask storage.
 
+6. Recurrent update-window state alignment.
+   - `source/isaac_pursuit_evasion/dgppo/dgppo_agent.py`: DG-PPO now snapshots incoming Vl carries alongside the
+     existing incoming policy carries before each live rollout step.
+   - `source/isaac_pursuit_evasion/dgppo/dgppo_memory.py`: rollout memory stores per-step centralized Vl carries as
+     `bT_vl_rnn_states`.
+   - `source/isaac_pursuit_evasion/dgppo/update_helpers.py`: recurrent policy and Vl minibatch evaluation now starts
+     each rollout chunk from the stored incoming carry at that chunk's first timestep. This preserves the existing
+     zero-start default for JAX reset-at-rollout parity helpers, while live IsaacLab continuous windows use their real
+     mid-episode recurrent context.
+   - `source/isaac_pursuit_evasion/dgppo/parity_suite/test_memory_and_adapter_parity.py`: added a storage regression
+     for policy and Vl recurrent carries.
+
 No hyperparameters were tuned.
 
 Validation run locally:
@@ -52,6 +64,10 @@ Validation run locally:
 - `python scripts/skrl/train.py --task PosTracking-RL-velocity-v0 --num_envs 4 --algorithm DGPPO --headless --total_frames 64`
   completed one tiny 16-timestep smoke run. Its debug JSONL reported `n_constraints: 3`, `infos_keys: ["costs"]`,
   `costs.shape: [4, 1, 3]`, and stored mask fields in `update_start`.
+- `python3 -m compileall -q source/isaac_pursuit_evasion/dgppo` passed after the recurrent update-window fix.
+- `PYTHONPATH=$PWD/source/isaac_pursuit_evasion:$PYTHONPATH python3 -m pytest -q source/isaac_pursuit_evasion/dgppo/parity_suite`
+  could not execute the parity tests in this plain local shell; pytest reported `1 skipped`, consistent with the
+  IsaacLab/torch/skrl environment not being active.
 
 ## Instrumentation Added
 
@@ -246,15 +262,199 @@ internals, because `record_transition` runs after `env.step`. Large diffs in tho
 evidence of an observation layout bug. They should either be ignored for this run or changed to compare
 `next_observations` against post-step env internals in a later instrumentation pass.
 
+## Run Analysis: `new_reference_debug`
+
+Analyzed file:
+
+```text
+logs/skrl/training/dgppo/new_reference_debug/dgppo_debug/events.jsonl
+```
+
+Run setup and outcome:
+
+- Same 500-env split as `reference_debug`: 250 deterministic envs and 250 stochastic envs.
+- `n_constraints: 3`, matching the new `arena_bounds`, `pillar_0`, and `pillar_1` cost heads.
+- The run reached the configured 3000 trainer timesteps. The last event is a transition at timestep 2999.
+- Event counts: `setup`: 1, `transition`: 2692, `bootstrap`: 187, `update_start`: 187, `minibatch`: 5984,
+  `update_end`: 187.
+- Every update emitted the expected 32 minibatches (`learning_epochs: 4`, `mini_batches: 8`) and an `update_end`.
+  The previous incomplete-update crash signature did not repeat.
+
+### Fix Check 1: RNN state reset worked
+
+Across all 2692 transition events:
+
+- `transition.data.rnn.done_new_nonzero_rate`: mean 0.0, median 0.0, max 0.0.
+- Sum of `done_new_nonzero_count`: 0.
+- `transition.data.anomaly_reasons`: empty for the whole run.
+
+Across update windows:
+
+- `update_start.data.rollout_boundaries.rnn_done_new_norms` is present in 185 of 187 updates. The two absent windows
+  had no done envs in the rollout.
+- For the 185 done-containing updates, `rnn_done_new_norms.mean` and `rnn_done_new_norms.max` are both exactly 0.0.
+
+This confirms the policy/Vl carry reset after `terminated | truncated` is active in the live run. The strongest
+`reference_debug` bug is fixed.
+
+### Fix Check 2: Termination/truncation masks are stored and consumed
+
+Every `update_start` reports:
+
+- `rollout_boundaries.mask_status`: `DGPPO memory/update consumes true-termination masks; truncation masks are stored.`
+- `rollout_boundaries.done`, `terminated`, and `truncated` tensors present with shape `[16, 500]`.
+
+Observed boundary rates:
+
+- Done true rate: mean 0.00692, median 0.00587, max 0.03613.
+- Terminated true rate: mean 0.00678, median 0.00575, max 0.03613.
+- Truncated true rate: mean 0.000136, median 0.0, max 0.00163.
+
+The split rollout tensors are also present in every update. Total true counts across update windows:
+
+- Stochastic rollout: 4078 terminations and 133 truncations.
+- Deterministic rollout: 6065 terminations and 70 truncations.
+
+So the masks are not merely allocated; they cover real episode boundaries and are flowing into the target/advantage
+computation path. Time-limit truncations remain rare but are now distinguishable from true terminations.
+
+### Fix Check 3: `infos["costs"]` is present and nonzero
+
+Across transition events:
+
+- `env.infos_keys` contains `costs` in all 2692 transitions.
+- `transition.data.tensors.costs.shape` is `[500, 1, 3]` in every transition.
+- `transition.data.tensors.costs.finite_rate` is 1.0 throughout.
+- Cost mean is negative throughout, with run mean -0.544.
+- Cost max is positive in 2622 of 2692 transition events; observed max is 0.101.
+- Cost min is negative in every transition and often saturated at -1.0.
+
+Across update windows, both split rollouts report finite nonzero `costs_h` with the same 3-head semantics. Vh prediction
+and target tensors also use the 3-head shape. This confirms that the safety pathway is no longer training on all-zero
+costs.
+
+### Remaining instability
+
+The run is healthier than `reference_debug`, but there are still signs to investigate before any hyperparameter tuning:
+
+- No NaNs or incomplete updates are visible in the JSONL stream.
+- Minibatch losses are lower overall than the old run: policy loss mean 0.128, Vh loss mean 0.000211, Vl loss mean
+  0.656.
+- Vl gradients are much smaller than before but still large: mean 15.7, p99 43.3, max 70.7.
+- Policy gradients are usually modest, but there is one spike to 204.7 at update 165.
+- PPO ratio mean stays near 1.0 overall, but rare ratio outliers remain. The largest ratio max is 976.6 at update 88,
+  followed by 507.8 and 280.5 in the same update. Another spike reaches 162.0 at update 165.
+- Clip fraction does not explode despite those outliers: mean 0.068, p99 0.208, max 0.333.
+- Stochastic log-probs grow very large by the second half of the run. Minibatch `log_prob.max` reaches 24.51, and the
+  final-quarter mean of `log_prob.max` is about 23.6.
+- Vl predictions and Ql targets drift upward over training. By update quartiles, stochastic `value_l.mean` moves from
+  0.31 to 3.92 to 9.61 to 12.76, while `ql.mean` moves from -0.07 to 2.71 to 7.85 to 10.88. `vl_boot.max` reaches
+  20.23.
+- Vh remains comparatively stable: minibatch Vh prediction mean is about -0.096, Vh grad norm mean is 0.014, and Vh
+  loss stays small.
+
+Interpretation: the original live-integration failures are fixed, and the run no longer crashes early, but there is
+still a policy/value-scale issue. The rare ratio spikes and high positive log-probs point toward a remaining policy
+distribution or action-squashing/log-prob stability question. The steadily rising Vl/Ql scale is a separate thing to
+inspect before treating this as a tuning problem.
+
+### Bootstrap mismatch remains
+
+The reference-style Vh bootstrap comparison is still nonzero:
+
+- `vh_boot_abs_diff.mean`: mean 0.00324, median 0.00276, max 0.02795.
+- `vh_boot_abs_diff.max`: mean 0.0566, median 0.0400, max 0.2845.
+
+This is not the dominant failure mode in the new run, but it remains a systematic RNN-specific mismatch. The max
+mismatch is larger than in `reference_debug`, likely because the run survives longer and the recurrent states grow to
+larger norms.
+
+### Cost-head sanity check
+
+Nothing in this run suggests a shape or finiteness bug from adding `arena_bounds` plus pillar cost heads:
+
+- Setup reports `n_constraints: 3`.
+- Transition costs, rollout costs, Vh predictions, and Vh losses all use 3-head tensors.
+- Costs are finite, signed, and nonzero.
+- CBF quantities are finite. `safe_rate` rises from about 0.46 in the first update quartile to about 0.94 in the final
+  quartile, while mean CBF penalty remains small.
+
+The only caveat is semantic, not a clear bug: costs are mostly negative/safe and often clipped at -1.0, with positive
+violations relatively small. That may be exactly the intended signed-distance convention, but if safety learning still
+looks weak later, inspect per-head cost distributions before changing hyperparameters.
+
+### Split-drift status
+
+The deterministic/stochastic split drift is still present but less suspicious than the old RNN/mask/cost failures:
+
+- Stochastic done rate mean: 0.00627; deterministic done rate mean: 0.00913.
+- Stochastic reward mean: 0.165; deterministic reward mean: 0.112.
+- Stochastic action norm mean: 1.48; deterministic action norm mean: 0.70.
+- Position error is close between splits: stochastic mean 1.146, deterministic mean 1.154.
+
+This remains worth tracking because Vh targets depend on the deterministic half, but it does not look like a new
+arena/pillar cost-head bug.
+
+## Run Analysis: provided `events.jsonl`
+
+Analyzed file:
+
+```text
+events.jsonl
+```
+
+Run setup and outcome:
+
+- GPU-cluster run with 20,000 envs, split into 10,000 deterministic envs and 10,000 stochastic envs.
+- `n_constraints: 3`, matching `arena_bounds`, `pillar_0`, and `pillar_1`.
+- The JSONL stream contains timesteps 0 through 2319. Event counts: `setup`: 1, `transition`: 2293, `bootstrap`: 145,
+  `update_start`: 145, `minibatch`: 4640, `update_end`: 145.
+- Every observed update emitted the expected 32 minibatches and an `update_end`. There is no incomplete-update or NaN
+  signature in this file.
+
+Fix checks:
+
+- RNN episode-end reset still looks fixed. `transition.data.rnn.done_new_nonzero_rate` is zero throughout and
+  `anomaly_reasons` is empty.
+- `infos["costs"]` is present from the first transition. Costs are finite, signed, and nonzero; `costs.max` is positive
+  in unsafe samples, with observed max about 0.235.
+- Termination/truncation masks are present in every update and carry real events. Mean rollout termination rate is about
+  0.00147 and mean truncation rate is about 0.00109 in the update windows.
+
+Performance degradation:
+
+- Mean reward improves in the second quartile and then degrades: 0.231 -> 0.331 -> 0.308 -> 0.215.
+- Mean position error follows the inverse trend: 1.061 -> 0.799 -> 0.854 -> 1.079.
+- Action norm rises steadily and is nearly saturated late: 0.553 -> 1.113 -> 1.497 -> 1.684.
+- Stochastic old log-prob mean rises from -1.98 to 9.86 by the final quartile. Minibatch `log_prob.max` reaches about
+  24.4, and the action tensor is already at `abs_max: 1.0` in most update windows.
+- Vl scale drifts strongly upward. Stochastic `value_l.mean` moves 1.04 -> 2.83 -> 9.52 -> 17.21, while Ql mean moves
+  -0.38 -> 0.55 -> 7.15 -> 15.07.
+- Vh remains comparatively stable: Qh/Vh means stay around -0.24 and Vh losses remain small.
+
+Most likely integration issue found from this run:
+
+- The live rollout stores old log-probs and Vl values using recurrent carries from long, continuous IsaacLab episodes.
+  Before the new recurrent update-window fix, the minibatch update recomputed recurrent policy log-probs and Vl
+  predictions from zero state at the start of every 16-step rollout window.
+- That zero-start behavior matches the JAX reset-at-rollout fixture semantics, but it is wrong for skrl live windows
+  that usually start mid-episode. It can explain both symptoms in this file: PPO ratios/log-probs become distorted by a
+  hidden-state mismatch, and Vl is trained/evaluated under a different recurrent context than the values used to build
+  targets.
+
+Status: fixed in the current code by storing incoming Vl carries and by evaluating recurrent policy/Vl chunks from
+stored chunk-start carries. This needs a new cluster run to confirm whether late reward degradation and action
+saturation are reduced.
+
 ## Updated Issue Register
 
 ### 1. RNN carries are not reset on episode end
 
-Likelihood: confirmed high in `reference_debug`.
+Status: fixed by the 2026-05-08 code changes and confirmed in `new_reference_debug`.
 
-skrl's recurrent PPO path resets recurrent states for environments where `terminated | truncated` is true. Current
-DG-PPO keeps `_policy_rnn_state` and `_vl_rnn_state` running through IsaacLab automatic resets. That means the next
-episode can inherit hidden state from a crashed, successful, out-of-bounds, or timed-out episode.
+skrl's recurrent PPO path resets recurrent states for environments where `terminated | truncated` is true. Before the
+fix, DG-PPO kept `_policy_rnn_state` and `_vl_rnn_state` running through IsaacLab automatic resets. The new run reports
+zero done-env RNN carry norms across all done-containing updates.
 
 Evidence to inspect:
 
@@ -262,8 +462,8 @@ Evidence to inspect:
 - `transition.data.anomaly_reasons` containing `rnn_state_nonzero_after_done`
 - `update_start.data.rollout_boundaries.rnn_done_new_norms`
 
-If this is the failure mode, done-heavy periods should show nonzero RNN carry norms on finished envs, followed by
-degrading rewards/position error.
+If this regresses, done-heavy periods should again show nonzero RNN carry norms on finished envs, followed by degrading
+rewards/position error.
 
 ### 2. Episode boundaries were observed but not consumed by DG-PPO targets
 
@@ -280,8 +480,8 @@ Evidence to inspect:
 - `update_start.data.rollout_boundaries.warning`
 - correlation between nonzero done/truncated rates and advantage, clip fraction, and losses.
 
-This can happen even though parity tests pass, because the parity fixtures validate math on already-formed rollout
-tensors rather than the live skrl transition adapter.
+`new_reference_debug` confirms the split rollout masks and boundary tensors are present on every update and that the
+masked target path is the active computation path.
 
 ### 3. RNN bootstrap path may not match the JAX reference
 
@@ -306,7 +506,8 @@ Likelihood: medium.
 
 The JAX reference collects fixed-horizon rollouts from environment reset with fresh initial RNN state. The skrl
 integration collects short continuous windows (`rollouts: 16`) from long IsaacLab episodes (`episode_length_s: 10`,
-policy rate 50 Hz) and currently does not reset recurrent state at rollout boundaries or episode boundaries.
+policy rate 50 Hz). Episode-boundary recurrent reset is now implemented, but rollout-window semantics still differ
+from the reference.
 
 Evidence to inspect:
 
@@ -317,9 +518,41 @@ Evidence to inspect:
 
 This may be an integration semantics issue rather than a hyperparameter issue.
 
-### 5. Deterministic and stochastic halves may drift into different state distributions
+### 5. Recurrent policy/Vl update windows started from zero mid-episode
 
-Likelihood: confirmed medium in `reference_debug`.
+Status: fixed in the current code after analyzing the provided `events.jsonl`; needs a new cluster run for live
+confirmation.
+
+The live skrl integration stores old log-probs and Vl values from continuous episodes, using the incoming recurrent
+state at each environment step. Before this fix, recurrent minibatch evaluation rebuilt policy log-probs and Vl
+predictions by initializing the RNN state to zero at the start of every rollout chunk. That was compatible with the JAX
+fixture's reset-at-rollout assumption, but not with live IsaacLab windows that usually begin mid-episode.
+
+Why this matters:
+
+- PPO ratios compare new log-probs against old log-probs produced from a different hidden state.
+- Vl losses compare predictions from a zero-start hidden state against Ql targets built from live Vl values and
+  bootstraps produced from the real carry.
+- The provided `events.jsonl` shows exactly the expected symptom cluster: high positive log-probs, rare ratio outliers,
+  rising action saturation, and strongly drifting Vl/Ql scale while Vh remains stable.
+
+Fix:
+
+- Store incoming centralized Vl carries in memory as `bT_vl_rnn_states`.
+- Evaluate recurrent policy chunks from stored incoming policy carries at each chunk's first timestep.
+- Evaluate recurrent Vl chunks from stored incoming Vl carries at each chunk's first timestep.
+
+Evidence to inspect on the next run:
+
+- `minibatch.data.ratio.max` and `minibatch.data.log_prob.max`
+- `transition.data.tensors.action_norm` and action `abs_max`
+- `transition.data.tensors.value_l.mean`
+- `update_start.data.targets_and_advantages.ql.mean`
+- reward/position-error quartiles after timestep 1000.
+
+### 6. Deterministic and stochastic halves may drift into different state distributions
+
+Likelihood: confirmed medium in `reference_debug` and still present in `new_reference_debug`.
 
 The port uses half the live IsaacLab envs for deterministic actions and half for stochastic actions. The JAX reference
 uses a separate deterministic rollout for Vh targets. The split adaptation may be valid, but if deterministic envs
@@ -333,13 +566,14 @@ Evidence to inspect:
 - `transition.data.done.stc_any` vs `det_any`
 - `update_start.data.stochastic_rollout` vs `deterministic_rollout`
 
-### 6. Costs were zero unless the env supplied `infos["costs"]`
+### 7. Costs were zero unless the env supplied `infos["costs"]`
 
-Likelihood: confirmed high in `reference_debug`; fixed in the 2026-05-08 code changes.
+Status: fixed by the 2026-05-08 code changes and confirmed in `new_reference_debug`.
 
 The position-tracking env exposes pillar collisions and done reasons. Before the fix, the DG-PPO agent only read costs
 from `infos["costs"]` or `infos["cost"]`; if those keys were absent, it logged and trained with zero constraints. This
-does not explain every degradation mode, but it meant the "safety" part of DG-PPO could be inactive in this task.
+does not explain every degradation mode, but it meant the "safety" part of DG-PPO could be inactive in this task. The
+new run has `infos["costs"]` in every transition and finite signed costs with shape `[500, 1, 3]`.
 
 Evidence to inspect:
 

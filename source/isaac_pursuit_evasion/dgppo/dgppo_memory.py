@@ -21,6 +21,7 @@ Rollout memory used by DGPPOAgent.
     values_l       (T+1, B)
     values_h       (T+1, B, A, NH)
     rnn_state      (T, B, A, L, C, H)  -- only kept if the policy has an RNN
+    vl_rnn_state   (T, B, L, C, H)     -- only kept if Vl has an RNN
 
 ``values_l`` / ``values_h`` have one extra step for the terminal bootstrap.
 """
@@ -47,6 +48,7 @@ class DGPPORolloutMemory(RandomMemory):
         n_constraints,
         device,
         use_rnn=False,
+        use_vl_rnn=False,
         rnn_layers=1,
         rnn_hidden=64,
         rnn_cell="gru",
@@ -58,12 +60,13 @@ class DGPPORolloutMemory(RandomMemory):
         self.n_stc_envs = int(num_stc_envs)
         self.rollout_length = int(rollout_length)
         self.use_rnn = bool(use_rnn)
+        self.use_vl_rnn = bool(use_vl_rnn)
         self._n_agents = int(n_agents)
         self._n_obs = int(n_obs)
         self._state_dim = int(state_dim)
         self._action_dim = int(action_dim)
         self._n_constraints = int(n_constraints)
-        
+
         # RNN state dimensions
         self.rnn_layers = rnn_layers
         self.rnn_hidden = rnn_hidden
@@ -83,11 +86,16 @@ class DGPPORolloutMemory(RandomMemory):
             # DGPPO DEBUG FIX END: rollout episode-boundary masks.
             self.create_tensor(f"{prefix}_values_l", size=B, dtype=torch.float32, keep_dimensions=False)
             self.create_tensor(f"{prefix}_values_h", size=B * A * NH, dtype=torch.float32, keep_dimensions=False)
-            
+
             if self.use_rnn:
                 # [B * A, L, C, H] flattened for RandomMemory which expects a flat size per step
                 rnn_size = B * A * self.rnn_layers * self.rnn_carries * self.rnn_hidden
                 self.create_tensor(f"{prefix}_rnn_states", size=rnn_size, dtype=torch.float32, keep_dimensions=False)
+            if self.use_vl_rnn:
+                vl_rnn_size = B * self.rnn_layers * self.rnn_carries * self.rnn_hidden
+                self.create_tensor(
+                    f"{prefix}_vl_rnn_states", size=vl_rnn_size, dtype=torch.float32, keep_dimensions=False
+                )
 
         self._final_values_l = {
             "stc": torch.zeros(self.n_stc_envs, dtype=torch.float32, device=device),
@@ -145,6 +153,8 @@ class DGPPORolloutMemory(RandomMemory):
         det_truncated: Optional[torch.Tensor] = None,
         stc_rnn_state: Optional[torch.Tensor] = None,
         det_rnn_state: Optional[torch.Tensor] = None,
+        stc_vl_rnn_state: Optional[torch.Tensor] = None,
+        det_vl_rnn_state: Optional[torch.Tensor] = None,
     ) -> None:
         """Append one rollout step for both stochastic and deterministic splits."""
         t = self._cursor
@@ -178,7 +188,7 @@ class DGPPORolloutMemory(RandomMemory):
         # DGPPO DEBUG FIX END: store deterministic episode-boundary masks.
         self._tensor("det_values_l")[t] = det_value_l.reshape(-1)
         self._tensor("det_values_h")[t] = det_value_h.reshape(-1)
-        
+
         if self.use_rnn:
             if stc_rnn_state is not None:
                 self._tensor("stc_rnn_states")[t] = self._canonical_rnn_state(
@@ -187,6 +197,15 @@ class DGPPORolloutMemory(RandomMemory):
             if det_rnn_state is not None:
                 self._tensor("det_rnn_states")[t] = self._canonical_rnn_state(
                     det_rnn_state, self.n_det_envs
+                ).reshape(-1)
+        if self.use_vl_rnn:
+            if stc_vl_rnn_state is not None:
+                self._tensor("stc_vl_rnn_states")[t] = self._canonical_vl_rnn_state(
+                    stc_vl_rnn_state, self.n_stc_envs
+                ).reshape(-1)
+            if det_vl_rnn_state is not None:
+                self._tensor("det_vl_rnn_states")[t] = self._canonical_vl_rnn_state(
+                    det_vl_rnn_state, self.n_det_envs
                 ).reshape(-1)
 
         self._cursor += 1
@@ -205,6 +224,19 @@ class DGPPORolloutMemory(RandomMemory):
             f"{(B, A, self.rnn_layers, self.rnn_carries, self.rnn_hidden)}"
         )
 
+    def _canonical_vl_rnn_state(self, rnn_state: torch.Tensor, B: int) -> torch.Tensor:
+        """Return centralized Vl RNN state as ``[B, L, C, H]`` for storage."""
+        expected_flat = (self.rnn_layers, B, self.rnn_carries, self.rnn_hidden)
+        expected_stored = (B, self.rnn_layers, self.rnn_carries, self.rnn_hidden)
+        if rnn_state.shape == expected_flat:
+            return rnn_state.permute(1, 0, 2, 3)
+        if rnn_state.shape == expected_stored:
+            return rnn_state
+        raise ValueError(
+            "Unexpected Vl RNN state shape "
+            f"{tuple(rnn_state.shape)}; expected {expected_flat} or {expected_stored}"
+        )
+
     def _canonical_done_mask(self, mask: Optional[torch.Tensor], B: int) -> torch.Tensor:
         """Return a flat boolean mask of length ``B`` for one rollout split."""
         if mask is None:
@@ -217,8 +249,6 @@ class DGPPORolloutMemory(RandomMemory):
         self._final_values_l[split] = value_l.reshape(-1).to(self.device)
         self._final_values_h[split] = value_h.to(self.device)
 
-    
-    
     # Read-side helpers used by the update
     # ------------------------------------------------------------------
 
@@ -266,7 +296,7 @@ class DGPPORolloutMemory(RandomMemory):
             "bTa_goal_state": goal_state.transpose(0, 1),
             "bTo_obs_state": obs_state.transpose(0, 1),
         }
-        
+
         if self.use_rnn:
             # RNN state shape in memory: [T, B * A * L * C * H]
             # Transpose to [B, T, L, A, C, H], matching the RNN carry layout per rollout step.
@@ -274,8 +304,13 @@ class DGPPORolloutMemory(RandomMemory):
             rnn_states = self._tensor(f"{split}_rnn_states").reshape(
                 T, B, A, self.rnn_layers, self.rnn_carries, self.rnn_hidden
             )
-            data["bTa_rnn_states"] = rnn_states.permute(1, 0, 3, 2, 4, 5) # [B, T, L, A, C, H]
-            
+            data["bTa_rnn_states"] = rnn_states.permute(1, 0, 3, 2, 4, 5)  # [B, T, L, A, C, H]
+        if self.use_vl_rnn:
+            vl_rnn_states = self._tensor(f"{split}_vl_rnn_states").reshape(
+                T, B, self.rnn_layers, self.rnn_carries, self.rnn_hidden
+            )
+            data["bT_vl_rnn_states"] = vl_rnn_states.permute(1, 0, 2, 3, 4)  # [B, T, L, C, H]
+
         return data
 
     def sample_minibatches(self, num_mini_batches: int) -> list[torch.Tensor]:
