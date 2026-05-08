@@ -6,7 +6,13 @@ from .parity_test_utils import assert_parity_close, importorskip, load_kernel_fi
 
 torch = importorskip("torch")
 
-from dgppo.utils import compute_dec_ocp_gae, compute_policy_surrogate
+from dgppo.utils import (
+    compute_dec_ocp_gae,
+    compute_policy_surrogate,
+    compute_pos_tracking_safety_costs,
+    zero_env_rnn_states_for_done,
+    zero_policy_rnn_states_for_done,
+)
 
 
 def test_dec_ocp_gae_matches_jax_kernel_fixture() -> None:
@@ -58,6 +64,84 @@ def test_ppo_surrogate_matches_jax_kernel_fixture() -> None:
         stage="kernel",
         tensor_name="clip_frac",
     )
+
+
+def test_dec_ocp_gae_masks_true_terminations_without_masking_truncations() -> None:
+    Tah_hs = torch.tensor([[[[0.0]], [[0.0]], [[100.0]]]], dtype=torch.float32)
+    T_l = torch.tensor([[1.0, 10.0, 100.0]], dtype=torch.float32)
+    Tp1ah_Vh = torch.zeros(1, 4, 1, 1)
+    Tp1ah_Vh[:, -1] = 1000.0
+    Tp1_Vl = torch.zeros(1, 4)
+    Tp1_Vl[:, -1] = 1000.0
+
+    qh, ql = compute_dec_ocp_gae(
+        Tah_hs=Tah_hs,
+        T_l=T_l,
+        Tp1ah_Vh=Tp1ah_Vh,
+        Tp1_Vl=Tp1_Vl,
+        disc_gamma=1.0,
+        gae_lambda=1.0,
+        T_terminated=torch.tensor([[False, True, False]]),
+    )
+
+    assert torch.equal(ql, torch.tensor([[11.0, 10.0, 1100.0]]))
+    assert torch.equal(qh.squeeze(-1).squeeze(-1), torch.tensor([[0.0, 0.0, 1000.0]]))
+
+    _, ql_truncated = compute_dec_ocp_gae(
+        Tah_hs=Tah_hs,
+        T_l=T_l,
+        Tp1ah_Vh=Tp1ah_Vh,
+        Tp1_Vl=Tp1_Vl,
+        disc_gamma=1.0,
+        gae_lambda=1.0,
+        T_terminated=torch.zeros(1, 3, dtype=torch.bool),
+        T_truncated=torch.tensor([[False, True, False]]),
+    )
+    assert torch.equal(ql_truncated, torch.tensor([[1111.0, 1110.0, 1100.0]]))
+
+
+def test_rnn_done_helpers_zero_only_finished_env_slots() -> None:
+    policy_state = torch.arange(1 * 6 * 1 * 2, dtype=torch.float32).reshape(1, 6, 1, 2)
+    vl_state = torch.arange(1 * 3 * 1 * 2, dtype=torch.float32).reshape(1, 3, 1, 2)
+    done = torch.tensor([False, True, False])
+
+    zero_policy_rnn_states_for_done(policy_state, done, n_agents=2)
+    zero_env_rnn_states_for_done(vl_state, done)
+
+    assert torch.equal(policy_state.reshape(1, 3, 2, 1, 2)[:, 1], torch.zeros(1, 2, 1, 2))
+    assert torch.equal(vl_state[:, 1], torch.zeros(1, 1, 2))
+    assert policy_state.reshape(1, 3, 2, 1, 2)[:, 0].abs().sum() > 0
+    assert vl_state[:, 0].abs().sum() > 0
+
+
+def test_pos_tracking_safety_costs_emit_boundary_and_pillar_heads() -> None:
+    agent_state = torch.zeros(4, 1, 6)
+    agent_state[:, 0, :3] = torch.tensor(
+        [
+            [0.0, 0.0, 1.0],
+            [2.2, 0.0, 1.0],
+            [0.51, 0.0, 1.0],
+            [0.0, 0.0, 0.1],
+        ]
+    )
+    obs_state = torch.zeros(4, 2, 6)
+    obs_state[:, :, :2] = torch.tensor([[0.5, 0.0], [-0.5, 0.0]]).view(1, 2, 2)
+
+    costs = compute_pos_tracking_safety_costs(
+        agent_state=agent_state,
+        obs_state=obs_state,
+        arena_min=(-2.0, -2.0, 0.0),
+        arena_max=(2.0, 2.0, 2.0),
+        collision_altitude=0.2,
+        pillar_collision_radius=0.2,
+        pillar_top_z=1.8,
+    )
+
+    assert costs.shape == (4, 1, 3)
+    assert torch.all(costs[0, 0] < 0.0)
+    assert costs[1, 0, 0] > 0.0
+    assert costs[2, 0, 1] > 0.0
+    assert costs[3, 0, 0] > 0.0
 
 
 def test_tanh_normal_supports_fixed_noise_sampling() -> None:

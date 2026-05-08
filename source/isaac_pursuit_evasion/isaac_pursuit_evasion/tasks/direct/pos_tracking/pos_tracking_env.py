@@ -25,6 +25,7 @@ from source.isaac_pursuit_evasion.controllers.rl_controllers import (
     CrazyflieRLBodyRatesWrapper,
     CrazyflieRLVelocityWrapper,
 )
+from source.isaac_pursuit_evasion.dgppo.utils import compute_pos_tracking_safety_costs
 from source.isaac_pursuit_evasion.dynamics.propellers import Drone_cfg, Propellers
 
 from .pos_tracking_env_cfg import PosTrackingEnvCfg
@@ -156,6 +157,15 @@ class PosTrackingEnv(DirectRLEnv):
         self._last_rewards = torch.zeros(self.num_envs, device=self.device)
         self._last_reward_components: dict[str, torch.Tensor] = {}
         self._last_done_reason = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+        # DGPPO DEBUG FIX START: real env safety costs for DG-PPO.
+        self._last_dgppo_costs = torch.zeros(
+            self.num_envs,
+            self.num_agents,
+            self.n_constraints,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        # DGPPO DEBUG FIX END: real env safety costs for DG-PPO.
 
         self._body_x_axis = torch.tensor([1.0, 0.0, 0.0], device=self.device)
 
@@ -270,6 +280,9 @@ class PosTrackingEnv(DirectRLEnv):
     def _get_rewards(self) -> torch.Tensor:
         env_origins = self._terrain.env_origins
         pos_local = self._robot.data.root_pos_w - env_origins
+        # DGPPO DEBUG FIX START: publish signed safety costs through infos.
+        self._update_dgppo_costs(pos_local)
+        # DGPPO DEBUG FIX END: publish signed safety costs through infos.
         pos_error = torch.norm(self._reference_pos - pos_local, dim=-1)
 
         pos_reward = self.cfg.reward_pos * torch.exp(-self.cfg.reward_pos_scale * pos_error)
@@ -342,6 +355,9 @@ class PosTrackingEnv(DirectRLEnv):
         timeout = self.episode_length_buf >= self.max_episode_length
         env_origins = self._terrain.env_origins
         pos_local = self._robot.data.root_pos_w - env_origins
+        # DGPPO DEBUG FIX START: keep costs current for the returned info dict.
+        self._update_dgppo_costs(pos_local)
+        # DGPPO DEBUG FIX END: keep costs current for the returned info dict.
         crash = self._crash_mask(pos_local)
         out_of_bounds = self._out_of_bounds_mask(pos_local)
         pillar_collision = self._pillar_collision_mask(pos_local)
@@ -413,7 +429,14 @@ class PosTrackingEnv(DirectRLEnv):
     
     @property
     def n_constraints(self) -> int:
-        return self._num_pillars # pairwise constraint
+        # DGPPO DEBUG FIX START: arena-boundary head plus per-pillar heads.
+        n_constraints = 1 + self._num_pillars
+        # DGPPO DEBUG FIX END: arena-boundary head plus per-pillar heads.
+        return n_constraints
+
+    @property
+    def cost_components(self) -> tuple[str, ...]:
+        return ("arena_bounds",) + tuple(f"pillar_{idx}" for idx in range(self._num_pillars))
 
     @property
     def graph_obs_layout(self) -> dict:
@@ -508,6 +531,31 @@ class PosTrackingEnv(DirectRLEnv):
         inside_radius = dxy <= self._pillar_collision_radius
         inside_height = (pos_local[:, 2] >= self.cfg.arena_min[2]) & (pos_local[:, 2] <= self._pillar_top_z)
         return torch.any(inside_radius, dim=1) & inside_height
+
+    # DGPPO DEBUG FIX START: real env signed safety costs.
+    def _update_dgppo_costs(self, pos_local: torch.Tensor) -> None:
+        agent_state = pos_local.new_zeros(self.num_envs, self.num_agents, self._GRAPH_STATE_DIM)
+        agent_state[:, 0, :3] = pos_local
+        agent_state[:, 0, 3:6] = self._robot.data.root_lin_vel_w
+
+        if self._num_pillars > 0:
+            obs_state = pos_local.new_zeros(self.num_envs, self._num_pillars, self._GRAPH_STATE_DIM)
+            obs_state[:, :, :2] = self._pillar_positions_xy.unsqueeze(0).expand(self.num_envs, -1, -1)
+        else:
+            obs_state = pos_local.new_zeros(self.num_envs, 0, self._GRAPH_STATE_DIM)
+
+        self._last_dgppo_costs = compute_pos_tracking_safety_costs(
+            agent_state=agent_state,
+            obs_state=obs_state,
+            arena_min=self._arena_min_safe,
+            arena_max=self._arena_max_safe,
+            collision_altitude=float(self.cfg.collision_altitude),
+            pillar_collision_radius=self._pillar_collision_radius,
+            pillar_top_z=self._pillar_top_z,
+        )
+        if hasattr(self, "extras"):
+            self.extras["costs"] = self._last_dgppo_costs
+    # DGPPO DEBUG FIX END: real env signed safety costs.
 
     def _update_success_flags(self, pos_local: torch.Tensor) -> torch.Tensor:
         pos_error = torch.norm(self._reference_pos - pos_local, dim=-1)
@@ -957,6 +1005,9 @@ class PosTrackingEnv(DirectRLEnv):
 
     def get_last_done_reasons(self) -> torch.Tensor:
         return self._last_done_reason
+
+    def get_last_dgppo_costs(self) -> torch.Tensor:
+        return self._last_dgppo_costs
 
     def get_reference_pose(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self._reference_pos.clone(), self._reference_yaw.clone()

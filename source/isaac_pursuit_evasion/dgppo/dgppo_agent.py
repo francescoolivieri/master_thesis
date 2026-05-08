@@ -7,6 +7,7 @@ import torch
 from skrl.agents.torch import Agent, AgentCfg
 from skrl.agents.torch.base import ExperimentCfg
 
+from .dgppo_debug import DGPPODebugConfig, DGPPOTrainingDiagnostics
 from .dgppo_memory import DGPPORolloutMemory
 from .dgppo_models import DGPPOPolicy, DGPPOValueNet
 from .update_helpers import (
@@ -21,10 +22,14 @@ from .update_helpers import (
 )
 from .utils import (
     GraphData,
+    align_safety_cost_heads,
     build_graph_data,
+    compute_pos_tracking_safety_costs,
     compute_cbf_advantages,
     compute_dec_ocp_gae,
     extract_graph_states_from_flat_obs,
+    zero_env_rnn_states_for_done,
+    zero_policy_rnn_states_for_done,
 )
 
 
@@ -77,6 +82,21 @@ class DGPPOAgentCfg(AgentCfg):
             "std_dev_min": 1e-5,
         }
     )
+    debug: dict[str, Any] = dataclasses.field(
+        default_factory=lambda: {
+            "enabled": True,
+            "step_interval": 10,
+            "update_interval": 1,
+            "minibatch_interval": 1,
+            "sample_env_count": 8,
+            "log_minibatches": True,
+            "log_jsonl": True,
+            "log_tensorboard_scalars": True,
+            "log_on_done": True,
+            "rnn_done_norm_epsilon": 1e-6,
+            "anomaly_abs_threshold": 1e6,
+        }
+    )
     seed: int | None = None
     num_envs: int | None = None
     _raw: dict[str, Any] = dataclasses.field(default_factory=dict, repr=False)
@@ -100,6 +120,19 @@ class DGPPOAgentCfg(AgentCfg):
             "scale_final": 0.01,
             "std_dev_init": 0.5,
             "std_dev_min": 1e-5,
+        }
+        default_debug = {
+            "enabled": True,
+            "step_interval": 10,
+            "update_interval": 1,
+            "minibatch_interval": 1,
+            "sample_env_count": 8,
+            "log_minibatches": True,
+            "log_jsonl": True,
+            "log_tensorboard_scalars": True,
+            "log_on_done": True,
+            "rnn_done_norm_epsilon": 1e-6,
+            "anomaly_abs_threshold": 1e6,
         }
         experiment_data = raw.get("experiment", {})
         experiment = (
@@ -132,6 +165,7 @@ class DGPPOAgentCfg(AgentCfg):
             rnn={**default_rnn, **dict(raw.get("rnn", {}))},
             gnn={**default_gnn, **dict(raw.get("gnn", {}))},
             model={**default_model, **dict(raw.get("model", {}))},
+            debug={**default_debug, **dict(raw.get("debug", {}))},
             seed=None if raw.get("seed") is None else int(raw["seed"]),
             num_envs=None if raw.get("num_envs") is None else int(raw["num_envs"]),
             _raw=raw,
@@ -219,6 +253,12 @@ class DGPPOAgent(Agent):
         self._current_Vl = None
         self._current_Vh = None
         self._current_next_observations = None
+        self._update_id = 0
+        self._debug = DGPPOTrainingDiagnostics(
+            cfg=DGPPODebugConfig.from_mapping(self.cfg.debug),
+            experiment_dir=self.experiment_dir,
+            track_data=self.track_data,
+        )
 
     def init(self, *, trainer_cfg: Any | None = None) -> None:
         """
@@ -271,6 +311,7 @@ class DGPPOAgent(Agent):
             )
         if self.Vl.rnn is not None:
             self._vl_rnn_state = self.Vl.rnn.initialize_carry(self.env.num_envs, device=self.device)
+        self._debug.log_setup(agent=self, trainer_cfg=trainer_cfg)
 
     def act(
         self, observations: torch.Tensor, states: torch.Tensor | None, *, timestep: int, timesteps: int
@@ -408,21 +449,24 @@ class DGPPOAgent(Agent):
             agent_state, goal_state, obs_state = self._extract_graph_states(observations)
             actions = actions.reshape(n_envs, n_agents, action_dim)
             rewards = rewards.reshape(n_envs)
+            # DGPPO DEBUG FIX START: canonical live episode-boundary masks.
+            terminated_1d = self._env_done_mask(terminated, n_envs)
+            truncated_1d = self._env_done_mask(truncated, n_envs)
+            done_1d = terminated_1d | truncated_1d
+            # DGPPO DEBUG FIX END: canonical live episode-boundary masks.
             log_prob = self._last_log_prob.reshape(n_envs, n_agents)
             value_l_all = self._current_Vl.reshape(n_envs, -1).squeeze(-1)
             value_h_all = self._current_Vh.reshape(n_envs, n_agents, n_constraints)
-            costs_all = None
-            if isinstance(infos, Mapping):
-                costs_all = infos.get("costs", infos.get("cost"))
-            if costs_all is None:
-                costs_all = torch.zeros(n_envs, n_agents, n_constraints, device=self.device, dtype=torch.float32)
-            else:
-                costs_all = torch.as_tensor(costs_all, device=self.device, dtype=torch.float32)
-                if costs_all.ndim == 1:
-                    costs_all = costs_all[:, None, None]
-                elif costs_all.ndim == 2:
-                    costs_all = costs_all[:, :, None]
-                costs_all = costs_all.reshape(n_envs, n_agents, n_constraints)
+            # DGPPO DEBUG FIX START: real/env or adapter safety costs.
+            costs_all = self._costs_from_infos_or_adapter(
+                infos=infos,
+                agent_state=agent_state,
+                obs_state=obs_state,
+                n_envs=n_envs,
+                n_agents=n_agents,
+                n_constraints=n_constraints,
+            )
+            # DGPPO DEBUG FIX END: real/env or adapter safety costs.
 
             stc_rnn_state = self._select_policy_rnn_envs(self._last_policy_rnn_state, self._stoch_env_ids)
             det_rnn_state = self._select_policy_rnn_envs(self._last_policy_rnn_state, self._det_env_ids)
@@ -437,6 +481,8 @@ class DGPPOAgent(Agent):
                 stc_cost=costs_all[self._stoch_env_ids],
                 stc_value_l=value_l_all[self._stoch_env_ids],
                 stc_value_h=value_h_all[self._stoch_env_ids],
+                stc_terminated=terminated_1d[self._stoch_env_ids],
+                stc_truncated=truncated_1d[self._stoch_env_ids],
                 det_agent_state=agent_state[self._det_env_ids],
                 det_goal_state=goal_state[self._det_env_ids],
                 det_obs_state=obs_state[self._det_env_ids],
@@ -446,8 +492,41 @@ class DGPPOAgent(Agent):
                 det_cost=costs_all[self._det_env_ids],
                 det_value_l=value_l_all[self._det_env_ids],
                 det_value_h=value_h_all[self._det_env_ids],
+                det_terminated=terminated_1d[self._det_env_ids],
+                det_truncated=truncated_1d[self._det_env_ids],
                 stc_rnn_state=stc_rnn_state,
                 det_rnn_state=det_rnn_state,
+            )
+
+            # DGPPO DEBUG FIX START: skrl PPO_RNN-style recurrent reset.
+            self._reset_rnn_states_for_done(done_1d)
+            # DGPPO DEBUG FIX END: skrl PPO_RNN-style recurrent reset.
+
+            self._debug.record_transition(
+                timestep=timestep,
+                timesteps=timesteps,
+                env=self.env,
+                observations=observations,
+                next_observations=next_observations,
+                actions=actions,
+                rewards=rewards,
+                terminated=terminated,
+                truncated=truncated,
+                infos=infos,
+                agent_state=agent_state,
+                goal_state=goal_state,
+                obs_state=obs_state,
+                log_prob=log_prob,
+                value_l=value_l_all,
+                value_h=value_h_all,
+                costs=costs_all,
+                old_policy_rnn_state=self._last_policy_rnn_state,
+                new_policy_rnn_state=self._policy_rnn_state,
+                vl_rnn_state=self._vl_rnn_state,
+                stoch_env_ids=self._stoch_env_ids,
+                det_env_ids=self._det_env_ids,
+                memory_cursor=self.memory.cursor,
+                rollout_length=self.memory.rollout_length,
             )
 
             if self.memory.is_full:
@@ -455,6 +534,26 @@ class DGPPOAgent(Agent):
                     next_graph = self._build_graph(next_observations, next_states)
                     vl_boot, _ = self.Vl(next_graph, self._vl_rnn_state, self.env.num_agents)
                     vh_boot, _ = self.Vh(next_graph, self._policy_rnn_state, self.env.num_agents)
+                    policy_reference_state = None
+                    vh_boot_reference = None
+                    if self.policy.rnn is not None and self._last_policy_rnn_state is not None:
+                        _action, _log_prob, _mode, policy_reference_state = self.policy.act(
+                            next_graph,
+                            rnn_state=self._last_policy_rnn_state,
+                            n_agents_total=self.env.num_agents,
+                            deterministic=True,
+                        )
+                        vh_boot_reference, _ = self.Vh(next_graph, policy_reference_state, self.env.num_agents)
+                    elif self.policy.rnn is None:
+                        vh_boot_reference = vh_boot
+                self._debug.log_bootstrap(
+                    timestep=timestep,
+                    vl_boot=vl_boot,
+                    vh_boot=vh_boot,
+                    vh_boot_reference=vh_boot_reference,
+                    policy_bootstrap_rnn_state=self._policy_rnn_state,
+                    policy_reference_rnn_state=policy_reference_state,
+                )
                 self.memory.set_final_values("stc", vl_boot[self._stoch_env_ids], vh_boot[self._stoch_env_ids])
                 self.memory.set_final_values("det", vl_boot[self._det_env_ids], vh_boot[self._det_env_ids])
 
@@ -489,6 +588,8 @@ class DGPPOAgent(Agent):
         if self.memory is None or self.memory.cursor < self.rollouts:
             return
 
+        self._update_id += 1
+        update_id = self._update_id
         view = self.memory.as_bTah_view("stc")
         det_view = self.memory.as_bTah_view("det")
 
@@ -500,6 +601,10 @@ class DGPPOAgent(Agent):
             Tp1_Vl=view["bTp1_Vl"],
             disc_gamma=self.gamma,
             gae_lambda=self.gae_lambda,
+            # DGPPO DEBUG FIX START: stochastic true-termination mask.
+            T_terminated=view["bT_terminated"],
+            T_truncated=view["bT_truncated"],
+            # DGPPO DEBUG FIX END: stochastic true-termination mask.
         )
 
         Qh_det, _ = compute_dec_ocp_gae(
@@ -509,9 +614,14 @@ class DGPPOAgent(Agent):
             Tp1_Vl=view["bTp1_Vl"],
             disc_gamma=self.gamma,
             gae_lambda=self.gae_lambda,
+            # DGPPO DEBUG FIX START: deterministic true-termination mask.
+            T_terminated=det_view["bT_terminated"],
+            T_truncated=det_view["bT_truncated"],
+            # DGPPO DEBUG FIX END: deterministic true-termination mask.
         )
 
         # flipped for PPO use
+        cbf_scale = self._cbf_scale(timestep=timestep, timesteps=timesteps)
         adv_info = compute_cbf_advantages(
             bT_Ql=Ql,
             bT_Vl=view["bT_Vl"],
@@ -521,7 +631,7 @@ class DGPPOAgent(Agent):
             cbf_eps=self.cbf_eps,
             cbf_weight=self.cbf_weight,
             dt=self.env._step_dt,
-            cbf_scale=self._cbf_scale(timestep=timestep, timesteps=timesteps),
+            cbf_scale=cbf_scale,
         )
         bTa_A = adv_info["bTa_A"].detach()
         self.track_data("DGPPO/safe_rate", float(adv_info["bTa_is_safe"].float().mean().item()))
@@ -530,6 +640,17 @@ class DGPPOAgent(Agent):
         graph = build_rollout_graph(view=view, obs_radius=self.obs_radius)
         det_graph = build_rollout_graph(view=det_view, obs_radius=self.obs_radius)
         chunk_ids = self._rnn_chunk_ids(T=view["bTa_actions"].shape[1], device=torch.device("cpu"))
+        self._debug.log_update_start(
+            timestep=timestep,
+            update_id=update_id,
+            view=view,
+            det_view=det_view,
+            ql=Ql,
+            qh_det=Qh_det,
+            adv_info=adv_info,
+            cbf_scale=cbf_scale,
+            chunk_ids=chunk_ids,
+        )
 
         loss_p_acc = bTa_A.new_zeros(())
         loss_vl_acc = bTa_A.new_zeros(())
@@ -538,9 +659,9 @@ class DGPPOAgent(Agent):
         n_minibatches = 0
 
         # Learning epochs.
-        for _ in range(self.learning_epochs):
+        for epoch in range(self.learning_epochs):
             sampled_batches = self.memory.sample_minibatches(self.mini_batches)
-            for idx in sampled_batches:
+            for minibatch, idx in enumerate(sampled_batches):
                 info = self._update_minibatch(
                     idx=idx,
                     Qh_det=Qh_det,
@@ -552,6 +673,14 @@ class DGPPOAgent(Agent):
                     det_graph=det_graph,
                     chunk_ids=chunk_ids,
                 )
+                self._debug.log_minibatch(
+                    timestep=timestep,
+                    update_id=update_id,
+                    epoch=epoch,
+                    minibatch=minibatch,
+                    idx=idx,
+                    info=info,
+                )
                 loss_p_acc += info["loss_p"]
                 loss_vl_acc += info["loss_vl"]
                 loss_vh_acc += info["loss_vh"]
@@ -559,18 +688,30 @@ class DGPPOAgent(Agent):
                 n_minibatches += 1
 
         if n_minibatches == 0:
+            self._debug.reset_rollout()
             return
 
         inv_n = 1.0 / float(n_minibatches)
-        self.track_data("DGPPO/loss_policy", float((loss_p_acc * inv_n).item()))
-        self.track_data("DGPPO/loss_value_l", float((loss_vl_acc * inv_n).item()))
-        self.track_data("DGPPO/loss_value_h", float((loss_vh_acc * inv_n).item()))
-        self.track_data("DGPPO/clip_frac", float((clipfrac_acc * inv_n).item()))
+        update_summary = {
+            "loss_policy": float((loss_p_acc * inv_n).item()),
+            "loss_value_l": float((loss_vl_acc * inv_n).item()),
+            "loss_value_h": float((loss_vh_acc * inv_n).item()),
+            "clip_frac": float((clipfrac_acc * inv_n).item()),
+            "lr_policy": float(self._policy_opt.param_groups[0]["lr"]),
+            "lr_vl": float(self._vl_opt.param_groups[0]["lr"]),
+            "lr_vh": float(self._vh_opt.param_groups[0]["lr"]),
+        }
+        self.track_data("DGPPO/loss_policy", update_summary["loss_policy"])
+        self.track_data("DGPPO/loss_value_l", update_summary["loss_value_l"])
+        self.track_data("DGPPO/loss_value_h", update_summary["loss_value_h"])
+        self.track_data("DGPPO/clip_frac", update_summary["clip_frac"])
         self.track_data("DGPPO/lr_policy", float(self._policy_opt.param_groups[0]["lr"]))
         self.track_data("DGPPO/lr_vl", float(self._vl_opt.param_groups[0]["lr"]))
         self.track_data("DGPPO/lr_vh", float(self._vh_opt.param_groups[0]["lr"]))
+        self._debug.log_update_end(timestep=timestep, update_id=update_id, summary=update_summary)
 
         self.memory.reset()
+        self._debug.reset_rollout()
 
     def _update_minibatch(
         self,
@@ -629,7 +770,7 @@ class DGPPOAgent(Agent):
                 n_agents_total=batch.A,
                 rnn_state=None,
             )
-        apply_policy_update(
+        policy_grad_norm = apply_policy_update(
             optimizer=self._policy_opt,
             loss=policy_info["loss_policy_total"],
             parameters=self.policy.parameters(),
@@ -653,13 +794,13 @@ class DGPPOAgent(Agent):
             chunk_graph=chunk_graph,
             det_chunk_graph=det_chunk_graph,
         )
-        apply_value_update(
+        vl_grad_norm = apply_value_update(
             optimizer=self._vl_opt,
             loss=value_info["loss_vl"],
             parameters=self._vl_grad_params,
             grad_clip=self.grad_clip,
         )
-        apply_value_update(
+        vh_grad_norm = apply_value_update(
             optimizer=self._vh_opt,
             loss=value_info["loss_vh"],
             parameters=self._vh_grad_params,
@@ -671,6 +812,14 @@ class DGPPOAgent(Agent):
             "loss_vl": value_info["loss_vl"].detach(),
             "loss_vh": value_info["loss_vh"].detach(),
             "clip_frac": policy_info["clip_frac"].detach(),
+            "ratio": policy_info["ratio"].detach(),
+            "log_prob": policy_info["log_prob"].detach(),
+            "entropy": policy_info["entropy"].detach(),
+            "policy_grad_norm": policy_grad_norm.detach(),
+            "vl_grad_norm": vl_grad_norm.detach(),
+            "vh_grad_norm": vh_grad_norm.detach(),
+            "vl": value_info["vl"].detach(),
+            "vh": value_info["vh"].detach(),
         }
 
     def load_dgppo_hyperparameters(self) -> None:
@@ -745,3 +894,75 @@ class DGPPOAgent(Agent):
         A = self.env.num_agents
         state = rnn_state.reshape(L, self.env.num_envs, A, C, H)
         return state[:, env_ids].reshape(L, int(env_ids.numel()) * A, C, H)
+
+    # DGPPO DEBUG FIX START: live rollout mask/cost/RNN helpers.
+    def _env_done_mask(self, mask: torch.Tensor, n_envs: int) -> torch.Tensor:
+        """Return a flat boolean mask with one entry per IsaacLab env."""
+        return torch.as_tensor(mask, device=self.device, dtype=torch.bool).reshape(n_envs)
+
+    def _reset_rnn_states_for_done(self, done: torch.Tensor) -> None:
+        """Reset recurrent state on ``terminated | truncated`` like skrl PPO_RNN."""
+        self._policy_rnn_state = zero_policy_rnn_states_for_done(
+            self._policy_rnn_state,
+            done,
+            n_agents=self.env.num_agents,
+        )
+        self._vl_rnn_state = zero_env_rnn_states_for_done(self._vl_rnn_state, done)
+
+    def _costs_from_infos_or_adapter(
+        self,
+        *,
+        infos: Any,
+        agent_state: torch.Tensor,
+        obs_state: torch.Tensor,
+        n_envs: int,
+        n_agents: int,
+        n_constraints: int,
+    ) -> torch.Tensor:
+        """Prefer env-provided costs, otherwise derive signed safety costs from graph states."""
+        costs_all = None
+        if isinstance(infos, Mapping):
+            costs_all = infos.get("costs", infos.get("cost"))
+        if costs_all is None:
+            costs_all = self._adapter_safety_costs(
+                agent_state=agent_state,
+                obs_state=obs_state,
+                n_constraints=n_constraints,
+            )
+        else:
+            costs_all = torch.as_tensor(costs_all, device=self.device, dtype=torch.float32)
+            if costs_all.ndim == 1:
+                costs_all = costs_all[:, None, None]
+            elif costs_all.ndim == 2:
+                costs_all = costs_all[:, :, None]
+            costs_all = costs_all.reshape(n_envs, n_agents, -1)
+        return align_safety_cost_heads(costs_all.to(device=self.device, dtype=torch.float32), n_constraints)
+
+    def _adapter_safety_costs(
+        self,
+        *,
+        agent_state: torch.Tensor,
+        obs_state: torch.Tensor,
+        n_constraints: int,
+    ) -> torch.Tensor:
+        """Build signed arena/pillar costs when the IsaacLab info dict has no cost key."""
+        base_env = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
+        cfg = getattr(base_env, "cfg", None)
+        if cfg is None:
+            fallback = agent_state.new_full((*agent_state.shape[:2], max(1, int(n_constraints))), -1.0)
+            return align_safety_cost_heads(fallback, n_constraints)
+
+        default_pillar_top_z = float(getattr(cfg, "arena_min")[2]) + float(getattr(cfg, "pillar_height", 0.0))
+        costs = compute_pos_tracking_safety_costs(
+            agent_state=agent_state,
+            obs_state=obs_state,
+            arena_min=getattr(base_env, "_arena_min_safe", getattr(base_env, "_arena_min", getattr(cfg, "arena_min"))),
+            arena_max=getattr(base_env, "_arena_max_safe", getattr(base_env, "_arena_max", getattr(cfg, "arena_max"))),
+            collision_altitude=float(getattr(cfg, "collision_altitude")),
+            pillar_collision_radius=float(
+                getattr(base_env, "_pillar_collision_radius", getattr(cfg, "pillar_radius", 0.0))
+            ),
+            pillar_top_z=float(getattr(base_env, "_pillar_top_z", default_pillar_top_z)),
+        )
+        return align_safety_cost_heads(costs, n_constraints)
+    # DGPPO DEBUG FIX END: live rollout mask/cost/RNN helpers.

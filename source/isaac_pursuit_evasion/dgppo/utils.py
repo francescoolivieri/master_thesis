@@ -28,6 +28,9 @@ def compute_dec_ocp_gae(
     disc_gamma: float,
     gae_lambda: float,
     discount_to_max: bool = True,
+    T_terminated: torch.Tensor | None = None,
+    T_truncated: torch.Tensor | None = None,
+    bootstrap_on_truncated: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Computes the decomposed-OCP GAE target for both the constraint (high-level)
@@ -42,12 +45,32 @@ def compute_dec_ocp_gae(
         gae_lambda: GAE lambda.
         discount_to_max: if True, bootstrap ``Vh`` towards the max over heads
             (standard in DGPPO); otherwise per-head.
+        T_terminated: optional ``[B, T]`` true-termination mask. A true value
+            stops all value bootstrapping after that transition.
+        T_truncated: optional ``[B, T]`` time-limit mask, stored separately so
+            callers can choose whether truncations bootstrap.
+        bootstrap_on_truncated: if False, truncations are treated as terminal
+            for target recursion. The live DG-PPO path keeps this True to match
+            skrl's true-termination GAE mask and preserve time-limit bootstrap
+            semantics for future use.
 
     Returns:
         ``Qh`` with shape ``[B, T, A, NH]`` and ``Ql`` with shape ``[B, T]``.
     """
     B, T, A, NH = Tah_hs.shape
     device, dtype = Tah_hs.device, Tah_hs.dtype
+
+    # DGPPO DEBUG FIX START: episode-boundary target masks.
+    continue_mask = _gae_continue_mask(
+        T_terminated=T_terminated,
+        T_truncated=T_truncated,
+        bootstrap_on_truncated=bootstrap_on_truncated,
+        batch_size=B,
+        rollout_length=T,
+        device=device,
+        dtype=dtype,
+    )
+    # DGPPO DEBUG FIX END: episode-boundary target masks.
 
     Qs = torch.zeros((B, T, A, NH + 1), device=device, dtype=dtype)
     time_ids = torch.arange(T + 1, device=device)
@@ -78,9 +101,13 @@ def compute_dec_ocp_gae(
         else:
             h_disc = hs
 
-        disc_to_h = (1.0 - disc_gamma) * h_disc[:, None] + disc_gamma * next_Vhs_row
+        step_continue = continue_mask[:, t]
+        step_continue_h = step_continue[:, None, None, None]
+        step_continue_l = step_continue[:, None, None]
+
+        disc_to_h = (1.0 - disc_gamma) * h_disc[:, None] + disc_gamma * step_continue_h * next_Vhs_row
         Vhs_row = mask_h * torch.maximum(hs[:, None], disc_to_h)
-        Vl_row = mask_l * (cost_l[:, None, None] + disc_gamma * next_Vl_row)
+        Vl_row = mask_l * (cost_l[:, None, None] + disc_gamma * step_continue_l * next_Vl_row)
 
         cat_V_row = torch.cat([Vhs_row, Vl_row[:, :, :, None]], dim=-1)
         Qs[:, t] = torch.einsum("btah,t->bah", cat_V_row, gae_coeffs)
@@ -95,6 +122,150 @@ def compute_dec_ocp_gae(
         gae_coeffs[1] = (gae_lambda**step) * (1.0 - gae_lambda)
 
     return Qs[:, :, :, :NH], Qs[:, :, 0, NH]
+
+
+# DGPPO DEBUG FIX START: episode-boundary and safety-cost helper functions.
+def _gae_continue_mask(
+    *,
+    T_terminated: torch.Tensor | None,
+    T_truncated: torch.Tensor | None,
+    bootstrap_on_truncated: bool,
+    batch_size: int,
+    rollout_length: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return ``[B, T]`` continuation weights for masked target recursion."""
+    terminal = torch.zeros((batch_size, rollout_length), device=device, dtype=torch.bool)
+    if T_terminated is not None:
+        terminal = terminal | _canonical_bool_mask(T_terminated, (batch_size, rollout_length), device=device)
+    if T_truncated is not None and not bootstrap_on_truncated:
+        terminal = terminal | _canonical_bool_mask(T_truncated, (batch_size, rollout_length), device=device)
+    return (~terminal).to(dtype=dtype)
+
+
+def _canonical_bool_mask(mask: torch.Tensor, shape: tuple[int, ...], *, device: torch.device) -> torch.Tensor:
+    mask = torch.as_tensor(mask, device=device, dtype=torch.bool)
+    if tuple(mask.shape) != shape:
+        mask = mask.reshape(shape)
+    return mask
+
+
+def zero_policy_rnn_states_for_done(
+    rnn_state: torch.Tensor | None,
+    done: torch.Tensor,
+    *,
+    n_agents: int,
+) -> torch.Tensor | None:
+    """Zero env slots in a policy carry shaped ``[L, E*A, C, H]``."""
+    if rnn_state is None:
+        return None
+    done_1d = torch.as_tensor(done, device=rnn_state.device, dtype=torch.bool).reshape(-1)
+    if done_1d.numel() == 0 or not bool(done_1d.any().item()):
+        return rnn_state
+    L, total_agents, C, H = rnn_state.shape
+    n_agents = int(n_agents)
+    if n_agents <= 0 or total_agents % n_agents != 0:
+        raise ValueError(f"cannot reshape policy RNN state with total_agents={total_agents}, n_agents={n_agents}")
+    n_envs = total_agents // n_agents
+    if done_1d.numel() != n_envs:
+        raise ValueError(f"done mask has {done_1d.numel()} envs, but policy RNN state has {n_envs}")
+    rnn_state.reshape(L, n_envs, n_agents, C, H)[:, done_1d] = 0.0
+    return rnn_state
+
+
+def zero_env_rnn_states_for_done(rnn_state: torch.Tensor | None, done: torch.Tensor) -> torch.Tensor | None:
+    """Zero env slots in a centralized carry shaped ``[L, E, C, H]``."""
+    if rnn_state is None:
+        return None
+    done_1d = torch.as_tensor(done, device=rnn_state.device, dtype=torch.bool).reshape(-1)
+    if done_1d.numel() == 0 or not bool(done_1d.any().item()):
+        return rnn_state
+    if rnn_state.shape[1] != done_1d.numel():
+        raise ValueError(f"done mask has {done_1d.numel()} envs, but RNN state has {rnn_state.shape[1]}")
+    rnn_state[:, done_1d] = 0.0
+    return rnn_state
+
+
+def compute_pos_tracking_safety_costs(
+    *,
+    agent_state: torch.Tensor,
+    obs_state: torch.Tensor,
+    arena_min: torch.Tensor | Sequence[float],
+    arena_max: torch.Tensor | Sequence[float],
+    collision_altitude: float,
+    pillar_collision_radius: float,
+    pillar_top_z: float,
+    eps: float = 1e-3,
+) -> torch.Tensor:
+    """Signed DG-PPO costs for Crazyflie position tracking.
+
+    The returned heads are ``[arena_bounds, pillar_0, ..., pillar_N]``. Costs
+    are positive when unsafe and negative when safe, following the JAX DG-PPO
+    environment convention.
+    """
+    if agent_state.ndim != 3:
+        raise ValueError(f"agent_state must have shape [E, A, S], got {tuple(agent_state.shape)}")
+    E, A, _S = agent_state.shape
+    device, dtype = agent_state.device, agent_state.dtype
+    pos = agent_state[..., :3]
+
+    arena_min_t = torch.as_tensor(arena_min, device=device, dtype=dtype)
+    arena_max_t = torch.as_tensor(arena_max, device=device, dtype=dtype)
+    safe_min = arena_min_t.clone()
+    safe_min[2] = torch.maximum(safe_min[2], torch.as_tensor(collision_altitude, device=device, dtype=dtype))
+
+    lower_violation = safe_min.view(1, 1, 3) - pos
+    upper_violation = pos - arena_max_t.view(1, 1, 3)
+    boundary_cost = torch.maximum(lower_violation, upper_violation).amax(dim=-1, keepdim=True)
+
+    if obs_state.numel() == 0 or obs_state.shape[1] == 0:
+        raw_costs = boundary_cost
+    else:
+        pillar_xy = obs_state[:, None, :, :2].expand(E, A, -1, -1)
+        agent_xy = pos[:, :, None, :2]
+        dxy = torch.linalg.vector_norm(agent_xy - pillar_xy, dim=-1)
+        radial_cost = torch.as_tensor(pillar_collision_radius, device=device, dtype=dtype) - dxy
+
+        z = pos[..., 2]
+        z_min = arena_min_t[2]
+        z_max = torch.as_tensor(pillar_top_z, device=device, dtype=dtype)
+        inside_height = (z >= z_min) & (z <= z_max)
+        vertical_clearance = torch.maximum(z_min - z, z - z_max).clamp_min(0.0)
+        inactive_height_cost = -vertical_clearance.clamp_min(float(eps))
+        pillar_cost = torch.where(inside_height[..., None], radial_cost, inactive_height_cost[..., None])
+        raw_costs = torch.cat([boundary_cost, pillar_cost], dim=-1)
+
+    return _signed_clipped_cost(raw_costs, eps=eps).reshape(E, A, -1)
+
+
+def align_safety_cost_heads(costs: torch.Tensor, n_constraints: int) -> torch.Tensor:
+    """Align adapter/env costs to the Vh output width without losing OOB signal."""
+    n_constraints = int(n_constraints)
+    if n_constraints < 0:
+        raise ValueError(f"n_constraints must be non-negative, got {n_constraints}")
+    if costs.shape[-1] == n_constraints:
+        return costs
+    if n_constraints == 0:
+        return costs[..., :0]
+    if costs.shape[-1] == n_constraints + 1:
+        boundary = costs[..., :1]
+        remaining = costs[..., 1:]
+        if remaining.shape[-1] == n_constraints:
+            return torch.maximum(remaining, boundary.expand_as(remaining))
+    if n_constraints == 1:
+        return costs.max(dim=-1, keepdim=True).values
+    if costs.shape[-1] > n_constraints:
+        return costs[..., :n_constraints]
+    pad = costs.new_full((*costs.shape[:-1], n_constraints - costs.shape[-1]), -1.0)
+    return torch.cat([costs, pad], dim=-1)
+
+
+def _signed_clipped_cost(cost: torch.Tensor, *, eps: float) -> torch.Tensor:
+    eps_t = torch.as_tensor(eps, device=cost.device, dtype=cost.dtype)
+    shifted = torch.where(cost <= 0.0, cost - eps_t, cost + eps_t)
+    return torch.clamp(shifted, min=-1.0, max=1.0)
+# DGPPO DEBUG FIX END: episode-boundary and safety-cost helper functions.
 
 
 def compute_cbf_advantages(

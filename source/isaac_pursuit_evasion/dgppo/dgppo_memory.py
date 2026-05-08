@@ -16,6 +16,8 @@ Rollout memory used by DGPPOAgent.
     log_prob       (T, B, A)
     rewards        (T, B)
     costs          (T, B, A, NH)
+    terminated     (T, B)
+    truncated      (T, B)
     values_l       (T+1, B)
     values_h       (T+1, B, A, NH)
     rnn_state      (T, B, A, L, C, H)  -- only kept if the policy has an RNN
@@ -75,6 +77,10 @@ class DGPPORolloutMemory(RandomMemory):
             self.create_tensor(f"{prefix}_log_probs", size=B * A, dtype=torch.float32, keep_dimensions=False)
             self.create_tensor(f"{prefix}_rewards", size=B, dtype=torch.float32, keep_dimensions=False)
             self.create_tensor(f"{prefix}_costs", size=B * A * NH, dtype=torch.float32, keep_dimensions=False)
+            # DGPPO DEBUG FIX START: rollout episode-boundary masks.
+            self.create_tensor(f"{prefix}_terminated", size=B, dtype=torch.bool, keep_dimensions=False)
+            self.create_tensor(f"{prefix}_truncated", size=B, dtype=torch.bool, keep_dimensions=False)
+            # DGPPO DEBUG FIX END: rollout episode-boundary masks.
             self.create_tensor(f"{prefix}_values_l", size=B, dtype=torch.float32, keep_dimensions=False)
             self.create_tensor(f"{prefix}_values_h", size=B * A * NH, dtype=torch.float32, keep_dimensions=False)
             
@@ -133,6 +139,10 @@ class DGPPORolloutMemory(RandomMemory):
         det_cost: torch.Tensor,
         det_value_l: torch.Tensor,
         det_value_h: torch.Tensor,
+        stc_terminated: Optional[torch.Tensor] = None,
+        stc_truncated: Optional[torch.Tensor] = None,
+        det_terminated: Optional[torch.Tensor] = None,
+        det_truncated: Optional[torch.Tensor] = None,
         stc_rnn_state: Optional[torch.Tensor] = None,
         det_rnn_state: Optional[torch.Tensor] = None,
     ) -> None:
@@ -148,6 +158,10 @@ class DGPPORolloutMemory(RandomMemory):
         self._tensor("stc_log_probs")[t] = stc_log_prob.reshape(-1)
         self._tensor("stc_rewards")[t] = stc_reward.reshape(-1)
         self._tensor("stc_costs")[t] = stc_cost.reshape(-1)
+        # DGPPO DEBUG FIX START: store stochastic episode-boundary masks.
+        self._tensor("stc_terminated")[t] = self._canonical_done_mask(stc_terminated, self.n_stc_envs)
+        self._tensor("stc_truncated")[t] = self._canonical_done_mask(stc_truncated, self.n_stc_envs)
+        # DGPPO DEBUG FIX END: store stochastic episode-boundary masks.
         self._tensor("stc_values_l")[t] = stc_value_l.reshape(-1)
         self._tensor("stc_values_h")[t] = stc_value_h.reshape(-1)
 
@@ -158,6 +172,10 @@ class DGPPORolloutMemory(RandomMemory):
         self._tensor("det_log_probs")[t] = det_log_prob.reshape(-1)
         self._tensor("det_rewards")[t] = det_reward.reshape(-1)
         self._tensor("det_costs")[t] = det_cost.reshape(-1)
+        # DGPPO DEBUG FIX START: store deterministic episode-boundary masks.
+        self._tensor("det_terminated")[t] = self._canonical_done_mask(det_terminated, self.n_det_envs)
+        self._tensor("det_truncated")[t] = self._canonical_done_mask(det_truncated, self.n_det_envs)
+        # DGPPO DEBUG FIX END: store deterministic episode-boundary masks.
         self._tensor("det_values_l")[t] = det_value_l.reshape(-1)
         self._tensor("det_values_h")[t] = det_value_h.reshape(-1)
         
@@ -186,6 +204,12 @@ class DGPPORolloutMemory(RandomMemory):
             f"{(self.rnn_layers, B * A, self.rnn_carries, self.rnn_hidden)} or "
             f"{(B, A, self.rnn_layers, self.rnn_carries, self.rnn_hidden)}"
         )
+
+    def _canonical_done_mask(self, mask: Optional[torch.Tensor], B: int) -> torch.Tensor:
+        """Return a flat boolean mask of length ``B`` for one rollout split."""
+        if mask is None:
+            return torch.zeros(B, dtype=torch.bool, device=self.device)
+        return torch.as_tensor(mask, device=self.device, dtype=torch.bool).reshape(B)
 
     def set_final_values(self, split: str, value_l: torch.Tensor, value_h: torch.Tensor) -> None:
         if split not in ("stc", "det"):
@@ -217,6 +241,10 @@ class DGPPORolloutMemory(RandomMemory):
         log_probs = self._tensor(f"{split}_log_probs").reshape(T, B, A)
         rewards = self._tensor(f"{split}_rewards").reshape(T, B)
         costs = self._tensor(f"{split}_costs").reshape(T, B, A, self._n_constraints)
+        # DGPPO DEBUG FIX START: expose masks to target/GAE computation.
+        terminated = self._tensor(f"{split}_terminated").reshape(T, B)
+        truncated = self._tensor(f"{split}_truncated").reshape(T, B)
+        # DGPPO DEBUG FIX END: expose masks to target/GAE computation.
         values_l = self._tensor(f"{split}_values_l").reshape(T, B)
         values_h = self._tensor(f"{split}_values_h").reshape(T, B, A, self._n_constraints)
         v_l_tp1 = torch.cat([values_l, self._final_values_l[split].unsqueeze(0)], dim=0)
@@ -225,6 +253,9 @@ class DGPPORolloutMemory(RandomMemory):
         data = {
             "bT_l": -rewards.transpose(0, 1),
             "bTah_hs": costs.transpose(0, 1),
+            "bT_terminated": terminated.transpose(0, 1),
+            "bT_truncated": truncated.transpose(0, 1),
+            "bT_done": (terminated | truncated).transpose(0, 1),
             "bTp1_Vl": v_l_tp1.transpose(0, 1),
             "bTp1ah_Vh": v_h_tp1.transpose(0, 1),
             "bTah_Vh": values_h.transpose(0, 1),

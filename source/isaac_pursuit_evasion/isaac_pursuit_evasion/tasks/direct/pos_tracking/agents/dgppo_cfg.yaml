@@ -56,6 +56,21 @@ agent:
     std_dev_init: 0.5
     std_dev_min: 1.0e-5
 
+  # Live-training diagnostics. This branch is intentionally debug-heavy:
+  # JSONL events are written under each run's dgppo_debug/ directory.
+  debug:
+    enabled: true
+    step_interval: 10
+    update_interval: 1
+    minibatch_interval: 1
+    sample_env_count: 8
+    log_minibatches: true
+    log_jsonl: true
+    log_tensorboard_scalars: true
+    log_on_done: true
+    rnn_done_norm_epsilon: 1.0e-6
+    anomaly_abs_threshold: 1000000.0
+
   # skrl experiment logging
   experiment:
     directory: "training/dgppo"
@@ -72,7 +87,7 @@ agent:
 
 # - Trainer settings, read by skrl SequentialTrainer
 trainer:
-  timesteps: 15000
+  timesteps: 3000 #15000
   environment_info: log
   headless: true
   disable_progressbar: false

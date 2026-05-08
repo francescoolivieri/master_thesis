@@ -87,6 +87,75 @@ def test_rollout_memory_layout_matches_jax_update_fixture(num_envs: int) -> None
         stage=f"num_envs={num_envs}/memory",
         tensor_name="bTp1ah_Vh",
     )
+    assert not view["bT_terminated"].any()
+    assert not view["bT_truncated"].any()
+
+
+def test_rollout_memory_stores_split_done_masks() -> None:
+    importorskip("skrl.memories.torch")
+    from dgppo.dgppo_memory import DGPPORolloutMemory
+
+    T, B, A, S, O, Da, NH = 2, 3, 1, 4, 2, 2, 2
+    memory = DGPPORolloutMemory(
+        rollout_length=T,
+        num_det_envs=B,
+        num_stc_envs=B,
+        n_agents=A,
+        n_obs=O,
+        state_dim=S,
+        action_dim=Da,
+        n_constraints=NH,
+        device=torch.device("cpu"),
+        use_rnn=False,
+    )
+
+    zeros_agent = torch.zeros(B, A, S)
+    zeros_obs = torch.zeros(B, O, S)
+    zeros_action = torch.zeros(B, A, Da)
+    zeros_cost = torch.zeros(B, A, NH)
+    zeros_value_h = torch.zeros(B, A, NH)
+    zeros_env = torch.zeros(B)
+    zeros_logp = torch.zeros(B, A)
+
+    stc_terminated = [torch.tensor([False, True, False]), torch.tensor([True, False, False])]
+    stc_truncated = [torch.tensor([False, False, True]), torch.tensor([False, True, False])]
+    det_terminated = [torch.tensor([True, False, False]), torch.tensor([False, False, True])]
+    det_truncated = [torch.tensor([False, True, False]), torch.tensor([True, False, False])]
+
+    for t in range(T):
+        memory.add(
+            stc_agent_state=zeros_agent,
+            stc_goal_state=zeros_agent,
+            stc_obs_state=zeros_obs,
+            stc_action=zeros_action,
+            stc_log_prob=zeros_logp,
+            stc_reward=zeros_env,
+            stc_cost=zeros_cost,
+            stc_value_l=zeros_env,
+            stc_value_h=zeros_value_h,
+            stc_terminated=stc_terminated[t],
+            stc_truncated=stc_truncated[t],
+            det_agent_state=zeros_agent,
+            det_goal_state=zeros_agent,
+            det_obs_state=zeros_obs,
+            det_action=zeros_action,
+            det_log_prob=zeros_logp,
+            det_reward=zeros_env,
+            det_cost=zeros_cost,
+            det_value_l=zeros_env,
+            det_value_h=zeros_value_h,
+            det_terminated=det_terminated[t],
+            det_truncated=det_truncated[t],
+        )
+
+    stc_view = memory.as_bTah_view("stc")
+    det_view = memory.as_bTah_view("det")
+
+    assert torch.equal(stc_view["bT_terminated"], torch.stack(stc_terminated, dim=1))
+    assert torch.equal(stc_view["bT_truncated"], torch.stack(stc_truncated, dim=1))
+    assert torch.equal(det_view["bT_terminated"], torch.stack(det_terminated, dim=1))
+    assert torch.equal(det_view["bT_truncated"], torch.stack(det_truncated, dim=1))
+    assert torch.equal(stc_view["bT_done"], stc_view["bT_terminated"] | stc_view["bT_truncated"])
 
 
 @pytest.mark.parametrize("num_envs", [2, 6])
