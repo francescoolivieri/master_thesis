@@ -73,7 +73,6 @@ class DGPPORunner:
         critic_kwargs = dict(
             node_dim=node_dim,
             edge_dim=edge_dim,
-            gnn_layers=int(gnn_cfg.get("critic_layers", 1)),
             gnn_out_dim=int(gnn_cfg.get("critic_out_dim", gnn_cfg.get("out_dim", 64))),
             gnn_msg_dim=int(gnn_cfg.get("msg_dim", 32)),
             gnn_heads=int(gnn_cfg.get("n_heads", 3)),
@@ -84,8 +83,18 @@ class DGPPORunner:
             rnn_layers=int(rnn_cfg.get("layers", 1)),
             device=device,
         )
-        Vl = DGPPOValueNet(**critic_kwargs, n_out=1,             decompose=False)
-        Vh = DGPPOValueNet(**critic_kwargs, n_out=n_constraints, decompose=True)
+        Vl = DGPPOValueNet(
+            **critic_kwargs,
+            gnn_layers=int(gnn_cfg.get("vl_layers", 1)),
+            n_out=1,
+            decompose=False,
+        )
+        Vh = DGPPOValueNet(
+            **critic_kwargs,
+            gnn_layers=int(gnn_cfg.get("vh_layers", 1)),
+            n_out=n_constraints,
+            decompose=True,
+        )
 
         # - Agent
         self.agent = DGPPOAgent(

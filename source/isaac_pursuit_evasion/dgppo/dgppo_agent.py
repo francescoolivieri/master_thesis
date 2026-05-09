@@ -65,7 +65,8 @@ class DGPPOAgentCfg(AgentCfg):
     gnn: dict[str, Any] = dataclasses.field(
         default_factory=lambda: {
             "policy_layers": 1,
-            "critic_layers": 1,
+            "vl_layers": 1,
+            "vh_layers": 1,
             "policy_out_dim": 64,
             "critic_out_dim": 64,
             "msg_dim": 32,

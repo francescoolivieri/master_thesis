@@ -7,7 +7,7 @@ agent:
   alpha:        10.0    # CBF class-K multiplier
   cbf_eps:      0.01    # CBF slack (h >= -eps is "safe enough")
   cbf_weight:   1.0     # weight on the CBF penalty term
-  cbf_schedule: true    # linearly increase cbf_weight during training
+  cbf_schedule: false    # linearly increase cbf_weight during training
 
   # PPO / GAE
   discount_factor:  0.995
@@ -17,7 +17,7 @@ agent:
   learning_starts:  0
   mini_batches:     8
   ratio_clip:       0.2
-  entropy_loss_scale: 0.0
+  entropy_loss_scale: 0.01
   vl_loss_scale:    1.0
   vh_loss_scale:    1.0
   grad_norm_clip:   2.0
@@ -40,8 +40,9 @@ agent:
 
   # GNN backbone
   gnn:
-    policy_layers: 1
-    critic_layers: 1
+    policy_layers: 2
+    vl_layers: 2
+    vh_layers: 1
     policy_out_dim: 64
     critic_out_dim: 64
     msg_dim:  32
@@ -49,8 +50,8 @@ agent:
 
   # MLP / policy-head architecture
   model:
-    policy_mlp_hid: [128, 64]
-    critic_mlp_hid: [128, 64]
+    policy_mlp_hid: [64, 64]
+    critic_mlp_hid: [64, 64]
     scale_hid: 64
     scale_final: 0.01
     std_dev_init: 0.5
