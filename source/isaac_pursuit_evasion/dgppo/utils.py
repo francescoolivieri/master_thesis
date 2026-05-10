@@ -50,9 +50,9 @@ def compute_dec_ocp_gae(
         T_truncated: optional ``[B, T]`` time-limit mask, stored separately so
             callers can choose whether truncations bootstrap.
         bootstrap_on_truncated: if False, truncations are treated as terminal
-            for target recursion. The live DG-PPO path keeps this True to match
-            skrl's true-termination GAE mask and preserve time-limit bootstrap
-            semantics for future use.
+            for target recursion. The live DG-PPO path uses False because
+            IsaacLab autoresets after truncation and the reset state is not a
+            valid continuation value.
 
     Returns:
         ``Qh`` with shape ``[B, T, A, NH]`` and ``Ql`` with shape ``[B, T]``.
@@ -314,7 +314,11 @@ def compute_cbf_advantages(
 
     # add CBF term (note that bTah_Acbf is zero when satisfied)
     scale = cbf_weight if cbf_scale is None else cbf_scale
-    bTa_A = bTa_A + bTah_Acbf.max(dim=-1).values * scale
+    bTa_cbf_penalty = bTah_Acbf.max(dim=-1).values * scale
+    bTa_cbf_active = bTa_cbf_penalty > 0
+    bTa_reward_used = bTa_is_safe
+    bTa_A = bTa_A + bTa_cbf_penalty
+    bTa_A_before_flip = bTa_A
 
     # flip for PPO use
     bTa_A = -bTa_A
@@ -322,8 +326,13 @@ def compute_cbf_advantages(
     return {
         "bT_Al_raw": bT_Al_raw,
         "bT_Al_norm": bT_Al_norm,
+        "bTa_Al": bTa_Al,
         "bTah_cbf_deriv": bTah_cbf_deriv,
         "bTah_Acbf": bTah_Acbf,
+        "bTa_cbf_penalty": bTa_cbf_penalty,
+        "bTa_cbf_active": bTa_cbf_active,
+        "bTa_reward_used": bTa_reward_used,
+        "bTa_A_before_flip": bTa_A_before_flip,
         "bTa_is_safe": bTa_is_safe,
         "bTa_A": bTa_A,
     }

@@ -160,6 +160,9 @@ def compute_policy_loss(
     return {
         **loss_info,
         "log_prob": log_prob,
+        "old_logp": old_logp,
+        "log_prob_delta": log_prob - old_logp,
+        "advantages": advantages,
         "entropy": entropy,
     }
 
@@ -245,6 +248,7 @@ def compute_rollout_policy_loss(
 
     old_logp_chunked = old_logp[:, chunk_ids_index]
     advantages_chunked = advantages[:, chunk_ids_index]
+    log_prob_delta = log_prob - old_logp_chunked
     loss_info = compute_policy_loss_from_log_prob(
         log_prob=log_prob,
         old_logp=old_logp_chunked,
@@ -256,6 +260,9 @@ def compute_rollout_policy_loss(
     return {
         **loss_info,
         "log_prob": log_prob,
+        "old_logp": old_logp_chunked,
+        "log_prob_delta": log_prob_delta,
+        "advantages": advantages_chunked,
         "entropy": entropy,
     }
 

@@ -193,6 +193,7 @@ class DGPPOTrainingDiagnostics:
         speed = torch.linalg.vector_norm(agent_state[..., 3:6], dim=-1).squeeze(-1)
         action_norm = torch.linalg.vector_norm(actions.reshape(int(env.num_envs), int(env.num_agents), -1), dim=-1)
         action_norm = action_norm.squeeze(-1)
+        actions_env = actions.reshape(int(env.num_envs), int(env.num_agents), -1)
 
         data: dict[str, Any] = {
             "timestep": int(timestep),
@@ -223,6 +224,7 @@ class DGPPOTrainingDiagnostics:
                 "observations": _stats(observations),
                 "next_observations": _stats(next_observations),
                 "actions": _stats(actions),
+                "actions_by_dim": _per_dim_stats(actions_env),
                 "rewards": _stats(rewards),
                 "agent_pos": _stats(agent_state[..., :3]),
                 "agent_vel": _stats(agent_state[..., 3:6]),
@@ -319,7 +321,7 @@ class DGPPOTrainingDiagnostics:
                 "episode_length_buf": _stats(episode_lengths),
                 "rnn_done_new_norms": _stats(_cat_or_none(self._rollout_rnn_done_norms)),
                 # DGPPO DEBUG FIX START: update diagnostics for consumed rollout masks.
-                "mask_status": "DGPPO memory/update consumes true-termination masks; truncation masks are stored.",
+                "mask_status": "DGPPO memory/update consumes terminated, truncated, and done boundary masks.",
                 # DGPPO DEBUG FIX END: update diagnostics for consumed rollout masks.
             },
             "stochastic_rollout": {
@@ -353,12 +355,19 @@ class DGPPOTrainingDiagnostics:
             "targets_and_advantages": {
                 "ql": _stats(ql),
                 "qh_det": _stats(qh_det),
+                "vl_error": _stats(ql - view["bT_Vl"]),
+                "vh_det_error": _stats(qh_det - det_view["bTah_Vh"]),
                 "advantage": _stats(adv_info["bTa_A"]),
                 "advantage_positive_rate": _positive_rate(adv_info["bTa_A"]),
                 "adv_raw": _stats(adv_info["bT_Al_raw"]),
                 "adv_norm": _stats(adv_info["bT_Al_norm"]),
+                "reward_adv_agent": _stats(adv_info.get("bTa_Al")),
+                "reward_adv_used_rate": _true_rate(adv_info.get("bTa_reward_used")),
                 "cbf_deriv": _stats(adv_info["bTah_cbf_deriv"]),
                 "cbf_penalty": _stats(adv_info["bTah_Acbf"]),
+                "cbf_penalty_agent": _stats(adv_info.get("bTa_cbf_penalty")),
+                "cbf_active_rate": _true_rate(adv_info.get("bTa_cbf_active")),
+                "advantage_before_flip": _stats(adv_info.get("bTa_A_before_flip")),
                 "safe_rate": _finite_mean(adv_info["bTa_is_safe"].float()),
             },
         }
@@ -366,7 +375,9 @@ class DGPPOTrainingDiagnostics:
         truncated_rate = _finite_mean(truncated.float()) if truncated is not None else math.nan
         self._track("DGPPO Debug/rollout_truncated_rate", truncated_rate)
         self._track("DGPPO Debug/advantage_mean", _finite_mean(adv_info["bTa_A"]))
+        self._track("DGPPO Debug/advantage_abs_max", _finite_abs_max(adv_info["bTa_A"]))
         self._track("DGPPO Debug/cbf_deriv_max", _finite_max(adv_info["bTah_cbf_deriv"]))
+        self._track("DGPPO Debug/cbf_active_rate", _true_rate(adv_info.get("bTa_cbf_active")))
         self._write("update_start", data)
 
     def log_minibatch(
@@ -395,6 +406,11 @@ class DGPPOTrainingDiagnostics:
             "clip_frac": _scalar(info.get("clip_frac")),
             "ratio": _stats(info.get("ratio")),
             "log_prob": _stats(info.get("log_prob")),
+            "old_logp": _stats(info.get("old_logp")),
+            "log_prob_delta": _stats(info.get("log_prob_delta")),
+            "log_prob_delta_abs": _stats(None if info.get("log_prob_delta") is None else info["log_prob_delta"].abs()),
+            "log_prob_delta_abs_counts": _threshold_counts(info.get("log_prob_delta"), thresholds=(1.0, 5.0, 10.0)),
+            "advantages": _stats(info.get("advantages")),
             "entropy": _stats(info.get("entropy")),
             "policy_grad_norm": _scalar(info.get("policy_grad_norm")),
             "vl_grad_norm": _scalar(info.get("vl_grad_norm")),
@@ -402,6 +418,12 @@ class DGPPOTrainingDiagnostics:
             "vl_prediction": _stats(info.get("vl")),
             "vh_prediction": _stats(info.get("vh")),
         }
+        delta = info.get("log_prob_delta")
+        if isinstance(delta, torch.Tensor):
+            self._track("DGPPO Debug/minibatch_log_prob_delta_abs_max", _finite_abs_max(delta))
+        ratio = info.get("ratio")
+        if isinstance(ratio, torch.Tensor):
+            self._track("DGPPO Debug/minibatch_ratio_max", _finite_max(ratio))
         self._write("minibatch", data)
 
     def log_update_end(
@@ -830,7 +852,64 @@ def _finite_max(tensor: torch.Tensor | None) -> float:
     return float(values[finite].max().item())
 
 
+def _finite_abs_max(tensor: torch.Tensor | None) -> float:
+    if tensor is None or tensor.numel() == 0:
+        return math.nan
+    values = tensor.detach().float()
+    finite = torch.isfinite(values)
+    if not bool(finite.any().item()):
+        return math.nan
+    return float(values[finite].abs().max().item())
+
+
 def _positive_rate(tensor: torch.Tensor) -> float:
     if tensor.numel() == 0:
         return math.nan
     return float((tensor.detach() > 0).float().mean().item())
+
+
+def _true_rate(tensor: Any) -> float:
+    if tensor is None or not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+        return math.nan
+    return float(tensor.detach().bool().float().mean().item())
+
+
+def _threshold_counts(tensor: Any, *, thresholds: tuple[float, ...]) -> dict[str, Any]:
+    if tensor is None or not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+        return {"present": False}
+    values = tensor.detach().abs().float()
+    finite = values[torch.isfinite(values)]
+    result: dict[str, Any] = {"present": True, "numel": int(values.numel()), "finite_count": int(finite.numel())}
+    if finite.numel() == 0:
+        return result
+    for threshold in thresholds:
+        mask = finite > float(threshold)
+        result[f"abs_gt_{threshold:g}_count"] = int(mask.sum().item())
+        result[f"abs_gt_{threshold:g}_rate"] = float(mask.float().mean().item())
+    return result
+
+
+def _per_dim_stats(tensor: Any) -> dict[str, Any]:
+    if tensor is None or not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+        return {"present": False}
+    data = tensor.detach()
+    if data.ndim == 0:
+        return {"present": False, "reason": "scalar"}
+    flat = data.reshape(-1, data.shape[-1]).float()
+    finite = torch.isfinite(flat)
+    safe = torch.where(finite, flat, torch.zeros_like(flat))
+    counts = finite.sum(dim=0).clamp_min(1)
+    means = safe.sum(dim=0) / counts
+    mins = torch.where(finite, flat, torch.full_like(flat, float("inf"))).min(dim=0).values
+    maxs = torch.where(finite, flat, torch.full_like(flat, float("-inf"))).max(dim=0).values
+    centered = torch.where(finite, flat - means, torch.zeros_like(flat))
+    stds = torch.sqrt((centered.square().sum(dim=0) / counts).clamp_min(0.0))
+    return {
+        "present": True,
+        "shape": tuple(int(v) for v in data.shape),
+        "mean": _jsonable(means),
+        "std": _jsonable(stds),
+        "min": _jsonable(mins),
+        "max": _jsonable(maxs),
+        "finite_count": _jsonable(finite.sum(dim=0)),
+    }

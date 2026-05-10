@@ -22,6 +22,16 @@ before feeding the carry to the next step.
 
 Applied later on 2026-05-10:
 
+- `source/isaac_pursuit_evasion/dgppo/dgppo_debug.py`
+  - Adds collapse-oriented diagnostics to `transition`, `update_start`, and `minibatch` events:
+    action stats by action dimension, reward-vs-CBF advantage decomposition, CBF active rate, Vl/Vh target errors,
+    old/new log-prob deltas, and log-prob delta threshold counts.
+  - Mirrors key signals to scalar logging: advantage abs max, CBF active rate, minibatch ratio max, and minibatch
+    log-prob delta abs max.
+
+- `source/isaac_pursuit_evasion/dgppo/update_helpers.py`
+  - Returns chunked `old_logp`, `log_prob_delta`, and `advantages` from policy-loss helpers for debug logging.
+
 - `source/isaac_pursuit_evasion/dgppo/dgppo_agent.py`
   - Calls `compute_dec_ocp_gae(..., bootstrap_on_truncated=False)` for both stochastic and deterministic targets.
     This treats IsaacLab truncations as rollout boundaries unless/until terminal-observation bootstrap is wired in.
@@ -59,7 +69,7 @@ Earlier fixes already present on this branch:
 
 - Live rollout resets policy and Vl carries on `terminated | truncated`.
 - Rollout memory stores stochastic/deterministic `terminated`, `truncated`, and `done` masks.
-- GAE/target recursion masks true terminations while keeping truncation bootstrap semantics separate.
+- GAE/target recursion masks true terminations and treats truncations as live rollout boundaries.
 - The position-tracking task publishes signed DG-PPO costs, with an agent-side fallback adapter.
 - Rollout memory stores incoming policy and Vl carries so recurrent update chunks can start from the real live context.
 
@@ -72,10 +82,19 @@ Line numbers below are from this debugging branch after the 2026-05-10 patch:
   - `compute_cbf_advantages(..., bT_done=view["bT_done"])`: around line 645.
   - `compute_rollout_policy_loss(..., done_mask=batch.done_mask)`: around line 769.
   - `compute_value_losses(..., done_mask=batch.done_mask)`: around line 804.
+  - Minibatch debug return of `old_logp`, `log_prob_delta`, and `advantages`: around lines 832-834.
+
+- `dgppo_debug.py`
+  - Transition action-by-dimension stats: around line 227.
+  - Update target errors and advantage decomposition: around lines 358-370.
+  - TensorBoard scalar mirrors for advantage/CBF drift: around lines 377-380.
+  - Minibatch log-prob delta and advantage diagnostics: around lines 407-413.
+  - TensorBoard scalar mirrors for log-prob/ratio drift: around lines 421-426.
 
 - `utils.py`
   - `compute_cbf_advantages(..., bT_done=...)`: around line 281.
   - CBF done-boundary finite-difference masking: around lines 302-306.
+  - Reward-vs-CBF advantage decomposition returned for logging: around lines 315-334.
 
 - `update_helpers.py`
   - `UpdateGraphBatch.done_mask`: around line 33.
