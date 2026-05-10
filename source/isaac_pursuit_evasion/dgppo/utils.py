@@ -278,6 +278,7 @@ def compute_cbf_advantages(
     cbf_weight: float,
     dt: float = 0.03,
     cbf_scale: float | None = None,
+    bT_done: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """
     CBF-based advantage used by DGPPO.
@@ -285,6 +286,9 @@ def compute_cbf_advantages(
     Reward advantage is standardized across time, and the constraint term
     (``V_{t+1} - V_t) / dt + alpha * V_t``) enters as an additive penalty
     whenever any head is unsafe.
+
+    If ``bT_done`` is provided, done transitions use ``V_t`` as the finite
+    difference endpoint so the CBF term does not cross into a reset episode.
     """
 
     # calculate cost advantage and normalize
@@ -295,7 +299,11 @@ def compute_cbf_advantages(
     bTa_Al = bT_Al_norm[:, :, None].expand(-1, -1, bTah_Vh.shape[2])
 
     # Discrete CBF derivative: (V_{t+1} - V_t) / dt + alpha * V_t.
-    bTah_cbf_deriv = (bTp1ah_Vh[:, 1:] - bTah_Vh) / dt + alpha * bTah_Vh
+    bTah_next_Vh = bTp1ah_Vh[:, 1:]
+    if bT_done is not None:
+        done = _canonical_bool_mask(bT_done, tuple(bT_Ql.shape), device=bTah_Vh.device)
+        bTah_next_Vh = torch.where(done[:, :, None, None], bTah_Vh, bTah_next_Vh)
+    bTah_cbf_deriv = (bTah_next_Vh - bTah_Vh) / dt + alpha * bTah_Vh
     bTah_Acbf = torch.clamp(bTah_cbf_deriv + cbf_eps, min=0.0)
 
     # check if the safety constraint is satisfied (check for all constraints)
@@ -846,7 +854,8 @@ class MLP(nn.Module):
     Fully-connected network with orthogonal init and optional per-layer LayerNorm.
 
     Activation is applied after each layer; the final layer's activation can be disabled via 'act_final=False'
-    and its weight can be rescaled via 'scale_final' (typical trick for policy/value heads so that the initial output is small).
+    and its weight can be rescaled via 'scale_final' (typical trick for
+    policy/value heads so that the initial output is small).
     """
 
     def __init__(

@@ -609,10 +609,11 @@ class DGPPOAgent(Agent):
             Tp1_Vl=view["bTp1_Vl"],
             disc_gamma=self.gamma,
             gae_lambda=self.gae_lambda,
-            # DGPPO DEBUG FIX START: stochastic true-termination mask.
+            # DGPPO DEBUG FIX START: stochastic rollout-boundary masks.
             T_terminated=view["bT_terminated"],
             T_truncated=view["bT_truncated"],
-            # DGPPO DEBUG FIX END: stochastic true-termination mask.
+            bootstrap_on_truncated=False,
+            # DGPPO DEBUG FIX END: stochastic rollout-boundary masks.
         )
 
         Qh_det, _ = compute_dec_ocp_gae(
@@ -622,10 +623,11 @@ class DGPPOAgent(Agent):
             Tp1_Vl=view["bTp1_Vl"],
             disc_gamma=self.gamma,
             gae_lambda=self.gae_lambda,
-            # DGPPO DEBUG FIX START: deterministic true-termination mask.
+            # DGPPO DEBUG FIX START: deterministic rollout-boundary masks.
             T_terminated=det_view["bT_terminated"],
             T_truncated=det_view["bT_truncated"],
-            # DGPPO DEBUG FIX END: deterministic true-termination mask.
+            bootstrap_on_truncated=False,
+            # DGPPO DEBUG FIX END: deterministic rollout-boundary masks.
         )
 
         # flipped for PPO use
@@ -640,6 +642,7 @@ class DGPPOAgent(Agent):
             cbf_weight=self.cbf_weight,
             dt=self.env._step_dt,
             cbf_scale=cbf_scale,
+            bT_done=view["bT_done"],
         )
         bTa_A = adv_info["bTa_A"].detach()
         self.track_data("DGPPO/safe_rate", float(adv_info["bTa_is_safe"].float().mean().item()))
@@ -766,6 +769,7 @@ class DGPPOAgent(Agent):
                 n_agents=batch.A,
                 chunk_graph=chunk_graph,
                 rnn_states=batch.rnn_states,
+                done_mask=batch.done_mask,
             )
         else:
             policy_info = compute_policy_loss(
@@ -800,6 +804,7 @@ class DGPPOAgent(Agent):
             rnn_states=batch.rnn_states,
             det_rnn_states=batch.det_rnn_states,
             vl_rnn_states=batch.vl_rnn_states,
+            done_mask=batch.done_mask,
             chunk_ids=chunk_ids,
             chunk_graph=chunk_graph,
             det_chunk_graph=det_chunk_graph,

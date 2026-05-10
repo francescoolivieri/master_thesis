@@ -6,7 +6,9 @@ from .parity_test_utils import assert_parity_close, importorskip, load_kernel_fi
 
 torch = importorskip("torch")
 
+from dgppo.update_helpers import _reset_env_carry_after_done, _reset_policy_carry_after_done
 from dgppo.utils import (
+    compute_cbf_advantages,
     compute_dec_ocp_gae,
     compute_policy_surrogate,
     compute_pos_tracking_safety_costs,
@@ -99,6 +101,41 @@ def test_dec_ocp_gae_masks_true_terminations_without_masking_truncations() -> No
     )
     assert torch.equal(ql_truncated, torch.tensor([[1111.0, 1110.0, 1100.0]]))
 
+    _, ql_truncated_masked = compute_dec_ocp_gae(
+        Tah_hs=Tah_hs,
+        T_l=T_l,
+        Tp1ah_Vh=Tp1ah_Vh,
+        Tp1_Vl=Tp1_Vl,
+        disc_gamma=1.0,
+        gae_lambda=1.0,
+        T_truncated=torch.tensor([[False, True, False]]),
+        bootstrap_on_truncated=False,
+    )
+    assert torch.equal(ql_truncated_masked, torch.tensor([[11.0, 10.0, 1100.0]]))
+
+
+def test_cbf_advantages_do_not_cross_done_boundaries() -> None:
+    bT_Ql = torch.zeros(1, 2)
+    bT_Vl = torch.zeros(1, 2)
+    bTah_Vh = -torch.ones(1, 2, 1, 1)
+    bTp1ah_Vh = -torch.ones(1, 3, 1, 1)
+    bTp1ah_Vh[:, 1] = 1000.0
+
+    info = compute_cbf_advantages(
+        bT_Ql=bT_Ql,
+        bT_Vl=bT_Vl,
+        bTah_Vh=bTah_Vh,
+        bTp1ah_Vh=bTp1ah_Vh,
+        alpha=2.0,
+        cbf_eps=0.01,
+        cbf_weight=1.0,
+        dt=0.1,
+        bT_done=torch.tensor([[True, False]]),
+    )
+
+    assert torch.equal(info["bTah_cbf_deriv"][:, 0], torch.tensor([[[-2.0]]]))
+    assert torch.equal(info["bTah_Acbf"][:, 0], torch.zeros(1, 1, 1))
+
 
 def test_rnn_done_helpers_zero_only_finished_env_slots() -> None:
     policy_state = torch.arange(1 * 6 * 1 * 2, dtype=torch.float32).reshape(1, 6, 1, 2)
@@ -112,6 +149,21 @@ def test_rnn_done_helpers_zero_only_finished_env_slots() -> None:
     assert torch.equal(vl_state[:, 1], torch.zeros(1, 1, 2))
     assert policy_state.reshape(1, 3, 2, 1, 2)[:, 0].abs().sum() > 0
     assert vl_state[:, 0].abs().sum() > 0
+
+
+def test_recurrent_update_done_masks_zero_post_step_carries_out_of_place() -> None:
+    policy_state = torch.arange(1 * 6 * 1 * 2, dtype=torch.float32, requires_grad=True).reshape(1, 6, 1, 2)
+    vl_state = torch.arange(1 * 3 * 1 * 2, dtype=torch.float32, requires_grad=True).reshape(1, 3, 1, 2)
+    done = torch.tensor([[False], [True], [False]])
+
+    policy_reset = _reset_policy_carry_after_done(policy_state, done, n_agents=2)
+    vl_reset = _reset_env_carry_after_done(vl_state, done)
+
+    assert torch.equal(policy_reset.reshape(1, 3, 2, 1, 2)[:, 1], torch.zeros(1, 2, 1, 2))
+    assert torch.equal(vl_reset[:, 1], torch.zeros(1, 1, 2))
+    assert torch.equal(policy_state.reshape(1, 3, 2, 1, 2)[:, 1], torch.tensor([[[[4.0, 5.0]], [[6.0, 7.0]]]]))
+    assert torch.equal(vl_state[:, 1], torch.tensor([[[2.0, 3.0]]]))
+    (policy_reset.sum() + vl_reset.sum()).backward()
 
 
 def test_pos_tracking_safety_costs_emit_boundary_and_pillar_heads() -> None:

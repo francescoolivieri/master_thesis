@@ -30,6 +30,7 @@ class UpdateGraphBatch:
     rnn_states: torch.Tensor | None
     vl_rnn_states: torch.Tensor | None
     det_rnn_states: torch.Tensor | None
+    done_mask: torch.Tensor | None
     b: int
     T: int
     A: int
@@ -84,6 +85,7 @@ def build_update_graph_batch(
     rnn_states = view.get("bTa_rnn_states")
     vl_rnn_states = view.get("bT_vl_rnn_states")
     det_rnn_states = det_view.get("bTa_rnn_states")
+    done_mask = view.get("bT_done")
 
     return UpdateGraphBatch(
         graph=graph,
@@ -96,6 +98,7 @@ def build_update_graph_batch(
         rnn_states=rnn_states[idx] if rnn_states is not None else None,
         vl_rnn_states=vl_rnn_states[idx] if vl_rnn_states is not None else None,
         det_rnn_states=det_rnn_states[idx] if det_rnn_states is not None else None,
+        done_mask=done_mask[idx] if done_mask is not None else None,
         b=b,
         T=T,
         A=A,
@@ -199,6 +202,7 @@ def compute_rollout_policy_loss(
     n_agents: int,
     chunk_graph: GraphData | None = None,
     rnn_states: torch.Tensor | None = None,
+    done_mask: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Evaluate policy loss over rollout envs and RNN chunks using production policy code.
 
@@ -231,6 +235,7 @@ def compute_rollout_policy_loss(
             graph=chunk_graph,
             action_chunks=action_chunks,
             rnn_states=rnn_states[:, chunk_ids_index[:, 0]] if rnn_states is not None else None,
+            done_chunks=done_mask[:, chunk_ids_index] if done_mask is not None else None,
             B=B,
             C=C,
             R=R,
@@ -318,6 +323,7 @@ def compute_value_losses(
     rnn_states: torch.Tensor | None = None,
     vl_rnn_states: torch.Tensor | None = None,
     det_rnn_states: torch.Tensor | None = None,
+    done_mask: torch.Tensor | None = None,
     chunk_ids: torch.Tensor | None = None,
     chunk_graph: GraphData | None = None,
     det_chunk_graph: GraphData | None = None,
@@ -336,6 +342,7 @@ def compute_value_losses(
             A=A,
             loss_scale=vl_loss_scale,
             rnn_states=vl_rnn_states,
+            done_mask=done_mask,
             chunk_graph=chunk_graph,
         )
         if det_rnn_states is None:
@@ -387,6 +394,7 @@ def compute_rollout_vl_loss(
     A: int,
     loss_scale: float = 1.0,
     rnn_states: torch.Tensor | None = None,
+    done_mask: torch.Tensor | None = None,
     chunk_graph: GraphData | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute the Vl update loss over rollout chunks using stored chunk-start RNN states when available."""
@@ -399,6 +407,7 @@ def compute_rollout_vl_loss(
         Vl=Vl,
         graph=chunk_graph,
         rnn_states=rnn_states[:, chunk_ids_index[:, 0]] if rnn_states is not None else None,
+        done_chunks=done_mask[:, chunk_ids_index] if done_mask is not None else None,
         B=B,
         C=C,
         R=R,
@@ -518,6 +527,7 @@ def _evaluate_policy_chunks(
     graph: GraphData,
     action_chunks: torch.Tensor,
     rnn_states: torch.Tensor | None,
+    done_chunks: torch.Tensor | None,
     B: int,
     C: int,
     R: int,
@@ -547,6 +557,8 @@ def _evaluate_policy_chunks(
         log_prob[:, :, r] = dist.log_prob(action_chunks[:, :, r])
         if compute_entropy:
             entropy[:, :, r] = dist.entropy()
+        if done_chunks is not None:
+            rnn_state = _reset_policy_carry_after_done(rnn_state, done_chunks[:, :, r], n_agents=A)
 
     return log_prob, entropy
 
@@ -556,6 +568,7 @@ def _evaluate_vl_chunks(
     Vl: DGPPOValueNet,
     graph: GraphData,
     rnn_states: torch.Tensor | None,
+    done_chunks: torch.Tensor | None,
     B: int,
     C: int,
     R: int,
@@ -580,7 +593,41 @@ def _evaluate_vl_chunks(
     for r in range(R):
         x_r, rnn_state = Vl.rnn(x[r], rnn_state)
         values[:, :, r] = Vl.net.value_out(x_r).reshape(B, C, Vl.net.n_out)
+        if done_chunks is not None:
+            rnn_state = _reset_env_carry_after_done(rnn_state, done_chunks[:, :, r])
     return values.squeeze(-1)
+
+
+def _reset_policy_carry_after_done(
+    rnn_state: torch.Tensor,
+    done: torch.Tensor,
+    *,
+    n_agents: int,
+) -> torch.Tensor:
+    """Zero finished env slots in a policy carry without mutating autograd state."""
+    done_1d = torch.as_tensor(done, device=rnn_state.device, dtype=torch.bool).reshape(-1)
+    if done_1d.numel() == 0 or not bool(done_1d.any().item()):
+        return rnn_state
+    L, total_agents, n_carries, H = rnn_state.shape
+    n_agents = int(n_agents)
+    if n_agents <= 0 or total_agents % n_agents != 0:
+        raise ValueError(f"cannot reshape policy RNN state with total_agents={total_agents}, n_agents={n_agents}")
+    n_envs = total_agents // n_agents
+    if done_1d.numel() != n_envs:
+        raise ValueError(f"done mask has {done_1d.numel()} envs, but policy RNN state has {n_envs}")
+    keep = (~done_1d).to(dtype=rnn_state.dtype).reshape(1, n_envs, 1, 1, 1)
+    return (rnn_state.reshape(L, n_envs, n_agents, n_carries, H) * keep).reshape_as(rnn_state)
+
+
+def _reset_env_carry_after_done(rnn_state: torch.Tensor, done: torch.Tensor) -> torch.Tensor:
+    """Zero finished env slots in a centralized carry without mutating autograd state."""
+    done_1d = torch.as_tensor(done, device=rnn_state.device, dtype=torch.bool).reshape(-1)
+    if done_1d.numel() == 0 or not bool(done_1d.any().item()):
+        return rnn_state
+    if rnn_state.shape[1] != done_1d.numel():
+        raise ValueError(f"done mask has {done_1d.numel()} envs, but RNN state has {rnn_state.shape[1]}")
+    keep = (~done_1d).to(dtype=rnn_state.dtype).reshape(1, -1, 1, 1)
+    return rnn_state * keep
 
 
 def _flatten_env_rnn_states(rnn_states: torch.Tensor) -> torch.Tensor:
