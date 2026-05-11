@@ -724,11 +724,19 @@ def _observation_consistency(
         result["goal_state_check_error"] = repr(exc)
 
     try:
+        cfg = getattr(base_env, "cfg", None)
+        obstacle_mode = getattr(cfg, "obstacle_observation_mode", "pillars")
         pillar_xy = getattr(base_env, "_pillar_positions_xy", None)
-        if pillar_xy is not None and obs_state.shape[1] > 0:
+        if obstacle_mode == "pillars" and pillar_xy is not None and obs_state.shape[1] > 0:
             obs_xy = obs_state[..., :2]
             expected = pillar_xy.unsqueeze(0).expand(obs_xy.shape[0], -1, -1)
             result["obstacle_xy_abs_diff"] = _stats(torch.abs(obs_xy - expected))
+        elif obstacle_mode == "ray_caster" and obs_state.shape[1] > 0:
+            obs_xy = obs_state[..., :2]
+            result["ray_obstacle_xy"] = _stats(obs_xy)
+            result["ray_obstacle_distance"] = _stats(
+                torch.linalg.vector_norm(obs_xy - agent_state[:, :1, :2], dim=-1)
+            )
     except Exception as exc:
         result["obstacle_state_check_error"] = repr(exc)
     return result

@@ -979,9 +979,16 @@ class DGPPOAgent(Agent):
             return align_safety_cost_heads(fallback, n_constraints)
 
         default_pillar_top_z = float(getattr(cfg, "arena_min")[2]) + float(getattr(cfg, "pillar_height", 0.0))
+        pillar_xy = getattr(base_env, "_pillar_positions_xy", None)
+        if pillar_xy is not None:
+            physical_obs_state = agent_state.new_zeros(agent_state.shape[0], pillar_xy.shape[0], agent_state.shape[-1])
+            physical_obs_state[:, :, :2] = pillar_xy.unsqueeze(0).expand(agent_state.shape[0], -1, -1)
+        else:
+            physical_obs_state = obs_state
+
         costs = compute_pos_tracking_safety_costs(
             agent_state=agent_state,
-            obs_state=obs_state,
+            obs_state=physical_obs_state,
             arena_min=getattr(base_env, "_arena_min_safe", getattr(base_env, "_arena_min", getattr(cfg, "arena_min"))),
             arena_max=getattr(base_env, "_arena_max_safe", getattr(base_env, "_arena_max", getattr(cfg, "arena_max"))),
             collision_altitude=float(getattr(cfg, "collision_altitude")),

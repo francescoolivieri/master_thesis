@@ -11,6 +11,7 @@ from isaaclab.assets import Articulation, ArticulationData
 from isaaclab.envs import DirectRLEnv
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.sensors import TiledCamera
+from isaaclab.sensors.ray_caster import MultiMeshRayCaster, MultiMeshRayCasterCfg, patterns
 from isaaclab.sensors.camera.utils import save_images_to_file
 from isaaclab.utils import math as math_utils
 import isaacsim.core.utils.prims as prim_utils
@@ -52,6 +53,14 @@ class PosTrackingEnv(DirectRLEnv):
     DONE_REASON_MAP = DONE_REASON_LABELS
 
     def __init__(self, cfg: PosTrackingEnvCfg, **kwargs) -> None:
+        valid_obstacle_modes = {"pillars", "ray_caster", "none"}
+        if cfg.obstacle_observation_mode not in valid_obstacle_modes:
+            raise ValueError(
+                f"Unsupported obstacle_observation_mode '{cfg.obstacle_observation_mode}'. "
+                f"Expected one of {sorted(valid_obstacle_modes)}."
+            )
+        if cfg.enable_obstacle_observations and cfg.obstacle_observation_mode == "ray_caster":
+            cfg.enable_ray_caster = True
         cfg.observation_space = self._compute_obs_dim(cfg)
         cfg.state_space = cfg.observation_space
 
@@ -71,9 +80,12 @@ class PosTrackingEnv(DirectRLEnv):
             self._cam_origin = None
             self._cam_line = None
 
+        self._ray_caster_cfg = self._make_ray_caster_cfg(cfg) if cfg.enable_ray_caster else None
+
         super().__init__(cfg, **kwargs)
 
         self._camera = self.scene.sensors.get("robot_camera") if self.cfg.enable_cameras else None
+        self._ray_caster = self.scene.sensors.get("lidar_ray_caster") if self.cfg.enable_ray_caster else None
         self._camera_save_stride = 1
         if self._camera_cfg is not None:
             update_period = float(getattr(self._camera_cfg, "update_period", 0.0))
@@ -135,11 +147,14 @@ class PosTrackingEnv(DirectRLEnv):
         self._pillar_collision_radius = float(self.cfg.pillar_radius + self.cfg.drone_collision_radius)
         self._pillar_top_z = float(self.cfg.arena_min[2] + self.cfg.pillar_height)
         if len(self.cfg.pillar_positions_xy) > 0:
-            self._pillar_positions_xy = torch.tensor(self.cfg.pillar_positions_xy, device=self.device, dtype=torch.float32)
+            self._pillar_positions_xy = torch.tensor(
+                self.cfg.pillar_positions_xy, device=self.device, dtype=torch.float32
+            )
         else:
             self._pillar_positions_xy = torch.zeros((0, 2), device=self.device, dtype=torch.float32)
         self._num_pillars = int(self._pillar_positions_xy.shape[0])
         self._reference_pillar_clearance = float(self._pillar_collision_radius + self.cfg.reference_obstacle_clearance)
+        self._num_obstacle_obs = self._compute_obstacle_obs_count(self.cfg)
 
         self._ref_pos_min = torch.tensor(self.cfg.ref_pos_min, device=self.device, dtype=torch.float32)
         self._ref_pos_max = torch.tensor(self.cfg.ref_pos_max, device=self.device, dtype=torch.float32)
@@ -187,6 +202,10 @@ class PosTrackingEnv(DirectRLEnv):
             cam_cfg = self._camera_cfg
             cam_cfg.prim_path = f"{self.scene.env_regex_ns}/Robot/body/fpv_camera"
             self.scene.sensors["robot_camera"] = TiledCamera(cam_cfg)
+
+        if self.cfg.enable_ray_caster and self._ray_caster_cfg is not None:
+            self._ray_caster_cfg.prim_path = f"{self.scene.env_regex_ns}/Robot/body"
+            self.scene.sensors["lidar_ray_caster"] = MultiMeshRayCaster(self._ray_caster_cfg)
 
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
@@ -263,8 +282,12 @@ class PosTrackingEnv(DirectRLEnv):
         # Goal state: pos only (3) — vel is always zero, omitted
         goal_pos = self._reference_pos                          # (E, 3)
 
-        # Obstacle state: xy only, flattened — vel/z always zero, omitted
-        if self._num_pillars > 0:
+        # Obstacle state: xy only, flattened — vel/z always zero, omitted.
+        if not self.cfg.enable_obstacle_observations or self.cfg.obstacle_observation_mode == "none":
+            obstacle_xy_flat = agent_pos.new_empty(self.num_envs, 0)
+        elif self.cfg.obstacle_observation_mode == "ray_caster":
+            obstacle_xy_flat = self._get_ray_caster_obstacle_xy(env_origins, agent_pos).reshape(self.num_envs, -1)
+        elif self._num_pillars > 0:
             obstacle_xy_flat = (
                 self._pillar_positions_xy.unsqueeze(0).expand(self.num_envs, -1, -1)
                 .reshape(self.num_envs, -1)
@@ -443,12 +466,12 @@ class PosTrackingEnv(DirectRLEnv):
         """Return the layout of the flat policy-obs vector for graph construction."""
         agent_end = self._GRAPH_STATE_DIM              # 6
         goal_end  = agent_end + 3                      # 9  (goal pos only)
-        obstacles_end   = goal_end  + self._num_pillars * 2  # 9 + O*2
+        obstacles_end   = goal_end  + self._num_obstacle_obs * 2  # 9 + O*2
         
         return {
             "state_dim"   : self._GRAPH_STATE_DIM,
             "n_agents"    : self.num_agents,
-            "n_obstacles" : self._num_pillars,
+            "n_obstacles" : self._num_obstacle_obs,
             "agent_end"   : agent_end,
             "goal_end"    : goal_end,
             "obstacles_end"     : obstacles_end,
@@ -457,7 +480,92 @@ class PosTrackingEnv(DirectRLEnv):
     @staticmethod
     def _compute_obs_dim(cfg: PosTrackingEnvCfg) -> int:
         # agent (pos3 + vel3) + goal pos (3) + obstacle xy flat (O * 2)
-        return 6 + 3 + len(cfg.pillar_positions_xy) * 2
+        return 6 + 3 + PosTrackingEnv._compute_obstacle_obs_count(cfg) * 2
+
+    @staticmethod
+    def _compute_obstacle_obs_count(cfg: PosTrackingEnvCfg) -> int:
+        if not cfg.enable_obstacle_observations or cfg.obstacle_observation_mode == "none":
+            return 0
+        if cfg.obstacle_observation_mode == "ray_caster":
+            return max(0, int(cfg.ray_caster_top_k_hits))
+        if cfg.obstacle_observation_mode == "pillars" and cfg.enable_pillars:
+            return len(cfg.pillar_positions_xy)
+        return 0
+
+    @staticmethod
+    def _make_ray_caster_cfg(cfg: PosTrackingEnvCfg) -> MultiMeshRayCasterCfg:
+        horizontal_span = float(cfg.ray_caster_horizontal_fov_range[1] - cfg.ray_caster_horizontal_fov_range[0])
+        num_rays = max(1, int(cfg.ray_caster_num_rays))
+        full_circle = abs(abs(horizontal_span) - 360.0) < 1e-6
+        horizontal_res = abs(horizontal_span) / (num_rays if full_circle else max(1, num_rays - 1))
+        mesh_targets: list[MultiMeshRayCasterCfg.RaycastTargetCfg] = []
+        if cfg.enable_walls:
+            mesh_targets.append(
+                MultiMeshRayCasterCfg.RaycastTargetCfg(
+                    prim_expr="{ENV_REGEX_NS}/Walls/Wall.*",
+                    is_shared=True,
+                    track_mesh_transforms=False,
+                )
+            )
+        if cfg.enable_pillars and len(cfg.pillar_positions_xy) > 0:
+            mesh_targets.append(
+                MultiMeshRayCasterCfg.RaycastTargetCfg(
+                    prim_expr="{ENV_REGEX_NS}/Pillars/Pillar.*",
+                    is_shared=True,
+                    track_mesh_transforms=False,
+                )
+            )
+        if not mesh_targets:
+            mesh_targets.append(
+                MultiMeshRayCasterCfg.RaycastTargetCfg(
+                    prim_expr=cfg.terrain.prim_path,
+                    is_shared=True,
+                    track_mesh_transforms=False,
+                )
+            )
+
+        return MultiMeshRayCasterCfg(
+            prim_path="/World/envs/env_.*/Robot/body",
+            update_period=0.0,
+            offset=MultiMeshRayCasterCfg.OffsetCfg(pos=cfg.ray_caster_offset),
+            mesh_prim_paths=mesh_targets,
+            ray_alignment="yaw",
+            pattern_cfg=patterns.LidarPatternCfg(
+                channels=max(1, int(cfg.ray_caster_channels)),
+                vertical_fov_range=cfg.ray_caster_vertical_fov_range,
+                horizontal_fov_range=cfg.ray_caster_horizontal_fov_range,
+                horizontal_res=horizontal_res,
+            ),
+            max_distance=float(cfg.ray_caster_max_distance),
+            debug_vis=bool(cfg.ray_caster_debug_vis),
+        )
+
+    def _get_ray_caster_obstacle_xy(self, env_origins: torch.Tensor, agent_pos: torch.Tensor) -> torch.Tensor:
+        top_k = max(0, int(self.cfg.ray_caster_top_k_hits))
+        if top_k == 0:
+            return agent_pos.new_empty(self.num_envs, 0, 2)
+        fallback_xy = agent_pos[:, :2] + agent_pos.new_tensor([float(self.cfg.ray_caster_no_hit_distance), 0.0])
+        if self._ray_caster is None:
+            return fallback_xy.unsqueeze(1).expand(-1, top_k, -1)
+
+        hits_w = self._ray_caster.data.ray_hits_w
+        sensor_pos_w = self._ray_caster.data.pos_w
+        finite_hits = torch.isfinite(hits_w).all(dim=-1)
+        hit_dist = torch.norm(hits_w - sensor_pos_w.unsqueeze(1), dim=-1)
+        valid_hits = finite_hits & (hit_dist <= float(self.cfg.ray_caster_max_distance))
+
+        sort_dist = torch.where(valid_hits, hit_dist, torch.full_like(hit_dist, float("inf")))
+        k = min(top_k, sort_dist.shape[1])
+        _, hit_idx = torch.topk(sort_dist, k=k, dim=1, largest=False)
+        gather_idx = hit_idx.unsqueeze(-1).expand(-1, -1, 2)
+        hit_xy = torch.gather(hits_w[..., :2], 1, gather_idx) - env_origins[:, None, :2]
+        hit_valid = torch.gather(valid_hits, 1, hit_idx).unsqueeze(-1)
+        hit_xy = torch.where(hit_valid, hit_xy, fallback_xy[:, None, :].expand(-1, k, -1))
+
+        if k == top_k:
+            return hit_xy
+        padding = fallback_xy[:, None, :].expand(-1, top_k - k, -1)
+        return torch.cat([hit_xy, padding], dim=1)
 
     def _build_action_wrapper(self):
         def passthrough(td: TensorDict) -> torch.Tensor:
@@ -609,7 +717,11 @@ class PosTrackingEnv(DirectRLEnv):
                 nearest_pillars = self._pillar_positions_xy[nearest_idx]
                 vectors = pos[colliding, :2] - nearest_pillars
                 norms = torch.norm(vectors, dim=1, keepdim=True)
-                unit = torch.where(norms > 1e-6, vectors / norms.clamp_min(1e-6), default_dirs.expand(vectors.shape[0], -1))
+                unit = torch.where(
+                    norms > 1e-6,
+                    vectors / norms.clamp_min(1e-6),
+                    default_dirs.expand(vectors.shape[0], -1),
+                )
                 projected = nearest_pillars + unit * safe_radius
                 pos[colliding, :2] = torch.clamp(projected, min=low[:2], max=high[:2])
 
@@ -623,7 +735,8 @@ class PosTrackingEnv(DirectRLEnv):
                 safe_candidates = candidate_xy[torch.all(candidate_dxy > safety_radius, dim=1)]
                 if safe_candidates.shape[0] == 0:
                     raise RuntimeError(
-                        "Reference sampling failed: no feasible XY location satisfies pillar clearance in current bounds."
+                        "Reference sampling failed: no feasible XY location satisfies pillar clearance in current "
+                        "bounds."
                     )
                 count = int(final_colliding.sum().item())
                 pick_idx = torch.randint(0, safe_candidates.shape[0], (count,), device=self.device)

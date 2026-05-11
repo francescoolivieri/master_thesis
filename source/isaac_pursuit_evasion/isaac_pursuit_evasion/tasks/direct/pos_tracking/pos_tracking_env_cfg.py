@@ -106,6 +106,20 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     flag_penalize_linvel: bool = False
     flag_action_smoothness_penalty: bool = False
     enable_obstacle_observations: bool = True
+    obstacle_observation_mode: Literal["pillars", "ray_caster", "none"] = "pillars"
+
+    # Ray-caster / LiDAR observations. Set obstacle_observation_mode="ray_caster"
+    # to feed the nearest ray hits to the policy and DG-PPO graph builder.
+    enable_ray_caster: bool = False
+    ray_caster_top_k_hits: int = 8
+    ray_caster_num_rays: int = 32
+    ray_caster_max_distance: float = 8.0
+    ray_caster_no_hit_distance: float = 9.0
+    ray_caster_channels: int = 1
+    ray_caster_vertical_fov_range: tuple[float, float] = (0.0, 0.0)
+    ray_caster_horizontal_fov_range: tuple[float, float] = (-180.0, 180.0)
+    ray_caster_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    ray_caster_debug_vis: bool = False
 
     # Camera flags
     enable_cameras: bool = False
