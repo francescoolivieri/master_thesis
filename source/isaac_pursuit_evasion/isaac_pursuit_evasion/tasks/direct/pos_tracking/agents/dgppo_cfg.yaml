@@ -6,29 +6,41 @@ agent:
   # DGPPO-specific
   alpha:        10.0    # CBF class-K multiplier
   cbf_eps:      0.01    # CBF slack (h >= -eps is "safe enough")
-  cbf_weight:   1.0     # weight on the CBF penalty term
-  cbf_schedule: false    # linearly increase cbf_weight during training
+  cbf_weight:   0.5     # weight on the CBF penalty term
+  cbf_schedule: false   
+
+  # Graph / observation radius for graph builder
+  obs_radius: 8.0
 
   # PPO / GAE
-  discount_factor:  0.995
-  gae_lambda:           0.95
   rollouts:         16       # steps collected per update (per env)
   learning_epochs:  4
-  learning_starts:  0
   mini_batches:     8
-  ratio_clip:       0.2
-  entropy_loss_scale: 0.01
-  vl_loss_scale:    1.0
-  vh_loss_scale:    1.0
-  grad_norm_clip:   2.0
+
+  discount_factor:  0.995
+  gae_lambda:           0.95
+  bootstrap_on_truncated: true
 
   # Learning rates
   lr_policy: 2.0e-4
   lr_vl:     1.0e-3
   lr_vh:     1.0e-3
+  # TODO: add scheduler (KLAdaptiveLR)
 
-  # Graph / observation radius for graph builder
-  obs_radius: 10.0
+
+  # TODO: add observation and value preprocessor
+
+
+  learning_starts:  0
+  
+  ratio_clip:       0.2
+  grad_norm_clip:   2.0
+  # TODO: add value_clip
+
+  entropy_loss_scale: 0.01
+  vl_loss_scale:    1.0
+  vh_loss_scale:    1.0
+  
 
   # RNN
   use_rnn: true
@@ -57,6 +69,9 @@ agent:
     std_dev_init: 0.5
     std_dev_min: 1.0e-5
 
+  # TODO: add activations selection to the relevant models (ex. elu,relu, etc.)
+
+  
   # Live-training diagnostics. This branch is intentionally debug-heavy:
   # JSONL events are written under each run's dgppo_debug/ directory.
   debug:

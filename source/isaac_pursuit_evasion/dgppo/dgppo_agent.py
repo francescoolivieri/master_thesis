@@ -44,6 +44,7 @@ class DGPPOAgentCfg(AgentCfg):
 
     discount_factor: float = 0.99
     gae_lambda: float = 0.95
+    bootstrap_on_truncated: bool = False
     learning_starts: int = 0
     rollouts: int = 32
     rnn_step: int = 16
@@ -148,6 +149,7 @@ class DGPPOAgentCfg(AgentCfg):
             cbf_schedule=bool(raw.get("cbf_schedule", True)),
             discount_factor=float(raw.get("discount_factor", 0.99)),
             gae_lambda=float(raw.get("gae_lambda", raw.get("lambda", 0.95))),
+            bootstrap_on_truncated=bool(raw.get("bootstrap_on_truncated", False)),
             learning_starts=int(raw.get("learning_starts", 0)),
             rollouts=int(raw.get("rollouts", 32)),
             rnn_step=int(raw.get("rnn_step", 16)),
@@ -612,7 +614,7 @@ class DGPPOAgent(Agent):
             # DGPPO DEBUG FIX START: stochastic rollout-boundary masks.
             T_terminated=view["bT_terminated"],
             T_truncated=view["bT_truncated"],
-            bootstrap_on_truncated=False,
+            bootstrap_on_truncated=self.bootstrap_on_truncated,
             # DGPPO DEBUG FIX END: stochastic rollout-boundary masks.
         )
 
@@ -626,7 +628,7 @@ class DGPPOAgent(Agent):
             # DGPPO DEBUG FIX START: deterministic rollout-boundary masks.
             T_terminated=det_view["bT_terminated"],
             T_truncated=det_view["bT_truncated"],
-            bootstrap_on_truncated=False,
+            bootstrap_on_truncated=self.bootstrap_on_truncated,
             # DGPPO DEBUG FIX END: deterministic rollout-boundary masks.
         )
 
@@ -843,6 +845,7 @@ class DGPPOAgent(Agent):
     def load_dgppo_hyperparameters(self) -> None:
         self.gamma: float = float(self.cfg.get("discount_factor", 0.99))
         self.gae_lambda: float = float(self.cfg.get("gae_lambda", self.cfg.get("lambda", 0.95)))
+        self.bootstrap_on_truncated: bool = bool(self.cfg.get("bootstrap_on_truncated", False))
         self.learning_starts: int = int(self.cfg.get("learning_starts", 0))
         self.rollouts: int = int(self.cfg.get("rollouts", 32))
         self.rnn_step: int = int(self.cfg.get("rnn_step", min(16, self.rollouts)))

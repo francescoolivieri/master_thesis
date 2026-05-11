@@ -94,6 +94,7 @@ class DGPPOTrainingDiagnostics:
                 "rnn_step": int(agent.rnn_step),
                 "gamma": float(agent.gamma),
                 "gae_lambda": float(agent.gae_lambda),
+                "bootstrap_on_truncated": bool(getattr(agent, "bootstrap_on_truncated", False)),
                 "clip_eps": float(agent.clip_eps),
                 "alpha": float(agent.alpha),
                 "cbf_eps": float(agent.cbf_eps),
