@@ -604,6 +604,8 @@ class DGPPOAgent(Agent):
         det_view = self.memory.as_bTah_view("det")
 
         # Compute returns and advantages.
+        # ``as_bTah_view`` already converts environment rewards to the low-level
+        # DG-PPO cost convention used by the JAX reference: l(s_t) = -reward_t.
         _Qh_stc, Ql = compute_dec_ocp_gae(
             Tah_hs=view["bTah_hs"],
             T_l=view["bT_l"],

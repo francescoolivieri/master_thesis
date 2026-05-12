@@ -28,8 +28,10 @@ class DecStateFn(nn.Module):
         self.rnn = rnn
         self.n_out = n_out
 
-        # final projection
-        self.value_out = nn.Linear(mlp.hid_sizes[-1], n_out)
+        # Final projection consumes the RNN output when recurrence is enabled,
+        # otherwise it consumes the MLP output directly.
+        value_in_dim = rnn.hidden_size if rnn is not None else mlp.hid_sizes[-1]
+        self.value_out = nn.Linear(value_in_dim, n_out)
         nn.init.orthogonal_(self.value_out.weight)
         nn.init.zeros_(self.value_out.bias)
 
@@ -60,7 +62,8 @@ class RStateFn(nn.Module):
         self.rnn = rnn
         self.n_out = n_out
 
-        self.value_out = nn.Linear(mlp.hid_sizes[-1], n_out)
+        value_in_dim = rnn.hidden_size if rnn is not None else mlp.hid_sizes[-1]
+        self.value_out = nn.Linear(value_in_dim, n_out)
         nn.init.orthogonal_(self.value_out.weight)
         nn.init.zeros_(self.value_out.bias)
 

@@ -4,9 +4,9 @@ seed: 42
 agent:
 
   # DGPPO-specific
-  alpha:        10.0    # CBF class-K multiplier
+  alpha:        15    # CBF class-K multiplier
   cbf_eps:      0.01    # CBF slack (h >= -eps is "safe enough")
-  cbf_weight:   0.5     # weight on the CBF penalty term
+  cbf_weight:   0.75     # weight on the CBF penalty term
   cbf_schedule: false   
 
   # Graph / observation radius for graph builder
@@ -19,7 +19,7 @@ agent:
 
   discount_factor:  0.995
   gae_lambda:           0.95
-  bootstrap_on_truncated: true
+  bootstrap_on_truncated: false
 
   # Learning rates
   lr_policy: 2.0e-4
