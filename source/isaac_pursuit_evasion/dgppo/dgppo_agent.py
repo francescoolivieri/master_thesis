@@ -55,6 +55,7 @@ class DGPPOAgentCfg(AgentCfg):
     vl_loss_scale: float = 1.0
     vh_loss_scale: float = 1.0
     grad_norm_clip: float = 2.0
+    rewards_shaper_scale: float = 1.0
 
     lr_policy: float = 3e-4
     lr_vl: float = 1e-3
@@ -160,6 +161,7 @@ class DGPPOAgentCfg(AgentCfg):
             vl_loss_scale=float(raw.get("vl_loss_scale", 1.0)),
             vh_loss_scale=float(raw.get("vh_loss_scale", 1.0)),
             grad_norm_clip=float(raw.get("grad_norm_clip", 2.0)),
+            rewards_shaper_scale=float(raw.get("rewards_shaper_scale", raw.get("reward_scale", 1.0))),
             lr_policy=float(raw.get("lr_policy", 3e-4)),
             lr_vl=float(raw.get("lr_vl", 1e-3)),
             lr_vh=float(raw.get("lr_vh", 1e-3)),
@@ -455,6 +457,8 @@ class DGPPOAgent(Agent):
             agent_state, goal_state, obs_state = self._extract_graph_states(observations)
             actions = actions.reshape(n_envs, n_agents, action_dim)
             rewards = rewards.reshape(n_envs)
+            if self.rewards_shaper_scale != 1.0:
+                rewards = rewards * self.rewards_shaper_scale
             # DGPPO DEBUG FIX START: canonical live episode-boundary masks.
             terminated_1d = self._env_done_mask(terminated, n_envs)
             truncated_1d = self._env_done_mask(truncated, n_envs)
@@ -649,8 +653,18 @@ class DGPPOAgent(Agent):
             bT_done=view["bT_done"],
         )
         bTa_A = adv_info["bTa_A"].detach()
+        vl_error = Ql - view["bT_Vl"]
         self.track_data("DGPPO/safe_rate", float(adv_info["bTa_is_safe"].float().mean().item()))
         self.track_data("DGPPO/adv_raw_mean", float(adv_info["bT_Al_raw"].mean().item()))
+        self.track_data("DGPPO/low_level_cost_mean", float(view["bT_l"].mean().item()))
+        self.track_data("DGPPO/ql_mean", float(Ql.mean().item()))
+        self.track_data("DGPPO/ql_abs_max", float(Ql.abs().max().item()))
+        self.track_data("DGPPO/vl_rollout_mean", float(view["bT_Vl"].mean().item()))
+        self.track_data("DGPPO/vl_target_error_mean", float(vl_error.mean().item()))
+        self.track_data("DGPPO/vl_target_error_abs_mean", float(vl_error.abs().mean().item()))
+        self.track_data("DGPPO/rollout_terminated_rate", float(view["bT_terminated"].float().mean().item()))
+        self.track_data("DGPPO/rollout_truncated_rate", float(view["bT_truncated"].float().mean().item()))
+        self.track_data("DGPPO/bootstrap_on_truncated", float(self.bootstrap_on_truncated))
 
         graph = build_rollout_graph(view=view, obs_radius=self.obs_radius)
         det_graph = build_rollout_graph(view=det_view, obs_radius=self.obs_radius)
@@ -710,6 +724,7 @@ class DGPPOAgent(Agent):
         update_summary = {
             "loss_policy": float((loss_p_acc * inv_n).item()),
             "loss_value_l": float((loss_vl_acc * inv_n).item()),
+            "loss_value_l_rmse": float(torch.sqrt((2.0 * loss_vl_acc * inv_n).clamp_min(0.0)).item()),
             "loss_value_h": float((loss_vh_acc * inv_n).item()),
             "clip_frac": float((clipfrac_acc * inv_n).item()),
             "lr_policy": float(self._policy_opt.param_groups[0]["lr"]),
@@ -718,6 +733,7 @@ class DGPPOAgent(Agent):
         }
         self.track_data("DGPPO/loss_policy", update_summary["loss_policy"])
         self.track_data("DGPPO/loss_value_l", update_summary["loss_value_l"])
+        self.track_data("DGPPO/loss_value_l_rmse", update_summary["loss_value_l_rmse"])
         self.track_data("DGPPO/loss_value_h", update_summary["loss_value_h"])
         self.track_data("DGPPO/clip_frac", update_summary["clip_frac"])
         self.track_data("DGPPO/lr_policy", float(self._policy_opt.param_groups[0]["lr"]))
@@ -866,6 +882,9 @@ class DGPPOAgent(Agent):
         self.lr_policy: float = float(self.cfg.get("lr_policy", 3e-4))
         self.lr_vl: float = float(self.cfg.get("lr_vl", 1e-3))
         self.lr_vh: float = float(self.cfg.get("lr_vh", 1e-3))
+        self.rewards_shaper_scale: float = float(
+            self.cfg.get("rewards_shaper_scale", self.cfg.get("reward_scale", 1.0))
+        )
 
     def _cbf_scale(self, *, timestep: int, timesteps: int) -> float:
         """Piecewise-constant CBF weight schedule."""

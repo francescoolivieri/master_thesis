@@ -57,6 +57,15 @@ To change yaw tracking or reference update behavior, edit:
 source/isaac_pursuit_evasion/isaac_pursuit_evasion/tasks/direct/pos_tracking/pos_tracking_env_cfg.py
 ```
 
+### Ray observations and DG-PPO safety
+PPO ray sensing is configured in `agents/skrl_ppo_cfg.yaml` and uses fixed ray-order hit slots, which is the stable
+MLP-friendly layout. DG-PPO opts into top-k ray hit graph nodes from:
+```
+source/isaac_pursuit_evasion/isaac_pursuit_evasion/tasks/direct/pos_tracking/agents/dgppo_cfg.yaml
+```
+The same DG-PPO config disables reward safety penalties and early safety termination, and uses a generic ray-obstacle
+safety cost head instead of per-pillar hidden-geometry heads.
+
 ---
 
 ## Benchmarking

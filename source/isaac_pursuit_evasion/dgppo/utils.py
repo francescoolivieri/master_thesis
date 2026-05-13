@@ -196,13 +196,15 @@ def compute_pos_tracking_safety_costs(
     collision_altitude: float,
     pillar_collision_radius: float,
     pillar_top_z: float,
-    eps: float = 1e-3,
+    eps: float = 5e-1,
+    obstacle_cost_mode: str = "per_obstacle",
 ) -> torch.Tensor:
     """Signed DG-PPO costs for Crazyflie position tracking.
 
-    The returned heads are ``[arena_bounds, pillar_0, ..., pillar_N]``. Costs
-    are positive when unsafe and negative when safe, following the JAX DG-PPO
-    environment convention.
+    The default returned heads are ``[arena_bounds, obstacle_0, ..., obstacle_N]``.
+    With ``obstacle_cost_mode="nearest_obstacle"``, obstacle costs are reduced to
+    one generic closest-obstacle head. Costs are positive when unsafe and
+    negative when safe, following the JAX DG-PPO environment convention.
     """
     if agent_state.ndim != 3:
         raise ValueError(f"agent_state must have shape [E, A, S], got {tuple(agent_state.shape)}")
@@ -219,6 +221,9 @@ def compute_pos_tracking_safety_costs(
     upper_violation = pos - arena_max_t.view(1, 1, 3)
     boundary_cost = torch.maximum(lower_violation, upper_violation).amax(dim=-1, keepdim=True)
 
+    if obstacle_cost_mode not in {"per_obstacle", "nearest_obstacle"}:
+        raise ValueError(f"Unsupported obstacle_cost_mode: {obstacle_cost_mode}")
+
     if obs_state.numel() == 0 or obs_state.shape[1] == 0:
         raw_costs = boundary_cost
     else:
@@ -227,14 +232,17 @@ def compute_pos_tracking_safety_costs(
         dxy = torch.linalg.vector_norm(agent_xy - pillar_xy, dim=-1)
         radial_cost = torch.as_tensor(pillar_collision_radius, device=device, dtype=dtype) - dxy
 
-        z = pos[..., 2]
-        z_min = arena_min_t[2]
-        z_max = torch.as_tensor(pillar_top_z, device=device, dtype=dtype)
-        inside_height = (z >= z_min) & (z <= z_max)
-        vertical_clearance = torch.maximum(z_min - z, z - z_max).clamp_min(0.0)
-        inactive_height_cost = -vertical_clearance.clamp_min(float(eps))
-        pillar_cost = torch.where(inside_height[..., None], radial_cost, inactive_height_cost[..., None])
-        raw_costs = torch.cat([boundary_cost, pillar_cost], dim=-1)
+        if obstacle_cost_mode == "nearest_obstacle":
+            obstacle_cost = radial_cost.max(dim=-1, keepdim=True).values
+        else:
+            z = pos[..., 2]
+            z_min = arena_min_t[2]
+            z_max = torch.as_tensor(pillar_top_z, device=device, dtype=dtype)
+            inside_height = (z >= z_min) & (z <= z_max)
+            vertical_clearance = torch.maximum(z_min - z, z - z_max).clamp_min(0.0)
+            inactive_height_cost = -vertical_clearance.clamp_min(float(eps))
+            obstacle_cost = torch.where(inside_height[..., None], radial_cost, inactive_height_cost[..., None])
+        raw_costs = torch.cat([boundary_cost, obstacle_cost], dim=-1)
 
     return _signed_clipped_cost(raw_costs, eps=eps).reshape(E, A, -1)
 

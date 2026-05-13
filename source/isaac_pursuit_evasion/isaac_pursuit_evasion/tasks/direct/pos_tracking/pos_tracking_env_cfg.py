@@ -105,16 +105,21 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     flag_yaw_tracking: bool = False
     flag_penalize_linvel: bool = False
     flag_action_smoothness_penalty: bool = False
+    include_yaw_in_observations: bool = False
+    include_yaw_with_ray_caster: bool = True
     enable_obstacle_observations: bool = True
-    obstacle_observation_mode: Literal["pillars", "ray_caster", "none"] = "pillars"
+    obstacle_observation_mode: Literal["pillars", "ray_caster", "none"] = "ray_caster"
+    safety_obstacle_source: Literal["auto", "geometry", "ray_caster", "none"] = "auto"
 
     # Ray-caster / LiDAR observations. Set obstacle_observation_mode="ray_caster"
     # to feed the nearest ray hits to the policy and DG-PPO graph builder.
     enable_ray_caster: bool = False
+    ray_caster_observation_mode: Literal["ray_ordered_hits", "top_k_hits"] = "ray_ordered_hits"
     ray_caster_top_k_hits: int = 8
     ray_caster_num_rays: int = 32
     ray_caster_max_distance: float = 8.0
     ray_caster_no_hit_distance: float = 9.0
+    ray_caster_safety_distance: float = 0.0  # <= 0 uses drone_collision_radius
     ray_caster_channels: int = 1
     ray_caster_vertical_fov_range: tuple[float, float] = (0.0, 0.0)
     ray_caster_horizontal_fov_range: tuple[float, float] = (-180.0, 180.0)
@@ -152,12 +157,14 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     reward_crash: float = 10.0
     reward_out_of_bounds: float = 10.0
     reward_pillar_collision: float = 10.0
+    include_safety_penalties_in_reward: bool = True
 
     # Success criteria
     pos_tolerance: float = 0.15
     yaw_tolerance: float = 0.25
     success_hold_time_s: float = 1.0 # prev: 0.5
     terminate_on_success: bool = True
+    terminate_on_safety_violation: bool = True
 
     total_timesteps = episode_length_s * sim_frequency
 

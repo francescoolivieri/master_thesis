@@ -834,6 +834,36 @@ def _log_agent_preprocessors(agent: Any, agent_cfg: dict) -> None:
     print(f"[INFO] Agent preprocessor runtime (value): {_describe(value_pre)}")
 
 
+def _as_plain_container(value: Any) -> Any:
+    if isinstance(value, DictConfig):
+        return OmegaConf.to_container(value, resolve=True)
+    return value
+
+
+def _apply_env_overrides_from_agent_cfg(env_cfg: Any, agent_cfg: Any) -> None:
+    cfg = _as_plain_container(agent_cfg)
+    if not isinstance(cfg, Mapping):
+        return
+    env_overrides = cfg.get("env", cfg.get("environment", None))
+    env_overrides = _as_plain_container(env_overrides)
+    if not isinstance(env_overrides, Mapping) or not env_overrides:
+        return
+
+    applied: list[str] = []
+    for key, value in env_overrides.items():
+        if key.startswith("_"):
+            continue
+        value = _as_plain_container(value)
+        if not hasattr(env_cfg, key):
+            print(f"[WARN] Ignoring agent env override '{key}': env config has no such attribute.")
+            continue
+        setattr(env_cfg, key, value)
+        applied.append(key)
+
+    if applied:
+        print(f"[INFO] Applied agent env overrides: {', '.join(sorted(applied))}")
+
+
 def _find_checkpoint_path(checkpoint_dir: Path, target_step: int) -> tuple[Optional[Path], Optional[int]]:
     if target_step <= 0:
         return None, None
@@ -1113,6 +1143,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.enable_evader_cameras = False
     if args_cli.domain_randomization is not None and hasattr(env_cfg, "domain_randomization"):
         env_cfg.domain_randomization.enable = bool(args_cli.domain_randomization)
+    _apply_env_overrides_from_agent_cfg(env_cfg, agent_cfg)
             
     # randomly sample a seed if seed = -1
     if args_cli.seed == -1:

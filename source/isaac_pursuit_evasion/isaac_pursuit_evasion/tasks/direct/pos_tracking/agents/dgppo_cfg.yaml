@@ -1,5 +1,16 @@
 seed: 42
 
+# Environment overrides consumed by scripts/skrl/train.py before gym.make(...).
+env:
+  obstacle_observation_mode: ray_caster
+  enable_obstacle_observations: true
+  enable_ray_caster: true
+  ray_caster_observation_mode: top_k_hits
+  safety_obstacle_source: ray_caster
+  include_yaw_with_ray_caster: true
+  include_safety_penalties_in_reward: false
+  terminate_on_safety_violation: false
+
 # - DG-PPO hyper-parameters, consumed by DGPPOAgentCfg / DGPPOAgent / DGPPORunner
 agent:
 
@@ -29,6 +40,10 @@ agent:
 
 
   # TODO: add observation and value preprocessor
+  # The custom DG-PPO runner does not use skrl tensor preprocessors yet; keep
+  # the low-level value target scale manageable by shaping rewards before
+  # storing them as l = -reward in the rollout memory.
+  rewards_shaper_scale: 0.1
 
 
   learning_starts:  0
@@ -75,7 +90,7 @@ agent:
   # Live-training diagnostics. This branch is intentionally debug-heavy:
   # JSONL events are written under each run's dgppo_debug/ directory.
   debug:
-    enabled: true
+    enabled: false
     step_interval: 10
     update_interval: 1
     minibatch_interval: 1

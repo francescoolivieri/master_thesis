@@ -26,7 +26,7 @@ from source.isaac_pursuit_evasion.controllers.rl_controllers import (
     CrazyflieRLBodyRatesWrapper,
     CrazyflieRLVelocityWrapper,
 )
-from source.isaac_pursuit_evasion.dgppo.utils import compute_pos_tracking_safety_costs
+from source.isaac_pursuit_evasion.dgppo.utils import align_safety_cost_heads, compute_pos_tracking_safety_costs
 from source.isaac_pursuit_evasion.dynamics.propellers import Drone_cfg, Propellers
 
 from .pos_tracking_env_cfg import PosTrackingEnvCfg
@@ -59,7 +59,22 @@ class PosTrackingEnv(DirectRLEnv):
                 f"Unsupported obstacle_observation_mode '{cfg.obstacle_observation_mode}'. "
                 f"Expected one of {sorted(valid_obstacle_modes)}."
             )
-        if cfg.enable_obstacle_observations and cfg.obstacle_observation_mode == "ray_caster":
+        valid_ray_modes = {"ray_ordered_hits", "top_k_hits"}
+        if cfg.ray_caster_observation_mode not in valid_ray_modes:
+            raise ValueError(
+                f"Unsupported ray_caster_observation_mode '{cfg.ray_caster_observation_mode}'. "
+                f"Expected one of {sorted(valid_ray_modes)}."
+            )
+        valid_safety_sources = {"auto", "geometry", "ray_caster", "none"}
+        if cfg.safety_obstacle_source not in valid_safety_sources:
+            raise ValueError(
+                f"Unsupported safety_obstacle_source '{cfg.safety_obstacle_source}'. "
+                f"Expected one of {sorted(valid_safety_sources)}."
+            )
+        safety_source = self._resolve_safety_obstacle_source_cfg(cfg)
+        if (cfg.enable_obstacle_observations and cfg.obstacle_observation_mode == "ray_caster") or (
+            safety_source == "ray_caster"
+        ):
             cfg.enable_ray_caster = True
         cfg.observation_space = self._compute_obs_dim(cfg)
         cfg.state_space = cfg.observation_space
@@ -154,6 +169,8 @@ class PosTrackingEnv(DirectRLEnv):
             self._pillar_positions_xy = torch.zeros((0, 2), device=self.device, dtype=torch.float32)
         self._num_pillars = int(self._pillar_positions_xy.shape[0])
         self._reference_pillar_clearance = float(self._pillar_collision_radius + self.cfg.reference_obstacle_clearance)
+        self._include_yaw_obs = self._use_yaw_observations_cfg(self.cfg)
+        self._graph_state_dim = self._compute_graph_state_dim(self.cfg)
         self._num_obstacle_obs = self._compute_obstacle_obs_count(self.cfg)
 
         self._ref_pos_min = torch.tensor(self.cfg.ref_pos_min, device=self.device, dtype=torch.float32)
@@ -275,9 +292,13 @@ class PosTrackingEnv(DirectRLEnv):
     def _get_observations(self) -> dict:
         env_origins = self._terrain.env_origins
 
-        # Agent state: pos (3) + vel (3)
+        # Agent state: pos (3) + vel (3) + optional yaw sin/cos (2)
         agent_pos = self._robot.data.root_pos_w - env_origins  # (E, 3)
         agent_vel = self._robot.data.root_lin_vel_w             # (E, 3)
+        agent_parts = [agent_pos, agent_vel]
+        if self._include_yaw_obs:
+            agent_parts.append(self._yaw_sin_cos(self._robot.data.root_quat_w))
+        agent_state_flat = torch.cat(agent_parts, dim=-1)
 
         # Goal state: pos only (3) — vel is always zero, omitted
         goal_pos = self._reference_pos                          # (E, 3)
@@ -295,8 +316,8 @@ class PosTrackingEnv(DirectRLEnv):
         else:
             obstacle_xy_flat = agent_pos.new_empty(self.num_envs, 0)
 
-        # Layout: [agent_pos(3), agent_vel(3), goal_pos(3), obstacle_xy(O*2)]
-        obs = torch.cat([agent_pos, agent_vel, goal_pos, obstacle_xy_flat], dim=-1)
+        # Layout: [agent_state(S), goal_pos(3), obstacle_xy(O*2)]
+        obs = torch.cat([agent_state_flat, goal_pos, obstacle_xy_flat], dim=-1)
         return {"policy": obs}
     
 
@@ -342,31 +363,18 @@ class PosTrackingEnv(DirectRLEnv):
         else:
             components["action_smoothness"] = torch.zeros_like(rewards)
 
-        crash = self._crash_mask(pos_local)
-        out_of_bounds = self._out_of_bounds_mask(pos_local)
-        if crash.any():
-            crash_pen = torch.zeros_like(rewards)
-            crash_pen[crash] = self.cfg.reward_crash
-            rewards -= crash_pen
+        crash, out_of_bounds, pillar_collision = self._safety_violation_masks(pos_local)
+        if self.cfg.include_safety_penalties_in_reward:
+            crash_pen = self._masked_penalty(rewards, crash, self.cfg.reward_crash)
+            bounds_pen = self._masked_penalty(rewards, out_of_bounds, self.cfg.reward_out_of_bounds)
+            pillar_pen = self._masked_penalty(rewards, pillar_collision, self.cfg.reward_pillar_collision)
+            rewards -= crash_pen + bounds_pen + pillar_pen
             components["crash"] = -crash_pen
-        else:
-            components["crash"] = torch.zeros_like(rewards)
-
-        if out_of_bounds.any():
-            bounds_pen = torch.zeros_like(rewards)
-            bounds_pen[out_of_bounds] = self.cfg.reward_out_of_bounds
-            rewards -= bounds_pen
             components["out_of_bounds"] = -bounds_pen
-        else:
-            components["out_of_bounds"] = torch.zeros_like(rewards)
-
-        pillar_collision = self._pillar_collision_mask(pos_local)
-        if pillar_collision.any():
-            pillar_pen = torch.zeros_like(rewards)
-            pillar_pen[pillar_collision] = self.cfg.reward_pillar_collision
-            rewards -= pillar_pen
             components["pillar_collision"] = -pillar_pen
         else:
+            components["crash"] = torch.zeros_like(rewards)
+            components["out_of_bounds"] = torch.zeros_like(rewards)
             components["pillar_collision"] = torch.zeros_like(rewards)
 
         self._last_rewards = rewards
@@ -381,27 +389,30 @@ class PosTrackingEnv(DirectRLEnv):
         # DGPPO DEBUG FIX START: keep costs current for the returned info dict.
         self._update_dgppo_costs(pos_local)
         # DGPPO DEBUG FIX END: keep costs current for the returned info dict.
-        crash = self._crash_mask(pos_local)
-        out_of_bounds = self._out_of_bounds_mask(pos_local)
-        pillar_collision = self._pillar_collision_mask(pos_local)
+        crash, out_of_bounds, pillar_collision = self._safety_violation_masks(pos_local)
         invalid = ~torch.isfinite(self._robot.data.root_state_w).all(dim=-1)
 
         success = self._update_success_flags(pos_local)
         self._last_success = success
 
-        terminated = crash | out_of_bounds | pillar_collision | invalid
+        safety_violation = crash | out_of_bounds | pillar_collision
+        terminated = invalid.clone()
+        if self.cfg.terminate_on_safety_violation:
+            terminated = terminated | safety_violation
         if self.cfg.terminate_on_success:
             terminated = terminated | success
 
         truncated = timeout & (~terminated)
 
         done_reason = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
-        done_reason[success] = 1
-        done_reason[crash] = 2
-        done_reason[out_of_bounds] = 3
-        done_reason[timeout] = 4
-        done_reason[invalid] = 5
-        done_reason[pillar_collision] = 6
+        if self.cfg.terminate_on_success:
+            done_reason[terminated & success] = 1
+        if self.cfg.terminate_on_safety_violation:
+            done_reason[terminated & crash] = 2
+            done_reason[terminated & out_of_bounds] = 3
+            done_reason[terminated & pillar_collision] = 6
+        done_reason[truncated] = 4
+        done_reason[terminated & invalid] = 5
         self._last_done_reason = done_reason
 
         return terminated, truncated
@@ -444,32 +455,37 @@ class PosTrackingEnv(DirectRLEnv):
 
 
     # Graph observation helpers (used by DGPPOAgent._build_graph)
-    _GRAPH_STATE_DIM: int = 6  # (x, y, z, vx, vy, vz)
-
     @property
     def num_agents(self) -> int:
         return 1
     
     @property
     def n_constraints(self) -> int:
-        # DGPPO DEBUG FIX START: arena-boundary head plus per-pillar heads.
-        n_constraints = 1 + self._num_pillars
-        # DGPPO DEBUG FIX END: arena-boundary head plus per-pillar heads.
-        return n_constraints
+        safety_source = self._resolve_safety_obstacle_source_cfg(self.cfg)
+        if safety_source == "ray_caster":
+            return 2
+        if safety_source == "none":
+            return 1
+        return 1 + getattr(self, "_num_pillars", len(self.cfg.pillar_positions_xy))
 
     @property
     def cost_components(self) -> tuple[str, ...]:
+        safety_source = self._resolve_safety_obstacle_source_cfg(self.cfg)
+        if safety_source == "ray_caster":
+            return ("arena_bounds", "ray_obstacle")
+        if safety_source == "none":
+            return ("arena_bounds",)
         return ("arena_bounds",) + tuple(f"pillar_{idx}" for idx in range(self._num_pillars))
 
     @property
     def graph_obs_layout(self) -> dict:
         """Return the layout of the flat policy-obs vector for graph construction."""
-        agent_end = self._GRAPH_STATE_DIM              # 6
-        goal_end  = agent_end + 3                      # 9  (goal pos only)
-        obstacles_end   = goal_end  + self._num_obstacle_obs * 2  # 9 + O*2
+        agent_end = self._graph_state_dim * self.num_agents
+        goal_end = agent_end + 3 * self.num_agents
+        obstacles_end = goal_end + self._num_obstacle_obs * 2
         
         return {
-            "state_dim"   : self._GRAPH_STATE_DIM,
+            "state_dim"   : self._graph_state_dim,
             "n_agents"    : self.num_agents,
             "n_obstacles" : self._num_obstacle_obs,
             "agent_end"   : agent_end,
@@ -479,18 +495,42 @@ class PosTrackingEnv(DirectRLEnv):
 
     @staticmethod
     def _compute_obs_dim(cfg: PosTrackingEnvCfg) -> int:
-        # agent (pos3 + vel3) + goal pos (3) + obstacle xy flat (O * 2)
-        return 6 + 3 + PosTrackingEnv._compute_obstacle_obs_count(cfg) * 2
+        # agent state + goal pos (3) + obstacle xy flat (O * 2)
+        return PosTrackingEnv._compute_graph_state_dim(cfg) + 3 + PosTrackingEnv._compute_obstacle_obs_count(cfg) * 2
+
+    @staticmethod
+    def _compute_graph_state_dim(cfg: PosTrackingEnvCfg) -> int:
+        return 8 if PosTrackingEnv._use_yaw_observations_cfg(cfg) else 6
+
+    @staticmethod
+    def _use_yaw_observations_cfg(cfg: PosTrackingEnvCfg) -> bool:
+        return bool(cfg.include_yaw_in_observations) or (
+            bool(cfg.include_yaw_with_ray_caster)
+            and bool(cfg.enable_obstacle_observations)
+            and cfg.obstacle_observation_mode == "ray_caster"
+        )
 
     @staticmethod
     def _compute_obstacle_obs_count(cfg: PosTrackingEnvCfg) -> int:
         if not cfg.enable_obstacle_observations or cfg.obstacle_observation_mode == "none":
             return 0
         if cfg.obstacle_observation_mode == "ray_caster":
+            if cfg.ray_caster_observation_mode == "ray_ordered_hits":
+                return PosTrackingEnv._compute_ray_caster_ray_count(cfg)
             return max(0, int(cfg.ray_caster_top_k_hits))
         if cfg.obstacle_observation_mode == "pillars" and cfg.enable_pillars:
             return len(cfg.pillar_positions_xy)
         return 0
+
+    @staticmethod
+    def _compute_ray_caster_ray_count(cfg: PosTrackingEnvCfg) -> int:
+        return max(1, int(cfg.ray_caster_num_rays)) * max(1, int(cfg.ray_caster_channels))
+
+    @staticmethod
+    def _resolve_safety_obstacle_source_cfg(cfg: PosTrackingEnvCfg) -> str:
+        if cfg.safety_obstacle_source == "auto":
+            return "ray_caster" if cfg.obstacle_observation_mode == "ray_caster" else "geometry"
+        return str(cfg.safety_obstacle_source)
 
     @staticmethod
     def _make_ray_caster_cfg(cfg: PosTrackingEnvCfg) -> MultiMeshRayCasterCfg:
@@ -540,32 +580,79 @@ class PosTrackingEnv(DirectRLEnv):
             debug_vis=bool(cfg.ray_caster_debug_vis),
         )
 
-    def _get_ray_caster_obstacle_xy(self, env_origins: torch.Tensor, agent_pos: torch.Tensor) -> torch.Tensor:
-        top_k = max(0, int(self.cfg.ray_caster_top_k_hits))
-        if top_k == 0:
+    def _get_ray_caster_obstacle_xy(
+        self,
+        env_origins: torch.Tensor,
+        agent_pos: torch.Tensor,
+        *,
+        mode: str | None = None,
+    ) -> torch.Tensor:
+        mode = mode or self.cfg.ray_caster_observation_mode
+        if mode not in {"ray_ordered_hits", "top_k_hits"}:
+            raise ValueError(f"Unsupported ray-caster observation mode '{mode}'.")
+
+        obs_count = (
+            self._compute_ray_caster_ray_count(self.cfg)
+            if mode == "ray_ordered_hits"
+            else max(0, int(self.cfg.ray_caster_top_k_hits))
+        )
+        if obs_count == 0:
             return agent_pos.new_empty(self.num_envs, 0, 2)
         fallback_xy = agent_pos[:, :2] + agent_pos.new_tensor([float(self.cfg.ray_caster_no_hit_distance), 0.0])
         if self._ray_caster is None:
-            return fallback_xy.unsqueeze(1).expand(-1, top_k, -1)
+            return fallback_xy.unsqueeze(1).expand(-1, obs_count, -1)
 
         hits_w = self._ray_caster.data.ray_hits_w
         sensor_pos_w = self._ray_caster.data.pos_w
         finite_hits = torch.isfinite(hits_w).all(dim=-1)
         hit_dist = torch.norm(hits_w - sensor_pos_w.unsqueeze(1), dim=-1)
         valid_hits = finite_hits & (hit_dist <= float(self.cfg.ray_caster_max_distance))
+        fallback_xy_all = self._ray_caster_no_hit_xy(env_origins, sensor_pos_w, hits_w.shape[1], agent_pos)
+
+        if mode == "ray_ordered_hits":
+            hit_xy = hits_w[..., :2] - env_origins[:, None, :2]
+            hit_xy = torch.where(valid_hits.unsqueeze(-1), hit_xy, fallback_xy_all)
+            if hit_xy.shape[1] == obs_count:
+                return hit_xy
+            return self._fit_obstacle_count(hit_xy, obs_count, fallback_xy)
 
         sort_dist = torch.where(valid_hits, hit_dist, torch.full_like(hit_dist, float("inf")))
-        k = min(top_k, sort_dist.shape[1])
+        k = min(obs_count, sort_dist.shape[1])
         _, hit_idx = torch.topk(sort_dist, k=k, dim=1, largest=False)
         gather_idx = hit_idx.unsqueeze(-1).expand(-1, -1, 2)
         hit_xy = torch.gather(hits_w[..., :2], 1, gather_idx) - env_origins[:, None, :2]
+        fallback_xy_selected = torch.gather(fallback_xy_all, 1, gather_idx)
         hit_valid = torch.gather(valid_hits, 1, hit_idx).unsqueeze(-1)
-        hit_xy = torch.where(hit_valid, hit_xy, fallback_xy[:, None, :].expand(-1, k, -1))
+        hit_xy = torch.where(hit_valid, hit_xy, fallback_xy_selected)
 
-        if k == top_k:
+        if k == obs_count:
             return hit_xy
-        padding = fallback_xy[:, None, :].expand(-1, top_k - k, -1)
+        padding = fallback_xy[:, None, :].expand(-1, obs_count - k, -1)
         return torch.cat([hit_xy, padding], dim=1)
+
+    def _ray_caster_no_hit_xy(
+        self,
+        env_origins: torch.Tensor,
+        sensor_pos_w: torch.Tensor,
+        num_rays: int,
+        agent_pos: torch.Tensor,
+    ) -> torch.Tensor:
+        ray_dirs_w = getattr(self._ray_caster, "_ray_directions_w", None)
+        if ray_dirs_w is None or ray_dirs_w.shape[1] != num_rays:
+            fallback_xy = agent_pos[:, :2] + agent_pos.new_tensor([float(self.cfg.ray_caster_no_hit_distance), 0.0])
+            return fallback_xy[:, None, :].expand(-1, num_rays, -1)
+
+        ray_dirs_w = ray_dirs_w.to(device=sensor_pos_w.device, dtype=sensor_pos_w.dtype)
+        ray_dirs_w = ray_dirs_w / torch.norm(ray_dirs_w, dim=-1, keepdim=True).clamp_min(1e-6)
+        fallback_w = sensor_pos_w[:, None, :] + ray_dirs_w * float(self.cfg.ray_caster_no_hit_distance)
+        return fallback_w[..., :2] - env_origins[:, None, :2]
+
+    @staticmethod
+    def _fit_obstacle_count(ray_xy: torch.Tensor, obs_count: int, fallback_xy: torch.Tensor) -> torch.Tensor:
+        if ray_xy.shape[1] > obs_count:
+            return ray_xy[:, :obs_count]
+        padding = fallback_xy[:, None, :].expand(-1, obs_count - ray_xy.shape[1], -1)
+        return torch.cat([ray_xy, padding], dim=1)
 
     def _build_action_wrapper(self):
         def passthrough(td: TensorDict) -> torch.Tensor:
@@ -621,6 +708,10 @@ class PosTrackingEnv(DirectRLEnv):
         yaw_align = torch.sum(forward_xy * desired_xy, dim=-1, keepdim=True)
         return yaw_err, yaw_align
 
+    def _yaw_sin_cos(self, quat: torch.Tensor) -> torch.Tensor:
+        yaw = math_utils.euler_xyz_from_quat(quat)[2].unsqueeze(-1)
+        return torch.cat([torch.sin(yaw), torch.cos(yaw)], dim=-1)
+
     def _crash_mask(self, pos_local: torch.Tensor) -> torch.Tensor:
         return pos_local[:, 2] < self.cfg.collision_altitude
 
@@ -640,27 +731,59 @@ class PosTrackingEnv(DirectRLEnv):
         inside_height = (pos_local[:, 2] >= self.cfg.arena_min[2]) & (pos_local[:, 2] <= self._pillar_top_z)
         return torch.any(inside_radius, dim=1) & inside_height
 
+    def _safety_violation_masks(self, pos_local: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            self._crash_mask(pos_local),
+            self._out_of_bounds_mask(pos_local),
+            self._pillar_collision_mask(pos_local),
+        )
+
+    @staticmethod
+    def _masked_penalty(reference: torch.Tensor, mask: torch.Tensor, weight: float) -> torch.Tensor:
+        penalty = torch.zeros_like(reference)
+        penalty[mask] = float(weight)
+        return penalty
+
     # DGPPO DEBUG FIX START: real env signed safety costs.
     def _update_dgppo_costs(self, pos_local: torch.Tensor) -> None:
-        agent_state = pos_local.new_zeros(self.num_envs, self.num_agents, self._GRAPH_STATE_DIM)
+        agent_state = pos_local.new_zeros(self.num_envs, self.num_agents, self._graph_state_dim)
         agent_state[:, 0, :3] = pos_local
         agent_state[:, 0, 3:6] = self._robot.data.root_lin_vel_w
+        if self._include_yaw_obs:
+            agent_state[:, 0, 6:8] = self._yaw_sin_cos(self._robot.data.root_quat_w)
 
-        if self._num_pillars > 0:
-            obs_state = pos_local.new_zeros(self.num_envs, self._num_pillars, self._GRAPH_STATE_DIM)
+        safety_source = self._resolve_safety_obstacle_source_cfg(self.cfg)
+        obstacle_cost_mode = "per_obstacle"
+        obstacle_collision_radius = self._pillar_collision_radius
+        if safety_source == "ray_caster":
+            env_origins = self._terrain.env_origins
+            obstacle_xy = self._get_ray_caster_obstacle_xy(env_origins, pos_local)
+            obs_state = pos_local.new_zeros(self.num_envs, obstacle_xy.shape[1], self._graph_state_dim)
+            obs_state[:, :, :2] = obstacle_xy
+            obstacle_cost_mode = "nearest_obstacle"
+            configured_safety_distance = float(self.cfg.ray_caster_safety_distance)
+            obstacle_collision_radius = (
+                configured_safety_distance
+                if configured_safety_distance > 0.0
+                else float(self.cfg.drone_collision_radius)
+            )
+        elif safety_source == "geometry" and self._num_pillars > 0:
+            obs_state = pos_local.new_zeros(self.num_envs, self._num_pillars, self._graph_state_dim)
             obs_state[:, :, :2] = self._pillar_positions_xy.unsqueeze(0).expand(self.num_envs, -1, -1)
         else:
-            obs_state = pos_local.new_zeros(self.num_envs, 0, self._GRAPH_STATE_DIM)
+            obs_state = pos_local.new_zeros(self.num_envs, 0, self._graph_state_dim)
 
-        self._last_dgppo_costs = compute_pos_tracking_safety_costs(
+        costs = compute_pos_tracking_safety_costs(
             agent_state=agent_state,
             obs_state=obs_state,
             arena_min=self._arena_min_safe,
             arena_max=self._arena_max_safe,
             collision_altitude=float(self.cfg.collision_altitude),
-            pillar_collision_radius=self._pillar_collision_radius,
+            pillar_collision_radius=obstacle_collision_radius,
             pillar_top_z=self._pillar_top_z,
+            obstacle_cost_mode=obstacle_cost_mode,
         )
+        self._last_dgppo_costs = align_safety_cost_heads(costs, self.n_constraints)
         if hasattr(self, "extras"):
             self.extras["costs"] = self._last_dgppo_costs
     # DGPPO DEBUG FIX END: real env signed safety costs.

@@ -1,5 +1,16 @@
 seed: 42
 
+# Environment overrides consumed by scripts/skrl/train.py before gym.make(...).
+# PPO uses fixed ray-order slots because a flat MLP needs stable feature meanings.
+env:
+  obstacle_observation_mode: ray_caster
+  enable_obstacle_observations: true
+  enable_ray_caster: true
+  ray_caster_observation_mode: ray_ordered_hits
+  include_yaw_with_ray_caster: true
+  include_safety_penalties_in_reward: true
+  terminate_on_safety_violation: true
+
 models:
   separate: True
   policy:
