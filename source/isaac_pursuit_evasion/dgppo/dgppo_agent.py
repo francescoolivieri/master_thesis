@@ -966,7 +966,21 @@ class DGPPOAgent(Agent):
         n_agents: int,
         n_constraints: int,
     ) -> torch.Tensor:
-        """Prefer env-provided costs, otherwise derive signed safety costs from graph states."""
+        """Return signed safety costs aligned with the stored rollout graph.
+
+        IsaacLab extras are produced after the physics step.  DG-PPO's safety
+        critic value in this transition is evaluated on ``observations`` before
+        that step, matching the JAX reference's ``get_cost(graph)`` convention.
+        For the local position-tracking task, derive costs from the same graph
+        state being stored instead of pairing Vh(s_t) with h(s_{t+1}).
+        """
+        if self._use_observation_aligned_cost_adapter():
+            return self._adapter_safety_costs(
+                agent_state=agent_state,
+                obs_state=obs_state,
+                n_constraints=n_constraints,
+            )
+
         costs_all = None
         if isinstance(infos, Mapping):
             costs_all = infos.get("costs", infos.get("cost"))
@@ -985,6 +999,12 @@ class DGPPOAgent(Agent):
             costs_all = costs_all.reshape(n_envs, n_agents, -1)
         return align_safety_cost_heads(costs_all.to(device=self.device, dtype=torch.float32), n_constraints)
 
+    def _use_observation_aligned_cost_adapter(self) -> bool:
+        """True for the Isaac position-tracking task whose extras are post-step."""
+        base_env = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
+        cfg = getattr(base_env, "cfg", None)
+        return hasattr(base_env, "graph_obs_layout") and hasattr(cfg, "safety_obstacle_source")
+
     def _adapter_safety_costs(
         self,
         *,
@@ -992,20 +1012,49 @@ class DGPPOAgent(Agent):
         obs_state: torch.Tensor,
         n_constraints: int,
     ) -> torch.Tensor:
-        """Build signed arena/pillar costs when the IsaacLab info dict has no cost key."""
+        """Build signed safety costs from the stored graph observation."""
         base_env = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
         cfg = getattr(base_env, "cfg", None)
         if cfg is None:
-            fallback = agent_state.new_full((*agent_state.shape[:2], max(1, int(n_constraints))), -1.0)
-            return align_safety_cost_heads(fallback, n_constraints)
+            raise RuntimeError("DG-PPO safety-cost adapter requires an env cfg when no info['costs'] is available.")
+
+        safety_source = "geometry"
+        resolver = getattr(base_env, "_resolve_safety_obstacle_source_cfg", None)
+        if callable(resolver):
+            safety_source = str(resolver(cfg))
+        elif hasattr(cfg, "safety_obstacle_source"):
+            safety_source = str(getattr(cfg, "safety_obstacle_source"))
 
         default_pillar_top_z = float(getattr(cfg, "arena_min")[2]) + float(getattr(cfg, "pillar_height", 0.0))
-        pillar_xy = getattr(base_env, "_pillar_positions_xy", None)
-        if pillar_xy is not None:
-            physical_obs_state = agent_state.new_zeros(agent_state.shape[0], pillar_xy.shape[0], agent_state.shape[-1])
-            physical_obs_state[:, :, :2] = pillar_xy.unsqueeze(0).expand(agent_state.shape[0], -1, -1)
-        else:
+        obstacle_cost_mode = "per_obstacle"
+        if safety_source == "ray_caster":
+            if obs_state.shape[1] == 0:
+                raise RuntimeError(
+                    "DG-PPO ray-caster safety source requires ray-hit obstacle nodes in the policy observation. "
+                    "Set enable_obstacle_observations=true and obstacle_observation_mode='ray_caster'."
+                )
             physical_obs_state = obs_state
+            obstacle_cost_mode = "nearest_obstacle"
+            configured_safety_distance = float(getattr(cfg, "ray_caster_safety_distance", 0.0))
+            obstacle_radius = (
+                configured_safety_distance
+                if configured_safety_distance > 0.0
+                else float(getattr(cfg, "drone_collision_radius", 0.0))
+            )
+        elif safety_source == "none":
+            physical_obs_state = obs_state.new_zeros(obs_state.shape[0], 0, agent_state.shape[-1])
+            obstacle_radius = 0.0
+        else:
+            if obs_state.shape[1] == 0:
+                raise RuntimeError(
+                    "DG-PPO geometry safety source requires obstacle nodes in the policy observation. "
+                    "Set enable_obstacle_observations=true with obstacle_observation_mode='pillars', "
+                    "or use safety_obstacle_source='ray_caster'/'none'."
+                )
+            physical_obs_state = obs_state
+            obstacle_radius = float(
+                getattr(base_env, "_pillar_collision_radius", getattr(cfg, "pillar_radius", 0.0))
+            )
 
         costs = compute_pos_tracking_safety_costs(
             agent_state=agent_state,
@@ -1013,10 +1062,9 @@ class DGPPOAgent(Agent):
             arena_min=getattr(base_env, "_arena_min_safe", getattr(base_env, "_arena_min", getattr(cfg, "arena_min"))),
             arena_max=getattr(base_env, "_arena_max_safe", getattr(base_env, "_arena_max", getattr(cfg, "arena_max"))),
             collision_altitude=float(getattr(cfg, "collision_altitude")),
-            pillar_collision_radius=float(
-                getattr(base_env, "_pillar_collision_radius", getattr(cfg, "pillar_radius", 0.0))
-            ),
+            pillar_collision_radius=obstacle_radius,
             pillar_top_z=float(getattr(base_env, "_pillar_top_z", default_pillar_top_z)),
+            obstacle_cost_mode=obstacle_cost_mode,
         )
         return align_safety_cost_heads(costs, n_constraints)
     # DGPPO DEBUG FIX END: live rollout mask/cost/RNN helpers.

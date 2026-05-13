@@ -36,7 +36,7 @@ parser.add_argument("--artifact-file", type=str, default=None, help="Specific fi
 parser.add_argument(
     "--actor-cfg",
     type=str,
-    default="source/isaac_pursuit_evasion/deployment/cfg/actor_pos_tracking_cfg.yml",
+    default="source/isaac_pursuit_evasion/deployment/cfg/actor_pos_tracking_ray_cfg.yml",
     help="Actor config name/path for policy loading.",
 )
 parser.add_argument(
@@ -98,6 +98,21 @@ from source.isaac_pursuit_evasion.deployment.actor_policy_loader import (
 import source.isaac_pursuit_evasion.isaac_pursuit_evasion.tasks.direct.pos_tracking  # noqa: F401
 
 
+def _apply_env_overrides_from_agent_cfg(env_cfg: Any, agent_cfg: Any) -> None:
+    if not isinstance(agent_cfg, dict):
+        return
+    env_overrides = agent_cfg.get("env", agent_cfg.get("environment", None))
+    if not isinstance(env_overrides, dict):
+        return
+    for key, value in env_overrides.items():
+        if key.startswith("_"):
+            continue
+        if not hasattr(env_cfg, key):
+            print(f"[WARN] Ignoring agent env override '{key}': env config has no such attribute.")
+            continue
+        setattr(env_cfg, key, value)
+
+
 def _resolve_path(path: Path) -> Path:
     return Path(path).expanduser().resolve()
 
@@ -111,6 +126,7 @@ class PolicyRunner:
         self.actor = actor
         self.device = torch.device(device)
         self.obs_scaler = getattr(self.actor, "obs_scaler", None)
+        self.expected_obs_dim = self._infer_obs_dim(actor)
 
     @classmethod
     def from_checkpoint(cls, checkpoint: str, actor_cfg: str | None, device: str) -> "PolicyRunner":
@@ -137,6 +153,11 @@ class PolicyRunner:
 
     def __call__(self, obs: torch.Tensor) -> torch.Tensor:
         obs = obs.to(self.device, dtype=torch.float32)
+        if self.expected_obs_dim is not None and obs.shape[-1] != self.expected_obs_dim:
+            raise ValueError(
+                f"Policy expects obs_dim={self.expected_obs_dim}, but the environment produced "
+                f"obs_dim={obs.shape[-1]}. Check --actor-cfg and the benchmark env overrides."
+            )
         if self.obs_scaler and self.obs_scaler.mean is not None and self.obs_scaler.std is not None:
             mean = self.obs_scaler.mean.to(self.device)
             std = self.obs_scaler.std.to(self.device)
@@ -144,6 +165,13 @@ class PolicyRunner:
         with torch.no_grad():
             action = self.actor.act(obs, deterministic=True)
         return action
+
+    @staticmethod
+    def _infer_obs_dim(actor) -> int | None:
+        for module in getattr(actor, "net_container", []):
+            if isinstance(module, torch.nn.Linear):
+                return int(module.in_features)
+        return None
 
 
 @dataclass
@@ -352,6 +380,7 @@ def main(env_cfg, agent_cfg: dict):
 
     env_cfg.scene.num_envs = args_cli.num_envs or env_cfg.scene.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device else env_cfg.sim.device
+    _apply_env_overrides_from_agent_cfg(env_cfg, agent_cfg)
     env_cfg.domain_randomization.enable = False
     env_cfg.use_position_controller = args_cli.policy_mode == "baseline"
     if args_cli.control_mode:
