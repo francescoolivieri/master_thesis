@@ -662,6 +662,7 @@ class DGPPOAgent(Agent):
         self.track_data("DGPPO/vl_rollout_mean", float(view["bT_Vl"].mean().item()))
         self.track_data("DGPPO/vl_target_error_mean", float(vl_error.mean().item()))
         self.track_data("DGPPO/vl_target_error_abs_mean", float(vl_error.abs().mean().item()))
+        self._track_safety_cost_metrics(view["bTah_hs"])
         self.track_data("DGPPO/rollout_terminated_rate", float(view["bT_terminated"].float().mean().item()))
         self.track_data("DGPPO/rollout_truncated_rate", float(view["bT_truncated"].float().mean().item()))
         self.track_data("DGPPO/bootstrap_on_truncated", float(self.bootstrap_on_truncated))
@@ -906,6 +907,25 @@ class DGPPOAgent(Agent):
         if T % rnn_step != 0:
             rnn_step = T
         return torch.arange(T, device=device, dtype=torch.long).reshape(-1, rnn_step)
+
+    def _track_safety_cost_metrics(self, safety_costs: torch.Tensor) -> None:
+        """Track signed safety costs without hiding opposing heads in a mean."""
+        if safety_costs.numel() == 0 or safety_costs.shape[-1] == 0:
+            return
+        max_per_agent = safety_costs.max(dim=-1).values
+        self.track_data("DGPPO/safety_cost_max", float(safety_costs.max().item()))
+        self.track_data("DGPPO/safety_cost_violation_rate", float((max_per_agent >= 0.0).float().mean().item()))
+
+        base_env = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
+        components = tuple(getattr(base_env, "cost_components", ()))
+        for idx, label in enumerate(components[: safety_costs.shape[-1]]):
+            head = safety_costs[..., idx]
+            metric_label = str(label).replace(" ", "_").replace("/", "_")
+            self.track_data(f"DGPPO/safety_cost/{metric_label}_max", float(head.max().item()))
+            self.track_data(
+                f"DGPPO/safety_cost/{metric_label}_violation_rate",
+                float((head >= 0.0).float().mean().item()),
+            )
 
     def _extract_graph_states(self, observations: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Decode flat policy observations into graph node state tensors."""

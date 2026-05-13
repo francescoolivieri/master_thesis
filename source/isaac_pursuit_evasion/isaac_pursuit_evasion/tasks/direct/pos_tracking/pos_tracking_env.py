@@ -395,10 +395,20 @@ class PosTrackingEnv(DirectRLEnv):
         success = self._update_success_flags(pos_local)
         self._last_success = success
 
-        safety_violation = crash | out_of_bounds | pillar_collision
+        terminate_crash = bool(self.cfg.terminate_on_safety_violation or self.cfg.terminate_on_crash)
+        terminate_out_of_bounds = bool(
+            self.cfg.terminate_on_safety_violation or self.cfg.terminate_on_out_of_bounds
+        )
+        terminate_pillar_collision = bool(
+            self.cfg.terminate_on_safety_violation or self.cfg.terminate_on_pillar_collision
+        )
+        safety_violation = (
+            (crash & terminate_crash)
+            | (out_of_bounds & terminate_out_of_bounds)
+            | (pillar_collision & terminate_pillar_collision)
+        )
         terminated = invalid.clone()
-        if self.cfg.terminate_on_safety_violation:
-            terminated = terminated | safety_violation
+        terminated = terminated | safety_violation
         if self.cfg.terminate_on_success:
             terminated = terminated | success
 
@@ -407,9 +417,11 @@ class PosTrackingEnv(DirectRLEnv):
         done_reason = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
         if self.cfg.terminate_on_success:
             done_reason[terminated & success] = 1
-        if self.cfg.terminate_on_safety_violation:
+        if terminate_crash:
             done_reason[terminated & crash] = 2
+        if terminate_out_of_bounds:
             done_reason[terminated & out_of_bounds] = 3
+        if terminate_pillar_collision:
             done_reason[terminated & pillar_collision] = 6
         done_reason[truncated] = 4
         done_reason[terminated & invalid] = 5

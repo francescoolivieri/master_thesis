@@ -165,6 +165,12 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     success_hold_time_s: float = 1.0 # prev: 0.5
     terminate_on_success: bool = True
     terminate_on_safety_violation: bool = True
+    # Granular safety resets are OR'ed with terminate_on_safety_violation. This
+    # lets DG-PPO keep obstacle contacts as costs while still resetting physically
+    # unrecoverable drone states such as crashes or leaving the arena.
+    terminate_on_crash: bool = False
+    terminate_on_out_of_bounds: bool = False
+    terminate_on_pillar_collision: bool = False
 
     total_timesteps = episode_length_s * sim_frequency
 
