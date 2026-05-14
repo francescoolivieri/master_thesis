@@ -1,4 +1,5 @@
 import dataclasses
+import importlib
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -56,6 +57,11 @@ class DGPPOAgentCfg(AgentCfg):
     vh_loss_scale: float = 1.0
     grad_norm_clip: float = 2.0
     rewards_shaper_scale: float = 1.0
+
+    observation_preprocessor: Any = None
+    observation_preprocessor_kwargs: dict[str, Any] = dataclasses.field(default_factory=dict)
+    value_preprocessor: Any = None
+    value_preprocessor_kwargs: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     lr_policy: float = 3e-4
     lr_vl: float = 1e-3
@@ -162,6 +168,12 @@ class DGPPOAgentCfg(AgentCfg):
             vh_loss_scale=float(raw.get("vh_loss_scale", 1.0)),
             grad_norm_clip=float(raw.get("grad_norm_clip", 2.0)),
             rewards_shaper_scale=float(raw.get("rewards_shaper_scale", raw.get("reward_scale", 1.0))),
+            observation_preprocessor=raw.get("observation_preprocessor", raw.get("state_preprocessor")),
+            observation_preprocessor_kwargs=dict(
+                raw.get("observation_preprocessor_kwargs", raw.get("state_preprocessor_kwargs")) or {}
+            ),
+            value_preprocessor=raw.get("value_preprocessor"),
+            value_preprocessor_kwargs=dict(raw.get("value_preprocessor_kwargs") or {}),
             lr_policy=float(raw.get("lr_policy", 3e-4)),
             lr_vl=float(raw.get("lr_vl", 1e-3)),
             lr_vh=float(raw.get("lr_vh", 1e-3)),
@@ -218,6 +230,16 @@ class DGPPOAgent(Agent):
 
         # Load hyperparameters
         self.load_dgppo_hyperparameters()
+        self._observation_preprocessor = self._make_preprocessor(
+            preprocessor=self.cfg.observation_preprocessor,
+            kwargs=self.cfg.observation_preprocessor_kwargs,
+            size=int(self.env.unwrapped.graph_obs_layout["state_dim"]),
+        )
+        self._value_preprocessor = self._make_preprocessor(
+            preprocessor=self.cfg.value_preprocessor,
+            kwargs=self.cfg.value_preprocessor_kwargs,
+            size=1,
+        )
 
         # Setup optimizers
         self._policy_opt = torch.optim.Adam(self.policy.parameters(), lr=self.lr_policy)
@@ -243,6 +265,10 @@ class DGPPOAgent(Agent):
             "Vl_optimizer": self._vl_opt,
             "Vh_optimizer": self._vh_opt,
         }
+        if self._observation_preprocessor is not None:
+            self.checkpoint_modules["observation_preprocessor"] = self._observation_preprocessor
+        if self._value_preprocessor is not None:
+            self.checkpoint_modules["value_preprocessor"] = self._value_preprocessor
 
         # Setup memory (Note: personalised memory for cleaner code)
         self.memory: DGPPORolloutMemory | None = None
@@ -325,10 +351,9 @@ class DGPPOAgent(Agent):
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Sample actions (and compute values if training) for the current environment step.
 
-        Note: the graph is built by querying the env for structured states (agent / goal /
-        obstacle positions), not from the flat `observations` blob passed by skrl.
-        This mirrors the reference DGPPO design: `build_graph_data` needs three separate
-        (E, A/O, S) tensors; the flat observation vector does not provide that structure.
+        The graph topology and safety adapter use raw physical units decoded from
+        IsaacLab's flat observation. Optional observation preprocessing is applied
+        only to the neural node/edge feature copy fed to the policy and critics.
 
         :param observations: Per-agent observations (E*A, obs_dim) — unused directly.
         :param states:       Global env state (E, state_dim)       — unused directly.
@@ -339,8 +364,9 @@ class DGPPOAgent(Agent):
         n_agents = self.env.num_agents
 
         with torch.no_grad():  # Saves memory
-            graph = self._build_graph(observations, states)
-            self._last_graph = graph
+            raw_graph = self._build_graph(observations, states)
+            self._last_graph = raw_graph
+            graph = self._preprocess_graph_observations(raw_graph)
             self._last_policy_rnn_state = (
                 None if self._policy_rnn_state is None else self._policy_rnn_state.detach().clone()
             )
@@ -356,7 +382,7 @@ class DGPPOAgent(Agent):
                 self._last_vl_rnn_state = None if self._vl_rnn_state is None else self._vl_rnn_state.detach().clone()
                 vl, self._vl_rnn_state = self.Vl(graph, self._vl_rnn_state, n_agents)
                 vh, _ = self.Vh(graph, self._last_policy_rnn_state, n_agents)
-                self._current_Vl = vl
+                self._current_Vl = self._inverse_preprocess_values(vl)
                 self._current_Vh = vh
 
         # Carry the RNN state forward to the next timestep
@@ -545,8 +571,9 @@ class DGPPOAgent(Agent):
 
             if self.memory.is_full:
                 with torch.no_grad():
-                    next_graph = self._build_graph(next_observations, next_states)
+                    next_graph = self._preprocess_graph_observations(self._build_graph(next_observations, next_states))
                     vl_boot, _ = self.Vl(next_graph, self._vl_rnn_state, self.env.num_agents)
+                    vl_boot = self._inverse_preprocess_values(vl_boot)
                     vh_boot, _ = self.Vh(next_graph, self._policy_rnn_state, self.env.num_agents)
                     policy_reference_state = None
                     vh_boot_reference = None
@@ -654,6 +681,7 @@ class DGPPOAgent(Agent):
         )
         bTa_A = adv_info["bTa_A"].detach()
         vl_error = Ql - view["bT_Vl"]
+        Ql_value_targets = self._preprocess_value_targets(Ql, train=True)
         self.track_data("DGPPO/safe_rate", float(adv_info["bTa_is_safe"].float().mean().item()))
         self.track_data("DGPPO/adv_raw_mean", float(adv_info["bT_Al_raw"].mean().item()))
         self.track_data("DGPPO/low_level_cost_mean", float(view["bT_l"].mean().item()))
@@ -695,7 +723,7 @@ class DGPPOAgent(Agent):
                 info = self._update_minibatch(
                     idx=idx,
                     Qh_det=Qh_det,
-                    Ql=Ql,
+                    Ql=Ql_value_targets,
                     bTa_A=bTa_A,
                     view=view,
                     det_view=det_view,
@@ -725,7 +753,7 @@ class DGPPOAgent(Agent):
         update_summary = {
             "loss_policy": float((loss_p_acc * inv_n).item()),
             "loss_value_l": float((loss_vl_acc * inv_n).item()),
-            "loss_value_l_rmse": float(torch.sqrt((2.0 * loss_vl_acc * inv_n).clamp_min(0.0)).item()),
+            "loss_value_l_rmse_normalized": float(torch.sqrt((2.0 * loss_vl_acc * inv_n).clamp_min(0.0)).item()),
             "loss_value_h": float((loss_vh_acc * inv_n).item()),
             "clip_frac": float((clipfrac_acc * inv_n).item()),
             "lr_policy": float(self._policy_opt.param_groups[0]["lr"]),
@@ -734,7 +762,7 @@ class DGPPOAgent(Agent):
         }
         self.track_data("DGPPO/loss_policy", update_summary["loss_policy"])
         self.track_data("DGPPO/loss_value_l", update_summary["loss_value_l"])
-        self.track_data("DGPPO/loss_value_l_rmse", update_summary["loss_value_l_rmse"])
+        self.track_data("DGPPO/loss_value_l_rmse_normalized", update_summary["loss_value_l_rmse_normalized"])
         self.track_data("DGPPO/loss_value_h", update_summary["loss_value_h"])
         self.track_data("DGPPO/clip_frac", update_summary["clip_frac"])
         self.track_data("DGPPO/lr_policy", float(self._policy_opt.param_groups[0]["lr"]))
@@ -742,6 +770,8 @@ class DGPPOAgent(Agent):
         self.track_data("DGPPO/lr_vh", float(self._vh_opt.param_groups[0]["lr"]))
         self._debug.log_update_end(timestep=timestep, update_id=update_id, summary=update_summary)
 
+        self._update_observation_preprocessor_stats(graph)
+        self._update_observation_preprocessor_stats(det_graph)
         self.memory.reset()
         self._debug.reset_rollout()
 
@@ -769,6 +799,11 @@ class DGPPOAgent(Agent):
             obs_radius=self.obs_radius,
             graph=graph,
             det_graph=det_graph,
+        )
+        batch = dataclasses.replace(
+            batch,
+            graph=self._preprocess_graph_observations(batch.graph),
+            det_graph=self._preprocess_graph_observations(batch.det_graph),
         )
         chunk_graph = None
         det_chunk_graph = None
@@ -843,6 +878,7 @@ class DGPPOAgent(Agent):
             grad_clip=self.grad_clip,
         )
 
+        vl_raw = self._inverse_preprocess_values(value_info["vl"].reshape(-1, 1)).reshape_as(value_info["vl"])
         return {
             "loss_p": policy_info["loss_policy"].detach(),
             "loss_vl": value_info["loss_vl"].detach(),
@@ -857,7 +893,7 @@ class DGPPOAgent(Agent):
             "policy_grad_norm": policy_grad_norm.detach(),
             "vl_grad_norm": vl_grad_norm.detach(),
             "vh_grad_norm": vh_grad_norm.detach(),
-            "vl": value_info["vl"].detach(),
+            "vl": vl_raw.detach(),
             "vh": value_info["vh"].detach(),
         }
 
@@ -886,6 +922,121 @@ class DGPPOAgent(Agent):
         self.rewards_shaper_scale: float = float(
             self.cfg.get("rewards_shaper_scale", self.cfg.get("reward_scale", 1.0))
         )
+
+    def _make_preprocessor(self, *, preprocessor: Any, kwargs: Mapping[str, Any] | None, size: int) -> Any | None:
+        preprocessor_cls = self._resolve_preprocessor(preprocessor)
+        if preprocessor_cls is None:
+            return None
+
+        preprocessor_kwargs = dict(kwargs or {})
+        preprocessor_kwargs.update({"size": int(size), "device": self.device})
+        instance = preprocessor_cls(**preprocessor_kwargs)
+        if hasattr(instance, "to"):
+            instance.to(self.device)
+        return instance
+
+    @staticmethod
+    def _resolve_preprocessor(preprocessor: Any) -> Any | None:
+        if preprocessor is None:
+            return None
+        if not isinstance(preprocessor, str):
+            return preprocessor
+
+        name = preprocessor.strip()
+        if not name or name.lower() in {"none", "null"}:
+            return None
+        if "." in name:
+            module_name, _, attr_name = name.rpartition(".")
+            return getattr(importlib.import_module(module_name), attr_name)
+
+        from skrl.resources.preprocessors.torch import RunningStandardScaler
+
+        registry = {
+            "RunningStandardScaler": RunningStandardScaler,
+        }
+        if name not in registry:
+            known = ", ".join(sorted(registry))
+            raise ValueError(f"Unsupported DG-PPO preprocessor '{name}'. Known preprocessors: {known}")
+        return registry[name]
+
+    def _preprocess_graph_observations(self, graph: GraphData) -> GraphData:
+        """Normalize neural graph features while keeping graph geometry/state tensors raw."""
+        preprocessor = self._observation_preprocessor
+        if preprocessor is None:
+            return graph
+
+        state_dim = int(graph.states.shape[-1])
+        nodes = graph.nodes
+        node_state = preprocessor(nodes[:, :state_dim], train=False)
+        processed_nodes = torch.cat([node_state, nodes[:, state_dim:]], dim=-1)
+
+        processed_edges = graph.edges
+        if graph.edges is not None:
+            edge_state = self._preprocess_relative_observation_features(graph.edges[:, :state_dim])
+            processed_edges = torch.cat([edge_state, graph.edges[:, state_dim:]], dim=-1)
+
+        return graph._replace(nodes=processed_nodes, edges=processed_edges)
+
+    def _update_observation_preprocessor_stats(self, graph: GraphData) -> None:
+        """Refresh observation stats after the PPO update for use by the next rollout."""
+        preprocessor = self._observation_preprocessor
+        if preprocessor is None:
+            return
+
+        valid_nodes = graph.node_types >= 0
+        if valid_nodes.numel() == 0 or not bool(valid_nodes.any().item()):
+            return
+
+        state_dim = int(graph.states.shape[-1])
+        preprocessor(graph.nodes[valid_nodes, :state_dim], train=True)
+
+    def _preprocess_relative_observation_features(self, values: torch.Tensor) -> torch.Tensor:
+        """Scale relative edge features without subtracting absolute-position means."""
+        preprocessor = self._observation_preprocessor
+        if preprocessor is None:
+            return values
+
+        std = self._running_preprocessor_std(preprocessor, like=values)
+        if std is None:
+            return preprocessor(values, train=False)
+
+        epsilon = float(getattr(preprocessor, "epsilon", 1e-8))
+        scaled = values / (std + epsilon)
+        clip_threshold = getattr(preprocessor, "clip_threshold", None)
+        if clip_threshold is not None:
+            scaled = torch.clamp(scaled, min=-float(clip_threshold), max=float(clip_threshold))
+        return scaled
+
+    @staticmethod
+    def _running_preprocessor_std(preprocessor: Any, *, like: torch.Tensor) -> torch.Tensor | None:
+        std = None
+        for key in ("std", "running_std", "_std"):
+            if hasattr(preprocessor, key):
+                std = getattr(preprocessor, key)
+                break
+        if std is None:
+            for key in ("var", "running_var", "running_variance", "variance", "_var"):
+                if hasattr(preprocessor, key):
+                    var = getattr(preprocessor, key)
+                    std = torch.sqrt(torch.clamp(torch.as_tensor(var, device=like.device), min=0.0))
+                    break
+        if std is None:
+            return None
+        return torch.as_tensor(std, device=like.device, dtype=like.dtype)
+
+    def _preprocess_value_targets(self, values: torch.Tensor, *, train: bool = False) -> torch.Tensor:
+        preprocessor = self._value_preprocessor
+        if preprocessor is None:
+            return values
+        shape = values.shape
+        return preprocessor(values.reshape(-1, 1), train=train).reshape(shape)
+
+    def _inverse_preprocess_values(self, values: torch.Tensor) -> torch.Tensor:
+        preprocessor = self._value_preprocessor
+        if preprocessor is None:
+            return values
+        shape = values.shape
+        return preprocessor(values.reshape(-1, 1), inverse=True).reshape(shape)
 
     def _cbf_scale(self, *, timestep: int, timesteps: int) -> float:
         """Piecewise-constant CBF weight schedule."""

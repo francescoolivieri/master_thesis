@@ -22,16 +22,16 @@ agent:
   # DGPPO-specific
   alpha:        15    # CBF class-K multiplier
   cbf_eps:      0.01    # CBF slack (h >= -eps is "safe enough")
-  cbf_weight:   0.75     # weight on the CBF penalty term
+  cbf_weight:   1.0     # weight on the CBF penalty term
   cbf_schedule: false   
 
   # Graph / observation radius for graph builder
   obs_radius: 8.0
 
   # PPO / GAE
-  rollouts:         16       # steps collected per update (per env)
-  learning_epochs:  4
-  mini_batches:     8
+  rollouts:         512       # steps collected per update (per env)
+  learning_epochs:  3
+  mini_batches:     12
 
   discount_factor:  0.995
   gae_lambda:           0.95
@@ -43,11 +43,13 @@ agent:
   lr_vh:     1.0e-3
   # TODO: add scheduler (KLAdaptiveLR)
 
-
-  # TODO: add observation and value preprocessor
-  # The custom DG-PPO runner does not use skrl tensor preprocessors yet; keep
-  # the low-level value target scale manageable by shaping rewards before
-  # storing them as l = -reward in the rollout memory.
+  # DG-PPO applies observation scaling to graph neural-network features after
+  # raw-unit graph topology/cost construction. Value scaling is used for Vl
+  # targets only; stored rollouts and CBF advantages remain in raw units.
+  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor_kwargs: null
+  value_preprocessor: RunningStandardScaler
+  value_preprocessor_kwargs: null
   rewards_shaper_scale: 0.1
 
 
@@ -123,7 +125,7 @@ agent:
 
 # - Trainer settings, read by skrl SequentialTrainer
 trainer:
-  timesteps: 3000 #15000
+  timesteps: 50000 #15000
   environment_info: log
   headless: true
   disable_progressbar: false
