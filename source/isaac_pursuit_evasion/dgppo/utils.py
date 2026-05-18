@@ -201,7 +201,9 @@ def compute_pos_tracking_safety_costs(
 ) -> torch.Tensor:
     """Signed DG-PPO costs for Crazyflie position tracking.
 
-    The default returned heads are ``[arena_bounds, obstacle_0, ..., obstacle_N]``.
+    The default returned heads are ``[vertical_bounds, obstacle_0, ..., obstacle_N]``.
+    Lateral walls are expected to enter through obstacle/ray nodes, not through
+    the vertical bounds head.
     With ``obstacle_cost_mode="nearest_obstacle"``, obstacle costs are reduced to
     one generic closest-obstacle head. Costs are positive when unsafe and
     negative when safe, following the JAX DG-PPO environment convention.
@@ -214,18 +216,17 @@ def compute_pos_tracking_safety_costs(
 
     arena_min_t = torch.as_tensor(arena_min, device=device, dtype=dtype)
     arena_max_t = torch.as_tensor(arena_max, device=device, dtype=dtype)
-    safe_min = arena_min_t.clone()
-    safe_min[2] = torch.maximum(safe_min[2], torch.as_tensor(collision_altitude, device=device, dtype=dtype))
-
-    lower_violation = safe_min.view(1, 1, 3) - pos
-    upper_violation = pos - arena_max_t.view(1, 1, 3)
-    boundary_cost = torch.maximum(lower_violation, upper_violation).amax(dim=-1, keepdim=True)
+    min_z = torch.maximum(arena_min_t[2], torch.as_tensor(collision_altitude, device=device, dtype=dtype))
+    max_z = arena_max_t[2]
+    lower_z_violation = min_z - pos[..., 2]
+    upper_z_violation = pos[..., 2] - max_z
+    vertical_cost = torch.maximum(lower_z_violation, upper_z_violation).unsqueeze(-1)
 
     if obstacle_cost_mode not in {"per_obstacle", "nearest_obstacle"}:
         raise ValueError(f"Unsupported obstacle_cost_mode: {obstacle_cost_mode}")
 
     if obs_state.numel() == 0 or obs_state.shape[1] == 0:
-        raw_costs = boundary_cost
+        raw_costs = vertical_cost
     else:
         pillar_xy = obs_state[:, None, :, :2].expand(E, A, -1, -1)
         agent_xy = pos[:, :, None, :2]
@@ -242,13 +243,13 @@ def compute_pos_tracking_safety_costs(
             vertical_clearance = torch.maximum(z_min - z, z - z_max).clamp_min(0.0)
             inactive_height_cost = -vertical_clearance.clamp_min(float(eps))
             obstacle_cost = torch.where(inside_height[..., None], radial_cost, inactive_height_cost[..., None])
-        raw_costs = torch.cat([boundary_cost, obstacle_cost], dim=-1)
+        raw_costs = torch.cat([vertical_cost, obstacle_cost], dim=-1)
 
     return _signed_clipped_cost(raw_costs, eps=eps).reshape(E, A, -1)
 
 
 def align_safety_cost_heads(costs: torch.Tensor, n_constraints: int) -> torch.Tensor:
-    """Align adapter/env costs to the Vh output width without losing OOB signal."""
+    """Align adapter/env costs to the Vh output width without losing vertical safety signal."""
     n_constraints = int(n_constraints)
     if n_constraints < 0:
         raise ValueError(f"n_constraints must be non-negative, got {n_constraints}")
@@ -257,10 +258,10 @@ def align_safety_cost_heads(costs: torch.Tensor, n_constraints: int) -> torch.Te
     if n_constraints == 0:
         return costs[..., :0]
     if costs.shape[-1] == n_constraints + 1:
-        boundary = costs[..., :1]
+        vertical = costs[..., :1]
         remaining = costs[..., 1:]
         if remaining.shape[-1] == n_constraints:
-            return torch.maximum(remaining, boundary.expand_as(remaining))
+            return torch.maximum(remaining, vertical.expand_as(remaining))
     if n_constraints == 1:
         return costs.max(dim=-1, keepdim=True).values
     if costs.shape[-1] > n_constraints:
@@ -273,6 +274,8 @@ def _signed_clipped_cost(cost: torch.Tensor, *, eps: float) -> torch.Tensor:
     eps_t = torch.as_tensor(eps, device=cost.device, dtype=cost.dtype)
     shifted = torch.where(cost <= 0.0, cost - eps_t, cost + eps_t)
     return torch.clamp(shifted, min=-1.0, max=1.0)
+
+
 # DGPPO DEBUG FIX END: episode-boundary and safety-cost helper functions.
 
 
@@ -372,8 +375,8 @@ class GraphData:
     -1 = padding).
     """
 
-    n_nodes: torch.Tensor  # (n_graphs,) nodes per sub-graph
-    n_edges: torch.Tensor  # (n_graphs,) edges per sub-graph
+    n_nodes: torch.Tensor  # batch_shape nodes per sub-graph
+    n_edges: torch.Tensor  # batch_shape edges per sub-graph
     nodes: torch.Tensor  # (sum_n_nodes, node_feat_dim)
     edges: torch.Tensor | None  # (sum_n_edges, edge_feat_dim)
     states: torch.Tensor  # per-node physical state, (sum_n_nodes, state_dim)
@@ -395,9 +398,8 @@ class GraphData:
 
     def get_type_nodes(self, type_idx: int, n_nodes: int) -> torch.Tensor:
         """
-        Get #'n_nodes' nodes of a given type 'type_idx'.
+        Return nodes of ``type_idx`` as ``batch_shape + (n_nodes, node_feat_dim)``.
         """
-        # TODO: check dymensionality
         tot_n_feats = self.nodes.shape[1]
 
         n_is_type = self.node_types == type_idx
@@ -413,9 +415,8 @@ class GraphData:
 
     def get_type_states(self, type_idx: int, n_states: int) -> torch.Tensor:
         """
-        Get #'n_states' states of the nodes of a given type 'type_idx'.
+        Return states of ``type_idx`` as ``batch_shape + (n_states, state_dim)``.
         """
-        # TODO: check dymensionality
         assert isinstance(self.states, torch.Tensor)
         tot_n_states = self.states.shape[1]
 

@@ -80,6 +80,7 @@ class DGPPOTrainingDiagnostics:
             "observation_space": str(getattr(agent, "observation_space", "")),
             "action_space": str(getattr(agent, "action_space", "")),
             "n_constraints": int(getattr(base_env, "n_constraints", 0)),
+            "cost_components": _jsonable(getattr(base_env, "cost_components", ())),
             "graph_obs_layout": _jsonable(layout),
             "split": {
                 "det_envs": int(agent._det_env_ids.numel()) if agent._det_env_ids is not None else 0,
@@ -662,10 +663,14 @@ def _bool_1d(tensor: torch.Tensor) -> torch.Tensor:
 
 def _done_reasons(env: Any, *, device: torch.device) -> torch.Tensor | None:
     base_env = env.unwrapped if hasattr(env, "unwrapped") else env
-    if not hasattr(base_env, "get_last_done_reasons"):
+    if hasattr(base_env, "get_last_episode_status"):
+        get_status = base_env.get_last_episode_status
+    elif hasattr(base_env, "get_last_done_reasons"):
+        get_status = base_env.get_last_done_reasons
+    else:
         return None
     try:
-        reasons = base_env.get_last_done_reasons()
+        reasons = get_status()
     except Exception:
         return None
     return torch.as_tensor(reasons, device=device).reshape(-1)

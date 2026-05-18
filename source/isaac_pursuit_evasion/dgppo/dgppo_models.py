@@ -36,14 +36,14 @@ class DecStateFn(nn.Module):
         nn.init.zeros_(self.value_out.bias)
 
     def forward(self, graph, rnn_state: torch.Tensor, n_agents: int):
-        x = self.gnn(graph, node_type=0, n_type=n_agents)  # (n_agents, gnn_out_dim)
+        x = self.gnn(graph, node_type=0, n_type=n_agents)
         batch_shape = x.shape[:-2]
-        x = self.mlp(x).reshape(-1, self.mlp.hid_sizes[-1])  # (B*n_agents, hid)
+        x = self.mlp(x).reshape(-1, self.mlp.hid_sizes[-1])
 
         if self.rnn is not None:
             x, rnn_state = self.rnn(x, rnn_state)
 
-        x = self.value_out(x)  # (n_agents, n_out)
+        x = self.value_out(x)
         x = x.reshape(batch_shape + (n_agents, self.n_out))
         return x, rnn_state
 
@@ -68,15 +68,15 @@ class RStateFn(nn.Module):
         nn.init.zeros_(self.value_out.bias)
 
     def forward(self, graph, rnn_state: torch.Tensor, n_agents: int):
-        x = self.gnn(graph, node_type=0, n_type=n_agents)  # (n_agents, gnn_out_dim)
+        x = self.gnn(graph, node_type=0, n_type=n_agents)
         batch_shape = x.shape[:-2]
-        x = x.mean(dim=-2)  # (..., gnn_out_dim)
+        x = x.mean(dim=-2)
         x = self.mlp(x).reshape(-1, self.mlp.hid_sizes[-1])
 
         if self.rnn is not None:
             x, rnn_state = self.rnn(x, rnn_state)
 
-        x = self.value_out(x)  # (1, n_out)
+        x = self.value_out(x)
         x = x.reshape(batch_shape + (self.n_out,))
         return x, rnn_state
 

@@ -166,17 +166,18 @@ def test_recurrent_update_done_masks_zero_post_step_carries_out_of_place() -> No
     (policy_reset.sum() + vl_reset.sum()).backward()
 
 
-def test_pos_tracking_safety_costs_emit_boundary_and_pillar_heads() -> None:
-    agent_state = torch.zeros(4, 1, 6)
+def test_pos_tracking_safety_costs_emit_vertical_and_pillar_heads() -> None:
+    agent_state = torch.zeros(5, 1, 6)
     agent_state[:, 0, :3] = torch.tensor(
         [
             [0.0, 0.0, 1.0],
-            [2.2, 0.0, 1.0],
+            [0.0, 0.0, 2.2],
             [0.51, 0.0, 1.0],
             [0.0, 0.0, 0.1],
+            [2.2, 0.0, 1.0],
         ]
     )
-    obs_state = torch.zeros(4, 2, 6)
+    obs_state = torch.zeros(5, 2, 6)
     obs_state[:, :, :2] = torch.tensor([[0.5, 0.0], [-0.5, 0.0]]).view(1, 2, 2)
 
     costs = compute_pos_tracking_safety_costs(
@@ -189,11 +190,12 @@ def test_pos_tracking_safety_costs_emit_boundary_and_pillar_heads() -> None:
         pillar_top_z=1.8,
     )
 
-    assert costs.shape == (4, 1, 3)
+    assert costs.shape == (5, 1, 3)
     assert torch.all(costs[0, 0] < 0.0)
     assert costs[1, 0, 0] > 0.0
     assert costs[2, 0, 1] > 0.0
     assert costs[3, 0, 0] > 0.0
+    assert costs[4, 0, 0] < 0.0
 
 
 def test_pos_tracking_safety_costs_can_reduce_to_nearest_obstacle_head() -> None:
@@ -219,6 +221,7 @@ def test_pos_tracking_safety_costs_can_reduce_to_nearest_obstacle_head() -> None
     )
 
     assert costs.shape == (2, 1, 2)
+    assert torch.all(costs[:, 0, 0] < 0.0)
     assert costs[0, 0, 1] > 0.0
     assert costs[1, 0, 1] < 0.0
 

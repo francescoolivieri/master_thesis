@@ -2,11 +2,19 @@ from __future__ import annotations
 
 import pytest
 
-from .parity_test_utils import assert_parity_close, importorskip, load_update_fixture_for_num_envs
+from .parity_test_utils import (
+    assert_parity_close,
+    importorskip,
+    load_update_fixture_for_num_envs,
+)
 
 torch = importorskip("torch")
 
-from dgppo.utils import build_graph_data, extract_graph_states_from_flat_obs
+from dgppo.utils import (
+    NUM_TYPE_INDICATORS,
+    build_graph_data,
+    extract_graph_states_from_flat_obs,
+)
 
 
 @pytest.mark.parametrize("num_envs", [2, 6])
@@ -260,3 +268,80 @@ def test_flat_observation_adapter_and_graph_shapes(num_envs: int) -> None:
     assert graph.n_graphs == num_envs
     assert graph.nodes.shape == (num_envs * (n_agents * 2 + n_obstacles + 1), state_dim + 3)
     assert graph.edges.shape == (num_envs * (n_agents * n_agents * 2 + n_agents * n_obstacles), state_dim + 3)
+
+
+def test_gnn_policy_and_value_shapes_for_rollout_and_chunk_graphs() -> None:
+    importorskip("torch_geometric")
+
+    from dgppo.dgppo_models import DGPPOPolicy, DGPPOValueNet
+    from dgppo.update_helpers import build_rollout_graph, rollout_graph_chunks
+
+    B, T, A, O, S = 2, 4, 3, 2, 6
+    action_dim = 4
+    n_constraints = 5
+    gnn_out_dim = 8
+    rnn_hidden = 7
+
+    agent_state = torch.randn(B, T, A, S)
+    goal_state = torch.randn(B, T, A, S)
+    obs_state = torch.randn(B, T, O, S)
+    graph = build_rollout_graph(
+        view={
+            "bTa_agent_state": agent_state,
+            "bTa_goal_state": goal_state,
+            "bTo_obs_state": obs_state,
+        },
+        obs_radius=10.0,
+    )
+    chunk_ids = torch.tensor([[0, 1], [2, 3]])
+    chunk_graph = rollout_graph_chunks(graph, chunk_ids=chunk_ids, T=T, B=B)
+
+    node_dim = S + NUM_TYPE_INDICATORS
+    common_kwargs = {
+        "node_dim": node_dim,
+        "edge_dim": node_dim,
+        "gnn_out_dim": gnn_out_dim,
+        "gnn_msg_dim": 6,
+        "gnn_heads": 2,
+        "mlp_hid": (9,),
+        "use_rnn": True,
+        "rnn_hidden": rnn_hidden,
+    }
+    policy = DGPPOPolicy(
+        **common_kwargs,
+        action_dim=action_dim,
+        gnn_layers=2,
+    )
+    Vl = DGPPOValueNet(
+        **common_kwargs,
+        gnn_layers=2,
+        n_out=1,
+        decompose=False,
+    )
+    Vh = DGPPOValueNet(
+        **common_kwargs,
+        gnn_layers=1,
+        n_out=n_constraints,
+        decompose=True,
+    )
+
+    assert policy.gnn(graph, node_type=0, n_type=A).shape == (B * T, A, gnn_out_dim)
+    assert policy.gnn(chunk_graph, node_type=0, n_type=A).shape == (
+        B,
+        chunk_ids.shape[0],
+        chunk_ids.shape[1],
+        A,
+        gnn_out_dim,
+    )
+
+    dist, policy_state = policy.distribution(graph, policy.initialize_carry(B * T * A), A)
+    assert dist.mean.shape == (B * T, A, action_dim)
+    assert dist.std.shape == (B * T, A, action_dim)
+    assert policy_state.shape == (1, B * T * A, 1, rnn_hidden)
+
+    vl, vl_state = Vl(graph, Vl.rnn.initialize_carry(B * T), A)
+    vh, vh_state = Vh(graph, policy.initialize_carry(B * T * A), A)
+    assert vl.shape == (B * T, 1)
+    assert vl_state.shape == (1, B * T, 1, rnn_hidden)
+    assert vh.shape == (B * T, A, n_constraints)
+    assert vh_state.shape == (1, B * T * A, 1, rnn_hidden)

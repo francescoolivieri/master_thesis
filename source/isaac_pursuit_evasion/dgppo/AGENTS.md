@@ -12,16 +12,15 @@ Use these JAX reference files when changing behavior:
 - `dgppo-main/dgppo/algo/module/value.py`: centralized/decentralized value heads.
 - `dgppo-main/dgppo/nn/gnn.py`, `dgppo-main/dgppo/nn/mlp.py`, `dgppo-main/dgppo/nn/rnn.py`: neural network building blocks.
 - `dgppo-main/dgppo/algo/utils.py`: Dec-EFOCP GAE and kernel utilities.
+- `dgppo-main/dgppo/env/lidar_env/base.py`: simulation environment of reference.
 - `dgppo-main/dgppo/parity/` and `dgppo-main/parity_artifacts`: fixture and tolerance tooling.
 
 ## Porting Priorities
 
-- Preserve algorithm semantics before refactoring for elegance.
-- Keep tensor shape names explicit in comments and variable names. Existing code uses `B`/`T`/`A`/`NH` and `bTah_*` style names; continue that convention.
+- Keep tensor shape names explicit in comments.
 - Match the reference update structure: stochastic rollout for policy/Vl, deterministic rollout for Vh targets, CBF-derived advantages for policy updates.
 - Keep the deterministic/stochastic environment split clear. Current code requires an even `num_envs >= 2`.
-- Treat RNN support as a first-class path even when `use_rnn: false` is the current config default. Avoid changes that make RNN parity harder.
-- Do not silently change sign conventions: rewards are converted to costs as `l = -reward`, and final policy advantages are negated before PPO.
+- Keep modularity support for the actor/critics newtorks, independently of current default config. 
 - Keep graph construction compatible with the IsaacLab observation layout in `pos_tracking_env.py`.
 
 ## Implementation Notes

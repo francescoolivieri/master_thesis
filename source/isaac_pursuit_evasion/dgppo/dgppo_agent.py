@@ -1227,12 +1227,16 @@ class DGPPOAgent(Agent):
                 getattr(base_env, "_pillar_collision_radius", getattr(cfg, "pillar_radius", 0.0))
             )
 
+        arena_min = getattr(base_env, "_arena_min_safe", getattr(base_env, "_arena_min", getattr(cfg, "arena_min")))
+        arena_max = getattr(base_env, "_arena_max_safe", getattr(base_env, "_arena_max", getattr(cfg, "arena_max")))
+        min_altitude = torch.as_tensor(arena_min, device=agent_state.device)[2].detach().cpu().item()
+
         costs = compute_pos_tracking_safety_costs(
             agent_state=agent_state,
             obs_state=physical_obs_state,
-            arena_min=getattr(base_env, "_arena_min_safe", getattr(base_env, "_arena_min", getattr(cfg, "arena_min"))),
-            arena_max=getattr(base_env, "_arena_max_safe", getattr(base_env, "_arena_max", getattr(cfg, "arena_max"))),
-            collision_altitude=float(getattr(cfg, "collision_altitude")),
+            arena_min=arena_min,
+            arena_max=arena_max,
+            collision_altitude=float(min_altitude),
             pillar_collision_radius=obstacle_radius,
             pillar_top_z=float(getattr(base_env, "_pillar_top_z", default_pillar_top_z)),
             obstacle_cost_mode=obstacle_cost_mode,

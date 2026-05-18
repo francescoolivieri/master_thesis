@@ -284,9 +284,8 @@ class EpisodeLogger:
         pos_error = torch.norm(ref_pos - pos_local, dim=-1, keepdim=True)
         state = torch.cat([pos_local, vel_world, quat, ang_vel], dim=-1)
         reference = torch.cat([ref_pos, ref_yaw], dim=-1)
-        flags = torch.stack(
-            [env._crash_mask(pos_local), env._out_of_bounds_mask(pos_local)], dim=-1
-        ).to(torch.float32)
+        altitude_limit, xy_limit = env._arena_limit_masks(pos_local)
+        flags = torch.stack([altitude_limit, xy_limit], dim=-1).to(torch.float32)
         rewards = env.get_last_rewards().detach().clone().cpu()
         reward_components = env.get_last_reward_components()
         observations = None
@@ -309,7 +308,7 @@ class EpisodeLogger:
             )
             self.step_counters[env_id] += 1
             if done[env_id].item():
-                reason = int(env.get_last_done_reasons()[env_id].item())
+                reason = int(env.get_last_episode_status()[env_id].item())
                 episode = buffer.to_episode(reason)
                 if episode is not None:
                     self.file_handler.write_episode(episode)
@@ -506,7 +505,7 @@ def main(env_cfg, agent_cfg: dict):
         episode_steps += 1
         if done.any():
             done_ids = torch.nonzero(done).squeeze(-1)
-            reasons = base_env.get_last_done_reasons()[done_ids]
+            reasons = base_env.get_last_episode_status()[done_ids]
             for env_id, reason in zip(done_ids.tolist(), reasons.tolist()):
                 total_episodes += 1
                 length = int(episode_steps[env_id].item())

@@ -695,10 +695,14 @@ def _reward_components_to_metrics(components: Any) -> dict[str, float]:
 
 
 def _termination_rates_to_metrics(base_env: Any) -> dict[str, float]:
-    if not hasattr(base_env, "get_last_done_reasons"):
+    if hasattr(base_env, "get_last_episode_status"):
+        get_status = base_env.get_last_episode_status
+    elif hasattr(base_env, "get_last_done_reasons"):
+        get_status = base_env.get_last_done_reasons
+    else:
         return {}
     try:
-        reasons = base_env.get_last_done_reasons()
+        reasons = get_status()
     except Exception:
         return {}
     if not isinstance(reasons, torch.Tensor):
@@ -1030,7 +1034,10 @@ def run_policy_evaluation(
         done_mask = (terminated | truncated)
         done_ids = torch.nonzero(done_mask, as_tuple=False).flatten()
         if done_ids.numel() > 0:
-            reasons = base_env.get_last_done_reasons().detach().clone().cpu()
+            if hasattr(base_env, "get_last_episode_status"):
+                reasons = base_env.get_last_episode_status().detach().clone().cpu()
+            else:
+                reasons = base_env.get_last_done_reasons().detach().clone().cpu()
             for env_id in done_ids.tolist():
                 reason = int(reasons[env_id].item())
                 reason_samples.append(reason)

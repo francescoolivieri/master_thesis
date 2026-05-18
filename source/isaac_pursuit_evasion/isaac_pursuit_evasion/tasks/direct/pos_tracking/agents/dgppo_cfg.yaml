@@ -10,11 +10,8 @@ env:
   include_yaw_with_ray_caster: true
   include_safety_penalties_in_reward: false
   terminate_on_safety_violation: false
-  # Match the LiDAR reference by treating obstacle contact as a cost, but reset
-  # drone states the reference never visits because it clips positions to bounds.
-  terminate_on_crash: true
-  terminate_on_out_of_bounds: true
-  terminate_on_pillar_collision: false
+  enable_clip_states: true
+  terminate_on_out_of_boundaries: true
 
 # - DG-PPO hyper-parameters, consumed by DGPPOAgentCfg / DGPPOAgent / DGPPORunner
 agent:

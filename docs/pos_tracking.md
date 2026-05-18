@@ -64,8 +64,8 @@ MLP-friendly layout. DG-PPO opts into top-k ray hit graph nodes from:
 source/isaac_pursuit_evasion/isaac_pursuit_evasion/tasks/direct/pos_tracking/agents/dgppo_cfg.yaml
 ```
 The same DG-PPO config disables reward safety penalties and keeps obstacle contact as a cost, while still resetting crash
-and out-of-bounds states that the clipped LiDAR reference never visits. It uses a generic ray-obstacle safety cost head
-instead of per-pillar hidden-geometry heads.
+states eagerly. Lateral walls are represented through ray-obstacle graph nodes, and the explicit bounds cost is reserved
+for vertical safety.
 
 ---
 

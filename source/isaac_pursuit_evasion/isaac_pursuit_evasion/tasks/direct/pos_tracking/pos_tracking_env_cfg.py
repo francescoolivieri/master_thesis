@@ -67,15 +67,15 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
         debug_vis=False,
     )
 
-    # Arena bounds [min, max] for [x, y, z]
-    arena_min = (-2.5, -2.0, 0.0) 
-    arena_max = (2.5, 2.0, 2.0)   
-    collision_altitude: float = 0.2
-    arena_margin: float = 0.0
+    # Safe flight envelope [min, max] for [x, y, z].
+    arena_min = (-2.5, -2.0, 0.2)
+    arena_max = (2.5, 2.0, 2.0)
+    arena_margin: float = 0.0 # add margin to the whole arena
+    altitude_outer_margin: float = 0.2  # add margin to altitudes
 
     enable_walls: bool = True
     wall_thickness: float = 0.05
-    wall_extra_margin: float = 0.5
+    wall_extra_margin: float = 0.0
 
     enable_pillars: bool = True
     pillar_positions_xy: tuple[tuple[float, float], ...] = ((-0.7, 0.0), (0.7, 0.0))
@@ -118,10 +118,7 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     ray_caster_top_k_hits: int = 8
     ray_caster_num_rays: int = 32
     ray_caster_max_distance: float = 8.0
-    ray_caster_no_hit_distance: float = 9.0
     ray_caster_safety_distance: float = 0.0  # <= 0 uses drone_collision_radius
-    ray_caster_channels: int = 1
-    ray_caster_vertical_fov_range: tuple[float, float] = (0.0, 0.0)
     ray_caster_horizontal_fov_range: tuple[float, float] = (-180.0, 180.0)
     ray_caster_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
     ray_caster_debug_vis: bool = False
@@ -164,13 +161,13 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     yaw_tolerance: float = 0.25
     success_hold_time_s: float = 1.0 # prev: 0.5
     terminate_on_success: bool = True
+
+    # Episode reset policy. Safety violations are the inner constraints (floor,
+    # ceiling, arena faces, pillars). Out-of-boundaries is the outer envelope,
+    # including wall thickness in xy and altitude_outer_margin in z.
     terminate_on_safety_violation: bool = True
-    # Granular safety resets are OR'ed with terminate_on_safety_violation. This
-    # lets DG-PPO keep obstacle contacts as costs while still resetting physically
-    # unrecoverable drone states such as crashes or leaving the arena.
-    terminate_on_crash: bool = False
-    terminate_on_out_of_bounds: bool = False
-    terminate_on_pillar_collision: bool = False
+    enable_clip_states: bool = True
+    terminate_on_out_of_boundaries: bool = False
 
     total_timesteps = episode_length_s * sim_frequency
 
