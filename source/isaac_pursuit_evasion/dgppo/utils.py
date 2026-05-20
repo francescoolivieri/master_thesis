@@ -157,25 +157,25 @@ def zero_policy_rnn_states_for_done(
     *,
     n_agents: int,
 ) -> torch.Tensor | None:
-    """Zero env slots in a policy carry shaped ``[L, E*A, C, H]``."""
+    """Zero done env slots in a policy carry with one sequence per env-agent pair."""
     if rnn_state is None:
         return None
     done_1d = torch.as_tensor(done, device=rnn_state.device, dtype=torch.bool).reshape(-1)
     if done_1d.numel() == 0 or not bool(done_1d.any().item()):
         return rnn_state
-    L, total_agents, C, H = rnn_state.shape
+    num_layers, num_sequences, num_carries, hidden_size = rnn_state.shape
     n_agents = int(n_agents)
-    if n_agents <= 0 or total_agents % n_agents != 0:
-        raise ValueError(f"cannot reshape policy RNN state with total_agents={total_agents}, n_agents={n_agents}")
-    n_envs = total_agents // n_agents
+    if n_agents <= 0 or num_sequences % n_agents != 0:
+        raise ValueError(f"cannot reshape policy RNN state with num_sequences={num_sequences}, n_agents={n_agents}")
+    n_envs = num_sequences // n_agents
     if done_1d.numel() != n_envs:
         raise ValueError(f"done mask has {done_1d.numel()} envs, but policy RNN state has {n_envs}")
-    rnn_state.reshape(L, n_envs, n_agents, C, H)[:, done_1d] = 0.0
+    rnn_state.reshape(num_layers, n_envs, n_agents, num_carries, hidden_size)[:, done_1d] = 0.0
     return rnn_state
 
 
 def zero_env_rnn_states_for_done(rnn_state: torch.Tensor | None, done: torch.Tensor) -> torch.Tensor | None:
-    """Zero env slots in a centralized carry shaped ``[L, E, C, H]``."""
+    """Zero done env slots in a centralized carry with one sequence per env."""
     if rnn_state is None:
         return None
     done_1d = torch.as_tensor(done, device=rnn_state.device, dtype=torch.bool).reshape(-1)
@@ -191,61 +191,61 @@ def compute_pos_tracking_safety_costs(
     *,
     agent_state: torch.Tensor,
     obs_state: torch.Tensor,
-    arena_min: torch.Tensor | Sequence[float],
-    arena_max: torch.Tensor | Sequence[float],
-    collision_altitude: float,
-    pillar_collision_radius: float,
-    pillar_top_z: float,
+    safe_arena_min: torch.Tensor | Sequence[float],
+    safe_arena_max: torch.Tensor | Sequence[float],
+    obstacle_collision_distance: float,
     eps: float = 5e-1,
-    obstacle_cost_mode: str = "per_obstacle",
 ) -> torch.Tensor:
-    """Signed DG-PPO costs for Crazyflie position tracking.
+    """Return signed DG-PPO costs for vertical bounds and nearest ray obstacle.
 
-    The default returned heads are ``[vertical_bounds, obstacle_0, ..., obstacle_N]``.
-    Lateral walls are expected to enter through obstacle/ray nodes, not through
-    the vertical bounds head.
-    With ``obstacle_cost_mode="nearest_obstacle"``, obstacle costs are reduced to
-    one generic closest-obstacle head. Costs are positive when unsafe and
-    negative when safe, following the JAX DG-PPO environment convention.
+    Positive costs mean unsafe. Negative costs mean safe. The final margin and
+    clipping follow the original DG-PPO convention.
     """
     if agent_state.ndim != 3:
         raise ValueError(f"agent_state must have shape [E, A, S], got {tuple(agent_state.shape)}")
-    E, A, _S = agent_state.shape
-    device, dtype = agent_state.device, agent_state.dtype
-    pos = agent_state[..., :3]
+    if agent_state.shape[-1] < 3:
+        raise ValueError(f"agent_state needs at least xyz position, got last dim {agent_state.shape[-1]}")
+    if obs_state.ndim != 3:
+        raise ValueError(f"obs_state must have shape [E, O, S], got {tuple(obs_state.shape)}")
+    if obs_state.shape[-1] < 2 and obs_state.shape[1] > 0:
+        raise ValueError(f"obs_state needs at least xy position, got last dim {obs_state.shape[-1]}")
+    if obs_state.shape[0] != agent_state.shape[0]:
+        raise ValueError(
+            f"agent_state has {agent_state.shape[0]} envs, but obs_state has {obs_state.shape[0]}"
+        )
 
-    arena_min_t = torch.as_tensor(arena_min, device=device, dtype=dtype)
-    arena_max_t = torch.as_tensor(arena_max, device=device, dtype=dtype)
-    min_z = torch.maximum(arena_min_t[2], torch.as_tensor(collision_altitude, device=device, dtype=dtype))
-    max_z = arena_max_t[2]
-    lower_z_violation = min_z - pos[..., 2]
-    upper_z_violation = pos[..., 2] - max_z
-    vertical_cost = torch.maximum(lower_z_violation, upper_z_violation).unsqueeze(-1)
+    n_envs, n_agents, _state_dim = agent_state.shape
+    device = agent_state.device
+    dtype = agent_state.dtype
+    obs_state = obs_state.to(device=device, dtype=dtype)
 
-    if obstacle_cost_mode not in {"per_obstacle", "nearest_obstacle"}:
-        raise ValueError(f"Unsupported obstacle_cost_mode: {obstacle_cost_mode}")
+    agent_pos = agent_state[..., :3]
+    agent_xy = agent_pos[..., :2]
+    agent_z = agent_pos[..., 2]
 
-    if obs_state.numel() == 0 or obs_state.shape[1] == 0:
-        raw_costs = vertical_cost
-    else:
-        pillar_xy = obs_state[:, None, :, :2].expand(E, A, -1, -1)
-        agent_xy = pos[:, :, None, :2]
-        dxy = torch.linalg.vector_norm(agent_xy - pillar_xy, dim=-1)
-        radial_cost = torch.as_tensor(pillar_collision_radius, device=device, dtype=dtype) - dxy
+    # altitude cost calculation
+    safe_min = torch.as_tensor(safe_arena_min, device=device, dtype=dtype)
+    safe_max = torch.as_tensor(safe_arena_max, device=device, dtype=dtype)
+    min_safe_z = safe_min[2]
+    max_safe_z = safe_max[2]
 
-        if obstacle_cost_mode == "nearest_obstacle":
-            obstacle_cost = radial_cost.max(dim=-1, keepdim=True).values
-        else:
-            z = pos[..., 2]
-            z_min = arena_min_t[2]
-            z_max = torch.as_tensor(pillar_top_z, device=device, dtype=dtype)
-            inside_height = (z >= z_min) & (z <= z_max)
-            vertical_clearance = torch.maximum(z_min - z, z - z_max).clamp_min(0.0)
-            inactive_height_cost = -vertical_clearance.clamp_min(float(eps))
-            obstacle_cost = torch.where(inside_height[..., None], radial_cost, inactive_height_cost[..., None])
-        raw_costs = torch.cat([vertical_cost, obstacle_cost], dim=-1)
+    lower_altitude_cost = min_safe_z - agent_z
+    upper_altitude_cost = agent_z - max_safe_z
+    vertical_cost = torch.maximum(lower_altitude_cost, upper_altitude_cost).unsqueeze(-1)
 
-    return _signed_clipped_cost(raw_costs, eps=eps).reshape(E, A, -1)
+    if obs_state.shape[1] == 0:
+        raise ValueError("DG-PPO safety costs require at least one ray obstacle observation")
+
+    obstacle_xy = obs_state[:, None, :, :2].expand(n_envs, n_agents, -1, -1)
+    distance_to_obstacle = torch.linalg.vector_norm(agent_xy[:, :, None, :] - obstacle_xy, dim=-1)
+
+    collision_radius = torch.as_tensor(obstacle_collision_distance, device=device, dtype=dtype)
+    obstacle_distance_cost = collision_radius - distance_to_obstacle
+    # max() selects the nearest hit because radius - distance grows as distance shrinks.
+    obstacle_cost = obstacle_distance_cost.max(dim=-1, keepdim=True).values
+
+    raw_costs = torch.cat((vertical_cost, obstacle_cost), dim=-1)
+    return _shift_and_clip_signed_cost(raw_costs, eps=eps)
 
 
 def align_safety_cost_heads(costs: torch.Tensor, n_constraints: int) -> torch.Tensor:
@@ -270,13 +270,12 @@ def align_safety_cost_heads(costs: torch.Tensor, n_constraints: int) -> torch.Te
     return torch.cat([costs, pad], dim=-1)
 
 
-def _signed_clipped_cost(cost: torch.Tensor, *, eps: float) -> torch.Tensor:
-    eps_t = torch.as_tensor(eps, device=cost.device, dtype=cost.dtype)
-    shifted = torch.where(cost <= 0.0, cost - eps_t, cost + eps_t)
+def _shift_and_clip_signed_cost(cost: torch.Tensor, *, eps: float) -> torch.Tensor:
+    margin = torch.as_tensor(eps, device=cost.device, dtype=cost.dtype)
+    shifted = torch.where(cost <= 0.0, cost - margin, cost + margin)
     return torch.clamp(shifted, min=-1.0, max=1.0)
 
 
-# DGPPO DEBUG FIX END: episode-boundary and safety-cost helper functions.
 
 
 def compute_cbf_advantages(
@@ -574,6 +573,8 @@ def extract_graph_states_from_flat_obs(
     S = int(layout["state_dim"])
     A = int(layout.get("n_agents", n_agents))
     n_obstacles = int(layout["n_obstacles"])
+    if observations.shape[1] != int(layout["obstacles_end"]):
+        raise ValueError("graph observation layout does not match observation vector")
 
     agent_flat = observations[:, : layout["agent_end"]]
     agent_state = agent_flat.reshape(E, A, S)
@@ -599,32 +600,40 @@ def build_graph_data(
     *,
     obs_radius: float,
 ) -> GraphData:
-    """Build a batched ``GraphData`` with jraph-style concatenated sub-graphs."""
+    """Build a fixed-layout batched graph from per-environment state tensors."""
     assert agent_state.dim() == 3 and goal_state.dim() == 3
     assert agent_state.shape[0] == goal_state.shape[0], "E must match"
     assert agent_state.shape[1] == goal_state.shape[1], "need one goal per agent"
     assert agent_state.shape[2] == goal_state.shape[2], "state dim must match"
 
-    E, A, S = agent_state.shape
+    n_envs, n_agents, state_dim = agent_state.shape
     device = agent_state.device
 
     if obs_state is None:
-        obs_state = agent_state.new_zeros(E, 0, S)
-    assert obs_state.shape[0] == E and obs_state.shape[2] == S
+        obs_state = agent_state.new_zeros(n_envs, 0, state_dim)
+    assert obs_state.shape[0] == n_envs and obs_state.shape[2] == state_dim
     n_obstacles = obs_state.shape[1]
 
-    N_per = A + A + n_obstacles + 1
+    # Each environment is stored as one fixed-size graph.
+    # Padding node used for inactive edges.
+    agent_start = 0
+    goal_start = n_agents
+    obstacle_start = 2 * n_agents
+    pad_index = obstacle_start + n_obstacles
+    nodes_per_env = pad_index + 1
+
     nodes, states, node_types = _make_node_features(agent_state, goal_state, obs_state)
 
-    nodes_flat = nodes.reshape(E * N_per, -1)
-    states_flat = states.reshape(E * N_per, -1)
-    node_types_flat = node_types.reshape(E * N_per)
+    nodes_flat = nodes.reshape(n_envs * nodes_per_env, -1)
+    states_flat = states.reshape(n_envs * nodes_per_env, -1)
+    node_types_flat = node_types.reshape(n_envs * nodes_per_env)
 
-    env_offsets = (torch.arange(E, device=device) * N_per).unsqueeze(1)
-    agent_ids = torch.arange(A, device=device).unsqueeze(0) + env_offsets
-    goal_ids = torch.arange(A, 2 * A, device=device).unsqueeze(0) + env_offsets
-    obs_ids = torch.arange(2 * A, 2 * A + n_obstacles, device=device).unsqueeze(0) + env_offsets
-    pad_ids = (N_per - 1 + env_offsets.squeeze(1)).long()
+    # Convert local node idxs of each environment into idxs in the flattened node array
+    env_offsets = (torch.arange(n_envs, device=device) * nodes_per_env).unsqueeze(1)
+    agent_ids = torch.arange(agent_start, goal_start, device=device).unsqueeze(0) + env_offsets
+    goal_ids = torch.arange(goal_start, obstacle_start, device=device).unsqueeze(0) + env_offsets
+    obs_ids = torch.arange(obstacle_start, pad_index, device=device).unsqueeze(0) + env_offsets
+    pad_ids = (pad_index + env_offsets.squeeze(1)).long()
 
     edges_flat, recvs_flat, sends_flat, n_edges_per_env = _make_edge_list(
         agent_state,
@@ -637,8 +646,8 @@ def build_graph_data(
         obs_radius=obs_radius,
     )
 
-    n_nodes = torch.full((E,), N_per, dtype=torch.long, device=device)
-    n_edges = torch.full((E,), n_edges_per_env, dtype=torch.long, device=device)
+    n_nodes = torch.full((n_envs,), nodes_per_env, dtype=torch.long, device=device)
+    n_edges = torch.full((n_envs,), n_edges_per_env, dtype=torch.long, device=device)
 
     return GraphData(
         n_nodes=n_nodes,
@@ -658,25 +667,30 @@ def _make_node_features(
     obs_state: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Assemble batched node features, physical states, and node-type ids."""
-    E, A, S = agent_state.shape
-    G = goal_state.shape[1]
+    n_envs, n_agents, state_dim = agent_state.shape
+    n_goals = goal_state.shape[1]
     n_obstacles = obs_state.shape[1]
     device, dtype = agent_state.device, agent_state.dtype
 
-    state_pad = torch.full((E, 1, S), -1.0, dtype=dtype, device=device)
+    n_real_nodes = n_agents + n_goals + n_obstacles
+    n_nodes = n_real_nodes + 1
+
+    nodes = torch.zeros(n_envs, n_nodes, state_dim + NUM_TYPE_INDICATORS, dtype=dtype, device=device)
+    nodes[:, :n_agents, :state_dim] = agent_state
+    nodes[:, n_agents : n_agents + n_goals, :state_dim] = goal_state
+    nodes[:, n_agents + n_goals : n_real_nodes, :state_dim] = obs_state
+
+    nodes[:, :n_agents, state_dim + 2] = 1.0 # agent indicator
+    nodes[:, n_agents : n_agents + n_goals, state_dim + 1] = 1.0 # goal indicator
+    nodes[:, n_agents + n_goals : n_real_nodes, state_dim] = 1.0 # obs indicator
+
+    state_pad = torch.full((n_envs, 1, state_dim), -1.0, dtype=dtype, device=device)
     states = torch.cat([agent_state, goal_state, obs_state, state_pad], dim=1)
 
-    N = A + G + n_obstacles + 1
-    indicator = torch.zeros(E, N, NUM_TYPE_INDICATORS, dtype=dtype, device=device)
-    indicator[:, :A, 2] = 1.0
-    indicator[:, A : A + G, 1] = 1.0
-    indicator[:, A + G : A + G + n_obstacles, 0] = 1.0
-    nodes = torch.cat([states, indicator], dim=-1)
-
-    node_types = torch.full((E, N), PAD_TYPE, dtype=torch.long, device=device)
-    node_types[:, :A] = AGENT_TYPE
-    node_types[:, A : A + G] = GOAL_TYPE
-    node_types[:, A + G : A + G + n_obstacles] = OBS_TYPE
+    node_types = torch.full((n_envs, n_nodes), PAD_TYPE, dtype=torch.long, device=device)
+    node_types[:, :n_agents] = AGENT_TYPE
+    node_types[:, n_agents : n_agents + n_goals] = GOAL_TYPE
+    node_types[:, n_agents + n_goals : n_real_nodes] = OBS_TYPE
 
     return nodes, states, node_types
 
@@ -693,68 +707,114 @@ def _make_edge_list(
     obs_radius: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Build fixed-size edge blocks, redirecting inactive edges to padding nodes."""
-    E, A, S = agent_state.shape
+    n_envs, n_agents, state_dim = agent_state.shape
     n_obstacles = obs_state.shape[1]
     device = agent_state.device
 
-    a_pos = agent_state[..., :2]
+    agent_pos = agent_state[..., :2]
+    not_self = ~torch.eye(n_agents, dtype=torch.bool, device=device)
 
-    dist_aa = torch.cdist(a_pos, a_pos)
-    aa_mask = (dist_aa < obs_radius) & ~torch.eye(A, dtype=torch.bool, device=device)
-    aa_feats = agent_state[:, :, None, :] - agent_state[:, None, :, :]
-    aa_f, aa_r, aa_s = _flatten_dense_edge_block(aa_feats, aa_mask, agent_ids, agent_ids, pad_ids)
+    # Agent-agent block. It is dense in shape, but self edges and far-away
+    # agents are marked inactive and routed to the padding node.
+    agent_agent_dist = torch.cdist(agent_pos, agent_pos)
+    agent_agent_active = (agent_agent_dist < obs_radius) & not_self
+    agent_agent_features = agent_state[:, :, None, :] - agent_state[:, None, :, :]
+    agent_agent_features, agent_agent_receivers, agent_agent_senders = _flatten_dense_edge_block(
+        agent_agent_features,
+        agent_agent_active,
+        agent_ids,
+        agent_ids,
+        pad_ids,
+    )
 
-    diag = torch.arange(A, device=device)
-    ag_feats = agent_state.new_zeros(E, A, A, S)
-    ag_feats[:, diag, diag, :] = agent_state - goal_state
-    ag_mask = torch.eye(A, dtype=torch.bool, device=device).unsqueeze(0)
-    ag_f, ag_r, ag_s = _flatten_dense_edge_block(ag_feats, ag_mask, agent_ids, goal_ids, pad_ids)
+    # Agent-goal block. Only the matching agent -> matching goal diagonal is
+    # active; the full A x A block is kept so every graph has the same shape.
+    agent_goal_diag = torch.arange(n_agents, device=device)
+    agent_goal_active = torch.eye(n_agents, dtype=torch.bool, device=device).unsqueeze(0)
+    agent_goal_features = agent_state.new_zeros(n_envs, n_agents, n_agents, state_dim)
+    agent_goal_features[:, agent_goal_diag, agent_goal_diag, :] = agent_state - goal_state
+    agent_goal_features, agent_goal_receivers, agent_goal_senders = _flatten_dense_edge_block(
+        agent_goal_features,
+        agent_goal_active,
+        agent_ids,
+        goal_ids,
+        pad_ids,
+    )
 
-    edge_f_parts = [aa_f.reshape(E, A * A, S), ag_f.reshape(E, A * A, S)]
-    recv_parts = [aa_r.reshape(E, A * A), ag_r.reshape(E, A * A)]
-    send_parts = [aa_s.reshape(E, A * A), ag_s.reshape(E, A * A)]
-    n_edges_per_env = A * A + A * A
+    n_agent_agent_edges = n_agents * n_agents
+    n_agent_goal_edges = n_agents * n_agents
+    n_edges_per_env = n_agent_agent_edges + n_agent_goal_edges
+
+    edge_feature_blocks = [
+        agent_agent_features.reshape(n_envs, n_agent_agent_edges, state_dim),
+        agent_goal_features.reshape(n_envs, n_agent_goal_edges, state_dim),
+    ]
+    receiver_blocks = [
+        agent_agent_receivers.reshape(n_envs, n_agent_agent_edges),
+        agent_goal_receivers.reshape(n_envs, n_agent_goal_edges),
+    ]
+    sender_blocks = [
+        agent_agent_senders.reshape(n_envs, n_agent_agent_edges),
+        agent_goal_senders.reshape(n_envs, n_agent_goal_edges),
+    ]
 
     if n_obstacles > 0:
-        o_pos = obs_state[..., :2]
-        dist_ao = torch.cdist(a_pos, o_pos)
-        ao_mask = dist_ao < obs_radius
-        ao_feats = agent_state[:, :, None, :] - obs_state[:, None, :, :]
-        ao_f, ao_r, ao_s = _flatten_dense_edge_block(ao_feats, ao_mask, agent_ids, obs_ids, pad_ids)
-        edge_f_parts.append(ao_f.reshape(E, A * n_obstacles, S))
-        recv_parts.append(ao_r.reshape(E, A * n_obstacles))
-        send_parts.append(ao_s.reshape(E, A * n_obstacles))
-        n_edges_per_env += A * n_obstacles
+        obstacle_pos = obs_state[..., :2]
+        agent_obstacle_dist = torch.cdist(agent_pos, obstacle_pos)
+        agent_obstacle_active = agent_obstacle_dist < obs_radius
+        agent_obstacle_features = agent_state.new_zeros(n_envs, n_agents, n_obstacles, state_dim)
+        agent_obstacle_features[..., :2] = agent_state[:, :, None, :2] - obs_state[:, None, :, :2]
+        agent_obstacle_features, agent_obstacle_receivers, agent_obstacle_senders = _flatten_dense_edge_block(
+            agent_obstacle_features,
+            agent_obstacle_active,
+            agent_ids,
+            obs_ids,
+            pad_ids,
+        )
 
-    edges_flat = torch.cat(edge_f_parts, dim=1).reshape(E * n_edges_per_env, S)
-    recvs_flat = torch.cat(recv_parts, dim=1).reshape(E * n_edges_per_env)
-    sends_flat = torch.cat(send_parts, dim=1).reshape(E * n_edges_per_env)
-    edges_flat = torch.cat(
-        [edges_flat, edges_flat.new_zeros(edges_flat.shape[0], NUM_TYPE_INDICATORS)],
-        dim=-1,
-    )
+        n_agent_obstacle_edges = n_agents * n_obstacles
+        edge_feature_blocks.append(agent_obstacle_features.reshape(n_envs, n_agent_obstacle_edges, state_dim))
+        receiver_blocks.append(agent_obstacle_receivers.reshape(n_envs, n_agent_obstacle_edges))
+        sender_blocks.append(agent_obstacle_senders.reshape(n_envs, n_agent_obstacle_edges))
+        n_edges_per_env += n_agent_obstacle_edges
+
+    edges_flat = torch.cat(edge_feature_blocks, dim=1).reshape(n_envs * n_edges_per_env, state_dim)
+    recvs_flat = torch.cat(receiver_blocks, dim=1).reshape(n_envs * n_edges_per_env)
+    sends_flat = torch.cat(sender_blocks, dim=1).reshape(n_envs * n_edges_per_env)
 
     return edges_flat, recvs_flat, sends_flat, n_edges_per_env
 
 
 def _flatten_dense_edge_block(
-    edge_feats: torch.Tensor,
-    edge_mask: torch.Tensor,
-    recv_ids: torch.Tensor,
-    send_ids: torch.Tensor,
+    edge_features: torch.Tensor,
+    edge_is_active: torch.Tensor,
+    receiver_ids: torch.Tensor,
+    sender_ids: torch.Tensor,
     pad_ids: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Flatten a dense edge grid and route inactive entries to each env's pad node."""
-    E, R, Sn, F = edge_feats.shape
-    recv_grid = recv_ids[:, :, None].expand(E, R, Sn)
-    send_grid = send_ids[:, None, :].expand(E, R, Sn)
-    pad_grid = pad_ids[:, None, None].expand(E, R, Sn)
+    """Flatten one dense [env, receiver, sender] edge block.
 
-    recv_flat = torch.where(edge_mask, recv_grid, pad_grid).reshape(-1)
-    send_flat = torch.where(edge_mask, send_grid, pad_grid).reshape(-1)
-    feats_flat = edge_feats.reshape(E * R * Sn, F)
+    Inputs:
+        edge_features:  [n_envs, n_receivers, n_senders, feature_dim]
+        edge_is_active: [n_envs, n_receivers, n_senders]
+        receiver_ids:   [n_envs, n_receivers]
+        sender_ids:     [n_envs, n_senders]
+        pad_ids:        [n_envs]
 
-    return feats_flat, recv_flat, send_flat
+    Inactive edges are not removed. Their sender and receiver are changed to
+    the padding node for the same environment, preserving the fixed block size.
+    """
+    n_envs, n_receivers, n_senders, feature_dim = edge_features.shape
+
+    receiver_grid = receiver_ids[:, :, None].expand(n_envs, n_receivers, n_senders)
+    sender_grid = sender_ids[:, None, :].expand(n_envs, n_receivers, n_senders)
+    pad_grid = pad_ids[:, None, None].expand(n_envs, n_receivers, n_senders)
+
+    receivers_flat = torch.where(edge_is_active, receiver_grid, pad_grid).reshape(-1)
+    senders_flat = torch.where(edge_is_active, sender_grid, pad_grid).reshape(-1)
+    edge_features_flat = edge_features.reshape(n_envs * n_receivers * n_senders, feature_dim)
+
+    return edge_features_flat, receivers_flat, senders_flat
 
 
 class GraphTransformer(MessagePassing):
@@ -933,9 +993,9 @@ class RNN(nn.Module):
 
     Inputs/outputs:
         x:         [n_agents, in_dim]
-        rnn_state: [n_layers, n_agents, n_carries, hid_size]
-                   - GRU:  n_carries = 1 (just 'h')
-                   - LSTM: n_carries = 2 ('h', 'c')
+        rnn_state: [num_layers, num_sequences, num_carries, hidden_size]
+                   - GRU:  one carry (hidden state)
+                   - LSTM: two carries (hidden and cell state)
     """
 
     def __init__(self, rnn_cell: str, input_size: int, hidden_size: int, rnn_layers: int):
@@ -956,25 +1016,23 @@ class RNN(nn.Module):
         self.cells = nn.ModuleList(cells)
 
     def forward(self, x: torch.Tensor, rnn_state: torch.Tensor):
-        # L -> n_layers, N -> n_agents, C -> n_carries, H -> hid_size
-
         new_states = []
         for i, cell in enumerate(self.cells):
             if self.rnn_cell == "gru":
-                h_i = rnn_state[i, :, 0, :]  # [N, H]
-                h_next = cell(x, h_i)  # [N, H]
+                h_i = rnn_state[i, :, 0, :]
+                h_next = cell(x, h_i)
                 x = h_next
-                new_states.append(h_next.unsqueeze(1))  # [N, 1, H]
+                new_states.append(h_next.unsqueeze(1))
             else:  # lstm
-                h_i = rnn_state[i, :, 0, :]  # [N, H]
-                c_i = rnn_state[i, :, 1, :]  # [N, H]
+                h_i = rnn_state[i, :, 0, :]
+                c_i = rnn_state[i, :, 1, :]
                 h_next, c_next = cell(x, (h_i, c_i))
                 x = h_next
-                new_states.append(torch.stack([h_next, c_next], dim=1))  # [N, 2, H]
-        return x, torch.stack(new_states, dim=0)  # [L, N, C, H]
+                new_states.append(torch.stack([h_next, c_next], dim=1))
+        return x, torch.stack(new_states, dim=0)
 
     @torch.no_grad()
-    def initialize_carry(self, n_agents: int, device=None) -> torch.Tensor:
+    def initialize_carry(self, num_sequences: int, device=None) -> torch.Tensor:
         device = device or next(self.parameters()).device
         n_carries = 1 if self.rnn_cell == "gru" else 2
-        return torch.zeros(self.rnn_layers, n_agents, n_carries, self.hidden_size, device=device)
+        return torch.zeros(self.rnn_layers, num_sequences, n_carries, self.hidden_size, device=device)

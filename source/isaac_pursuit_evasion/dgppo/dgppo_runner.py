@@ -33,6 +33,7 @@ class DGPPORunner:
 
         n_agents = env.num_agents
         n_envs = env.num_envs
+        n_agents = int(getattr(base_env, "num_agents", getattr(env, "num_agents", 1)))
         n_constraints = int(getattr(base_env, "n_constraints", 1))
         action_dim = env.action_space.shape[0]  # per agent action size
         agent_cfg.num_envs = int(n_envs)
@@ -41,7 +42,7 @@ class DGPPORunner:
         layout = base_env.graph_obs_layout
         graph_state_dim = int(layout["state_dim"])
         node_dim = graph_state_dim + NUM_TYPE_INDICATORS
-        edge_dim = graph_state_dim + NUM_TYPE_INDICATORS
+        edge_dim = graph_state_dim
         
 
         # - Policy
@@ -52,6 +53,7 @@ class DGPPORunner:
         policy = DGPPOPolicy(
             node_dim=node_dim,
             edge_dim=edge_dim,
+            n_agents=n_agents,
             action_dim=action_dim,
             gnn_layers=int(gnn_cfg.get("policy_layers", 1)),
             gnn_out_dim=int(gnn_cfg.get("policy_out_dim", gnn_cfg.get("out_dim", 64))),
@@ -73,6 +75,7 @@ class DGPPORunner:
         critic_kwargs = dict(
             node_dim=node_dim,
             edge_dim=edge_dim,
+            n_agents=n_agents,
             gnn_out_dim=int(gnn_cfg.get("critic_out_dim", gnn_cfg.get("out_dim", 64))),
             gnn_msg_dim=int(gnn_cfg.get("msg_dim", 32)),
             gnn_heads=int(gnn_cfg.get("n_heads", 3)),

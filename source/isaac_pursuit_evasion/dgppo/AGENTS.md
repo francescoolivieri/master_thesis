@@ -30,11 +30,10 @@ Use these JAX reference files when changing behavior:
 - `dgppo_memory.py` stores stochastic and deterministic rollout splits.
 - `dgppo_models.py` owns policy/value modules and the squashed Gaussian distribution.
 - `utils.py` owns graph data structures, GNN layers, GAE, CBF advantage, and PPO surrogate helpers.
+- Do not sacrifice code readability and cleanliness for parity support.
 
 ## Validation
 
-- For parity-sensitive changes, run `source/isaac_pursuit_evasion/dgppo/parity_suite` first; these tests must call production DG-PPO code (no copied test-only PPO/GAE/loss logic).
-- Use `dgppo-main/parity_artifacts` as the default oracle fixtures. Export fresh fixtures with `dgppo-main/parity_checks.py` when JAX reference behavior changes or when adding new coverage (for example `num_envs = 6`).
-- Treat `num_envs=6` single-update parity and the `drift_num_envs6` multi-update replay as the current executable multi-env gates. The drift artifact must include per-update replay inputs/checkpoints, not just scalar summaries.
+- For parity-sensitive changes, run `source/isaac_pursuit_evasion/dgppo/parity_suite` first; these tests must call production DG-PPO code.
 - For runtime integration changes, run the shortest practical DG-PPO headless smoke test through `scripts/skrl/train.py` after parity checks pass.
 - If a full IsaacLab or JAX dependency stack is unavailable, document exactly which validation could not run.

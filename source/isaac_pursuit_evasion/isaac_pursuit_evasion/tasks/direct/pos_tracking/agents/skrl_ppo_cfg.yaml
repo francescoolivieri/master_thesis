@@ -8,7 +8,6 @@ env:
   enable_ray_caster: true
   ray_caster_observation_mode: ray_ordered_hits
   include_yaw_with_ray_caster: true
-  include_safety_penalties_in_reward: true
   terminate_on_safety_violation: true
 
 models:

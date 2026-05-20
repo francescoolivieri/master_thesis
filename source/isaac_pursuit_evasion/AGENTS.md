@@ -22,7 +22,7 @@ Scope: everything under `source/isaac_pursuit_evasion/`.
 
 ## Training Configs
 
-- Keep `agents/dgppo_cfg.yaml` aligned with `DGPPOAgent.load_dgppo_hyperparameters()` and `DGPPORunner.__init__()`.
+- Keep `agents/dgppo_cfg.yaml` aligned with `DGPPOAgent._load_hyperparameters_from_cfg()` and `DGPPORunner.__init__()`.
 - When changing task IDs, config entrypoints, or environment registration, also update README/docs references.
 
 ## Validation

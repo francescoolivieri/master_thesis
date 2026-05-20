@@ -36,10 +36,6 @@ class UpdateGraphBatch:
     A: int
 
     @property
-    def n_agents_total(self) -> int:
-        return self.b * self.T * self.A
-
-    @property
     def chunk_ids(self) -> torch.Tensor:
         return torch.arange(self.T, device=self.actions.device).reshape(1, self.T)
 
@@ -136,15 +132,14 @@ def compute_policy_loss(
     advantages: torch.Tensor,
     clip_eps: float,
     entropy_scale: float,
-    n_agents_total: int,
+    n_agents: int,
     rnn_state: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Evaluate the real policy and compute the clipped DG-PPO policy loss."""
     log_prob, entropy, _ = policy.evaluate(
         graph,
-        action=actions.reshape(n_agents_total, -1),
+        action=actions.reshape(n_agents, -1),
         rnn_state=rnn_state,
-        n_agents_total=n_agents_total,
         compute_entropy=entropy_scale > 0,
     )
     log_prob = log_prob.reshape_as(old_logp)
@@ -210,8 +205,8 @@ def compute_rollout_policy_loss(
     """Evaluate policy loss over rollout envs and RNN chunks using production policy code.
 
     If ``rnn_states`` is provided, it is expected as incoming per-step policy
-    carries shaped ``[B, T, L, A, C, H]``. Chunk evaluation starts from the
-    stored carry at each chunk's first timestep.
+    carries. Chunk evaluation starts from the stored carry at each chunk's first
+    timestep.
     """
     B, T, A, action_dim = actions.shape
     chunk_ids_index = _canonical_chunk_ids(chunk_ids, device=actions.device)
@@ -227,7 +222,6 @@ def compute_rollout_policy_loss(
             chunk_graph,
             action=action_chunks.reshape(B * C * R * A, action_dim),
             rnn_state=None,
-            n_agents_total=n_agents,
             compute_entropy=compute_entropy,
         )
         log_prob = step_log_prob.reshape(B, C, R, A)
@@ -286,7 +280,7 @@ def scan_policy_rnn_states(
         states[:, t] = rnn_state.reshape(rnn_state.shape[0], B, A, rnn_state.shape[2], rnn_state.shape[3]).permute(
             1, 0, 2, 3, 4
         )
-        _, rnn_state = policy.distribution(rollout_graph_timestep(graph, t=t, T=T, B=B), rnn_state, A)
+        _, rnn_state = policy.distribution(rollout_graph_timestep(graph, t=t, T=T, B=B), rnn_state)
     return states
 
 
@@ -371,11 +365,11 @@ def compute_value_losses(
             "loss_vh": vh_info["loss_vh"],
         }
 
-    vl, _ = Vl(graph, None, A)
+    vl, _ = Vl(graph, None)
     vl = vl.reshape(b, T)
     loss_vl = compute_value_l2_loss(vl, ql_targets, scale=vl_loss_scale)
 
-    vh, _ = Vh(det_graph, None, A)
+    vh, _ = Vh(det_graph, None)
     vh = vh.reshape(b, T, A, -1)
     loss_vh = compute_value_l2_loss(vh, qh_det_targets, scale=vh_loss_scale)
 
@@ -474,7 +468,7 @@ def scan_vl_values(
     values = graph.nodes.new_empty((B, T))
     rnn_state = Vl.rnn.initialize_carry(B, device=graph.nodes.device) if Vl.rnn is not None else None
     for t in range(T):
-        value, rnn_state = Vl(rollout_graph_timestep(graph, t=t, T=T, B=B), rnn_state, A)
+        value, rnn_state = Vl(rollout_graph_timestep(graph, t=t, T=T, B=B), rnn_state)
         values[:, t] = value.squeeze(-1)
     return values
 
@@ -494,7 +488,7 @@ def evaluate_vh_values(
     values = graph.nodes.new_empty((B, T, A, n_heads), dtype=first_state.dtype)
     for t in range(T):
         step_rnn_states = _flatten_agent_rnn_states(rnn_states[:, t])
-        value, _ = Vh(rollout_graph_timestep(graph, t=t, T=T, B=B), step_rnn_states, A)
+        value, _ = Vh(rollout_graph_timestep(graph, t=t, T=T, B=B), step_rnn_states)
         values[:, t] = value
     return values
 
@@ -543,7 +537,7 @@ def _evaluate_policy_chunks(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Evaluate recurrent policy chunks with one GNN/MLP batch and an R-step recurrent scan."""
     action_dim = action_chunks.shape[-1]
-    x = policy.gnn(graph, node_type=0, n_type=A)
+    x = policy.gnn(graph, node_type=0, n_type=policy.n_agents)
     x = policy.mlp(x).reshape(B, C, R, A, policy.mlp.hid_sizes[-1])
     x = x.permute(2, 0, 1, 3, 4).reshape(R, B * C * A, policy.mlp.hid_sizes[-1])
 
@@ -584,10 +578,10 @@ def _evaluate_vl_chunks(
 ) -> torch.Tensor:
     """Evaluate centralized Vl chunks while preserving per-chunk recurrent resets."""
     if Vl.rnn is None:
-        values, _ = Vl(graph, None, A)
+        values, _ = Vl(graph, None)
         return values.squeeze(-1)
 
-    x = Vl.gnn(graph, node_type=0, n_type=A)
+    x = Vl.gnn(graph, node_type=0, n_type=Vl.n_agents)
     x = x.mean(dim=-2)
     x = Vl.head(x).reshape(B, C, R, Vl.head.hid_sizes[-1])
     x = x.permute(2, 0, 1, 3).reshape(R, B * C, Vl.head.hid_sizes[-1])
@@ -664,7 +658,7 @@ def _evaluate_vh_chunks(
 ) -> torch.Tensor:
     """Evaluate deterministic Vh chunks in one batched call using stored policy RNN states."""
     rnn_state = _flatten_agent_rnn_states(rnn_states) if Vh.rnn is not None else None
-    values, _ = Vh(graph, rnn_state, A)
+    values, _ = Vh(graph, rnn_state)
     return values.reshape(B, C, R, A, n_cost)
 
 
@@ -675,7 +669,7 @@ def apply_policy_update(
     parameters: Iterable[torch.nn.Parameter],
     grad_clip: float,
 ) -> torch.Tensor:
-    """Backpropagate, clip gradients, and apply one optimizer step."""
+    """Backpropagate, clip finite gradients, and apply one optimizer step."""
     return _apply_optimizer_update(optimizer=optimizer, loss=loss, parameters=parameters, grad_clip=grad_clip)
 
 
@@ -686,7 +680,7 @@ def apply_value_update(
     parameters: Iterable[torch.nn.Parameter],
     grad_clip: float,
 ) -> torch.Tensor:
-    """Backpropagate, clip gradients, and apply one critic optimizer step."""
+    """Backpropagate, clip finite gradients, and apply one critic optimizer step."""
     return _apply_optimizer_update(optimizer=optimizer, loss=loss, parameters=parameters, grad_clip=grad_clip)
 
 
@@ -700,6 +694,23 @@ def _apply_optimizer_update(
     params = list(parameters)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
-    grad_norm = torch.nn.utils.clip_grad_norm_(params, grad_clip)
+    grad_norm = _total_grad_norm(params, device=loss.device, dtype=loss.dtype)
+    if not bool(torch.isfinite(grad_norm).item()):
+        optimizer.zero_grad(set_to_none=True)
+        return grad_norm
+    torch.nn.utils.clip_grad_norm_(params, grad_clip)
     optimizer.step()
-    return torch.as_tensor(grad_norm, device=loss.device, dtype=loss.dtype)
+    return grad_norm
+
+
+def _total_grad_norm(
+    parameters: Iterable[torch.nn.Parameter],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    grads = [param.grad.detach() for param in parameters if param.grad is not None]
+    if not grads:
+        return torch.zeros((), device=device, dtype=dtype)
+    norms = torch.stack([torch.linalg.vector_norm(grad).to(device=device, dtype=dtype) for grad in grads])
+    return torch.linalg.vector_norm(norms)

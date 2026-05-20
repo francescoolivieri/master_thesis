@@ -11,9 +11,14 @@ from .parity_test_utils import (
 torch = importorskip("torch")
 
 from dgppo.utils import (
+    AGENT_TYPE,
+    GOAL_TYPE,
     NUM_TYPE_INDICATORS,
+    OBS_TYPE,
+    PAD_TYPE,
     build_graph_data,
     extract_graph_states_from_flat_obs,
+    graph_data_slice,
 )
 
 
@@ -267,7 +272,177 @@ def test_flat_observation_adapter_and_graph_shapes(num_envs: int) -> None:
     assert_parity_close(obs_state[..., :2], obstacles, stage="adapter", tensor_name="obstacle_xy")
     assert graph.n_graphs == num_envs
     assert graph.nodes.shape == (num_envs * (n_agents * 2 + n_obstacles + 1), state_dim + 3)
-    assert graph.edges.shape == (num_envs * (n_agents * n_agents * 2 + n_agents * n_obstacles), state_dim + 3)
+    assert graph.edges.shape == (num_envs * (n_agents * n_agents * 2 + n_agents * n_obstacles), state_dim)
+
+
+def test_build_graph_data_preserves_node_order_types_and_padding_state() -> None:
+    agent_state = torch.tensor(
+        [
+            [[1.0, 2.0, 3.0, 4.0], [10.0, 20.0, 30.0, 40.0]],
+            [[5.0, 6.0, 7.0, 8.0], [50.0, 60.0, 70.0, 80.0]],
+        ]
+    )
+    goal_state = torch.tensor(
+        [
+            [[-1.0, -2.0, -3.0, -4.0], [-10.0, -20.0, -30.0, -40.0]],
+            [[-5.0, -6.0, -7.0, -8.0], [-50.0, -60.0, -70.0, -80.0]],
+        ]
+    )
+    obs_state = torch.tensor(
+        [
+            [[100.0, 200.0, 300.0, 400.0]],
+            [[500.0, 600.0, 700.0, 800.0]],
+        ]
+    )
+
+    graph = build_graph_data(agent_state, goal_state, obs_state, obs_radius=1.0)
+
+    env0 = graph_data_slice(graph, 0)
+    env1 = graph_data_slice(graph, 1)
+    expected_types = torch.tensor([AGENT_TYPE, AGENT_TYPE, GOAL_TYPE, GOAL_TYPE, OBS_TYPE, PAD_TYPE])
+    expected_state_env0 = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0],
+            [10.0, 20.0, 30.0, 40.0],
+            [-1.0, -2.0, -3.0, -4.0],
+            [-10.0, -20.0, -30.0, -40.0],
+            [100.0, 200.0, 300.0, 400.0],
+            [-1.0, -1.0, -1.0, -1.0],
+        ]
+    )
+    expected_state_env1 = torch.tensor(
+        [
+            [5.0, 6.0, 7.0, 8.0],
+            [50.0, 60.0, 70.0, 80.0],
+            [-5.0, -6.0, -7.0, -8.0],
+            [-50.0, -60.0, -70.0, -80.0],
+            [500.0, 600.0, 700.0, 800.0],
+            [-1.0, -1.0, -1.0, -1.0],
+        ]
+    )
+
+    assert_parity_close(env0.states, expected_state_env0, stage="graph_nodes", tensor_name="env0_states")
+    assert_parity_close(env1.states, expected_state_env1, stage="graph_nodes", tensor_name="env1_states")
+    assert torch.equal(env0.node_types, expected_types)
+    assert torch.equal(env1.node_types, expected_types)
+
+    assert torch.equal(env0.nodes[:2, 4:], torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]))
+    assert torch.equal(env0.nodes[2:4, 4:], torch.tensor([[0.0, 1.0, 0.0], [0.0, 1.0, 0.0]]))
+    assert torch.equal(env0.nodes[4:5, 4:], torch.tensor([[1.0, 0.0, 0.0]]))
+    assert torch.equal(env0.nodes[5:, :], torch.zeros_like(env0.nodes[5:, :]))
+
+    assert_parity_close(graph.get_type_states(AGENT_TYPE, 2), agent_state, stage="graph_nodes", tensor_name="agent_states")
+    assert_parity_close(graph.get_type_states(GOAL_TYPE, 2), goal_state, stage="graph_nodes", tensor_name="goal_states")
+    assert_parity_close(graph.get_type_states(OBS_TYPE, 1), obs_state, stage="graph_nodes", tensor_name="obs_states")
+
+
+def test_build_graph_data_constructs_expected_edges_for_mixed_multi_env_case() -> None:
+    agent_state = torch.tensor(
+        [
+            [[0.0, 0.0, 0.0, 10.0], [0.4, 0.0, 1.0, 20.0]],
+            [[0.0, 0.0, 2.0, 30.0], [2.0, 0.0, 3.0, 40.0]],
+        ]
+    )
+    goal_state = torch.tensor(
+        [
+            [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+            [[0.0, 2.0, 0.0, 0.0], [2.0, 2.0, 0.0, 0.0]],
+        ]
+    )
+    obs_state = torch.tensor(
+        [
+            [[0.2, 0.0, 0.0, 0.0]],
+            [[2.2, 0.0, 0.0, 0.0]],
+        ]
+    )
+
+    graph = build_graph_data(agent_state, goal_state, obs_state, obs_radius=1.0)
+
+    env0 = graph_data_slice(graph, 0)
+    env1 = graph_data_slice(graph, 1)
+
+    assert torch.equal(env0.senders, torch.tensor([5, 1, 0, 5, 2, 5, 5, 3, 4, 4]))
+    assert torch.equal(env0.receivers, torch.tensor([5, 0, 1, 5, 0, 5, 5, 1, 0, 1]))
+    assert torch.equal(env1.senders, torch.tensor([5, 5, 5, 5, 2, 5, 5, 3, 5, 4]))
+    assert torch.equal(env1.receivers, torch.tensor([5, 5, 5, 5, 0, 5, 5, 1, 5, 1]))
+
+    assert_parity_close(
+        env0.edges[1, :4],
+        agent_state[0, 0] - agent_state[0, 1],
+        stage="graph_edges",
+        tensor_name="env0_agent_agent_0_from_1",
+    )
+    assert_parity_close(
+        env0.edges[2, :4],
+        agent_state[0, 1] - agent_state[0, 0],
+        stage="graph_edges",
+        tensor_name="env0_agent_agent_1_from_0",
+    )
+    assert_parity_close(
+        env0.edges[4, :4],
+        agent_state[0, 0] - goal_state[0, 0],
+        stage="graph_edges",
+        tensor_name="env0_goal0_to_agent0",
+    )
+    assert_parity_close(
+        env0.edges[7, :4],
+        agent_state[0, 1] - goal_state[0, 1],
+        stage="graph_edges",
+        tensor_name="env0_goal1_to_agent1",
+    )
+    expected_obs_env0 = torch.tensor([[-0.2, 0.0, 0.0, 0.0], [0.2, 0.0, 0.0, 0.0]])
+    assert_parity_close(env0.edges[8:, :4], expected_obs_env0, stage="graph_edges", tensor_name="env0_obs_edges")
+    assert_parity_close(
+        env1.edges[9, :4],
+        torch.tensor([-0.2, 0.0, 0.0, 0.0]),
+        stage="graph_edges",
+        tensor_name="env1_obs_to_agent1",
+    )
+
+    for env_graph in (env0, env1):
+        assert int(env_graph.senders.min()) >= 0
+        assert int(env_graph.receivers.min()) >= 0
+        assert int(env_graph.senders.max()) < env_graph.nodes.shape[0]
+        assert int(env_graph.receivers.max()) < env_graph.nodes.shape[0]
+
+
+def test_build_graph_data_without_obstacles_routes_only_agent_and_goal_edges() -> None:
+    agent_state = torch.tensor(
+        [
+            [[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
+            [[1.0, 0.0, 0.0], [4.0, 0.0, 0.0]],
+        ]
+    )
+    goal_state = torch.tensor(
+        [
+            [[0.5, 0.0, 0.0], [3.5, 0.0, 0.0]],
+            [[1.5, 0.0, 0.0], [4.5, 0.0, 0.0]],
+        ]
+    )
+
+    graph = build_graph_data(agent_state, goal_state, obs_state=None, obs_radius=0.5)
+
+    assert graph.n_graphs == 2
+    assert graph.nodes.shape == (2 * (2 * 2 + 1), 3 + NUM_TYPE_INDICATORS)
+    assert graph.edges.shape == (2 * (2 * 2 * 2), 3)
+    assert_parity_close(
+        graph.get_type_states(PAD_TYPE, 1),
+        torch.full((2, 1, 3), -1.0),
+        stage="graph_edges",
+        tensor_name="pad_state_without_obstacles",
+    )
+
+    env0 = graph_data_slice(graph, 0)
+    env1 = graph_data_slice(graph, 1)
+    expected_agent_agent = torch.full((4,), 4, dtype=torch.long)
+    expected_goal_senders = torch.tensor([2, 4, 4, 3], dtype=torch.long)
+    expected_goal_receivers = torch.tensor([0, 4, 4, 1], dtype=torch.long)
+
+    for env_graph in (env0, env1):
+        assert torch.equal(env_graph.senders[:4], expected_agent_agent)
+        assert torch.equal(env_graph.receivers[:4], expected_agent_agent)
+        assert torch.equal(env_graph.senders[4:], expected_goal_senders)
+        assert torch.equal(env_graph.receivers[4:], expected_goal_receivers)
 
 
 def test_gnn_policy_and_value_shapes_for_rollout_and_chunk_graphs() -> None:
@@ -299,7 +474,8 @@ def test_gnn_policy_and_value_shapes_for_rollout_and_chunk_graphs() -> None:
     node_dim = S + NUM_TYPE_INDICATORS
     common_kwargs = {
         "node_dim": node_dim,
-        "edge_dim": node_dim,
+        "edge_dim": S,
+        "n_agents": A,
         "gnn_out_dim": gnn_out_dim,
         "gnn_msg_dim": 6,
         "gnn_heads": 2,
@@ -334,13 +510,13 @@ def test_gnn_policy_and_value_shapes_for_rollout_and_chunk_graphs() -> None:
         gnn_out_dim,
     )
 
-    dist, policy_state = policy.distribution(graph, policy.initialize_carry(B * T * A), A)
+    dist, policy_state = policy.distribution(graph, policy.initialize_carry(B * T * A))
     assert dist.mean.shape == (B * T, A, action_dim)
     assert dist.std.shape == (B * T, A, action_dim)
     assert policy_state.shape == (1, B * T * A, 1, rnn_hidden)
 
-    vl, vl_state = Vl(graph, Vl.rnn.initialize_carry(B * T), A)
-    vh, vh_state = Vh(graph, policy.initialize_carry(B * T * A), A)
+    vl, vl_state = Vl(graph, Vl.rnn.initialize_carry(B * T))
+    vh, vh_state = Vh(graph, policy.initialize_carry(B * T * A))
     assert vl.shape == (B * T, 1)
     assert vl_state.shape == (1, B * T, 1, rnn_hidden)
     assert vh.shape == (B * T, A, n_constraints)

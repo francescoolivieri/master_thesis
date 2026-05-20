@@ -20,8 +20,8 @@ Rollout memory used by DGPPOAgent.
     truncated      (T, B)
     values_l       (T+1, B)
     values_h       (T+1, B, A, NH)
-    rnn_state      (T, B, A, L, C, H)  -- only kept if the policy has an RNN
-    vl_rnn_state   (T, B, L, C, H)     -- only kept if Vl has an RNN
+    rnn_state      one policy carry per rollout step, env, and agent
+    vl_rnn_state   one centralized Vl carry per rollout step and env
 
 ``values_l`` / ``values_h`` have one extra step for the terminal bootstrap.
 """
@@ -88,7 +88,6 @@ class DGPPORolloutMemory(RandomMemory):
             self.create_tensor(f"{prefix}_values_h", size=B * A * NH, dtype=torch.float32, keep_dimensions=False)
 
             if self.use_rnn:
-                # [B * A, L, C, H] flattened for RandomMemory which expects a flat size per step
                 rnn_size = B * A * self.rnn_layers * self.rnn_carries * self.rnn_hidden
                 self.create_tensor(f"{prefix}_rnn_states", size=rnn_size, dtype=torch.float32, keep_dimensions=False)
             if self.use_vl_rnn:
@@ -210,24 +209,25 @@ class DGPPORolloutMemory(RandomMemory):
 
         self._cursor += 1
 
-    def _canonical_rnn_state(self, rnn_state: torch.Tensor, B: int) -> torch.Tensor:
-        """Return policy RNN state as ``[B, A, L, C, H]`` for storage."""
+    def _canonical_rnn_state(self, rnn_state: torch.Tensor, n_envs: int) -> torch.Tensor:
+        """Return policy carry with env and agent as the first two dimensions."""
         A = self._n_agents
-        if rnn_state.shape == (self.rnn_layers, B * A, self.rnn_carries, self.rnn_hidden):
-            return rnn_state.reshape(self.rnn_layers, B, A, self.rnn_carries, self.rnn_hidden).permute(1, 2, 0, 3, 4)
-        if rnn_state.shape == (B, A, self.rnn_layers, self.rnn_carries, self.rnn_hidden):
+        flat_shape = (self.rnn_layers, n_envs * A, self.rnn_carries, self.rnn_hidden)
+        stored_shape = (n_envs, A, self.rnn_layers, self.rnn_carries, self.rnn_hidden)
+        if rnn_state.shape == flat_shape:
+            return rnn_state.reshape(self.rnn_layers, n_envs, A, self.rnn_carries, self.rnn_hidden).permute(1, 2, 0, 3, 4)
+        if rnn_state.shape == stored_shape:
             return rnn_state
         raise ValueError(
             "Unexpected RNN state shape "
             f"{tuple(rnn_state.shape)}; expected "
-            f"{(self.rnn_layers, B * A, self.rnn_carries, self.rnn_hidden)} or "
-            f"{(B, A, self.rnn_layers, self.rnn_carries, self.rnn_hidden)}"
+            f"{flat_shape} or {stored_shape}"
         )
 
-    def _canonical_vl_rnn_state(self, rnn_state: torch.Tensor, B: int) -> torch.Tensor:
-        """Return centralized Vl RNN state as ``[B, L, C, H]`` for storage."""
-        expected_flat = (self.rnn_layers, B, self.rnn_carries, self.rnn_hidden)
-        expected_stored = (B, self.rnn_layers, self.rnn_carries, self.rnn_hidden)
+    def _canonical_vl_rnn_state(self, rnn_state: torch.Tensor, n_envs: int) -> torch.Tensor:
+        """Return centralized Vl carry with env as the first dimension."""
+        expected_flat = (self.rnn_layers, n_envs, self.rnn_carries, self.rnn_hidden)
+        expected_stored = (n_envs, self.rnn_layers, self.rnn_carries, self.rnn_hidden)
         if rnn_state.shape == expected_flat:
             return rnn_state.permute(1, 0, 2, 3)
         if rnn_state.shape == expected_stored:
@@ -298,18 +298,15 @@ class DGPPORolloutMemory(RandomMemory):
         }
 
         if self.use_rnn:
-            # RNN state shape in memory: [T, B * A * L * C * H]
-            # Transpose to [B, T, L, A, C, H], matching the RNN carry layout per rollout step.
-            # Wait, N = B * A. The memory stores it as [T, N * L * C * H]
             rnn_states = self._tensor(f"{split}_rnn_states").reshape(
                 T, B, A, self.rnn_layers, self.rnn_carries, self.rnn_hidden
             )
-            data["bTa_rnn_states"] = rnn_states.permute(1, 0, 3, 2, 4, 5)  # [B, T, L, A, C, H]
+            data["bTa_rnn_states"] = rnn_states.permute(1, 0, 3, 2, 4, 5)
         if self.use_vl_rnn:
             vl_rnn_states = self._tensor(f"{split}_vl_rnn_states").reshape(
                 T, B, self.rnn_layers, self.rnn_carries, self.rnn_hidden
             )
-            data["bT_vl_rnn_states"] = vl_rnn_states.permute(1, 0, 2, 3, 4)  # [B, T, L, C, H]
+            data["bT_vl_rnn_states"] = vl_rnn_states.permute(1, 0, 2, 3, 4)
 
         return data
 

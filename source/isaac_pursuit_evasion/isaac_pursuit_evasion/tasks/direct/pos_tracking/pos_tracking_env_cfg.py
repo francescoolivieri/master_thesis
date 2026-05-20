@@ -109,7 +109,6 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     include_yaw_with_ray_caster: bool = True
     enable_obstacle_observations: bool = True
     obstacle_observation_mode: Literal["pillars", "ray_caster", "none"] = "ray_caster"
-    safety_obstacle_source: Literal["auto", "geometry", "ray_caster", "none"] = "auto"
 
     # Ray-caster / LiDAR observations. Set obstacle_observation_mode="ray_caster"
     # to feed the nearest ray hits to the policy and DG-PPO graph builder.
@@ -118,7 +117,6 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     ray_caster_top_k_hits: int = 8
     ray_caster_num_rays: int = 32
     ray_caster_max_distance: float = 8.0
-    ray_caster_safety_distance: float = 0.0  # <= 0 uses drone_collision_radius
     ray_caster_horizontal_fov_range: tuple[float, float] = (-180.0, 180.0)
     ray_caster_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
     ray_caster_debug_vis: bool = False
@@ -144,17 +142,16 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     ref_update_interval_s: float = 0.0  # 0 means static target per episode
     reference_obstacle_clearance: float = 0.2
 
-    # Rewards (positive weights; signs applied in env)
+    # Reward and penalty weights (signs applied in env)
     reward_pos: float = 1.0
     reward_pos_scale: float = 1.5
     reward_yaw: float = 0.3
     reward_body_rates: float = 0.001
     reward_lin_vel: float = 0.02
     reward_action_smoothness: float = 0.02
-    reward_crash: float = 10.0
-    reward_out_of_bounds: float = 10.0
-    reward_pillar_collision: float = 10.0
-    include_safety_penalties_in_reward: bool = True
+    penalty_altitude_limit: float = 10.0
+    penalty_xy_boundary: float = 10.0
+    penalty_pillar_collision: float = 10.0
 
     # Success criteria
     pos_tolerance: float = 0.15
@@ -165,7 +162,7 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     # Episode reset policy. Safety violations are the inner constraints (floor,
     # ceiling, arena faces, pillars). Out-of-boundaries is the outer envelope,
     # including wall thickness in xy and altitude_outer_margin in z.
-    terminate_on_safety_violation: bool = True
+    terminate_on_safety_violation: bool = False
     enable_clip_states: bool = True
     terminate_on_out_of_boundaries: bool = False
 

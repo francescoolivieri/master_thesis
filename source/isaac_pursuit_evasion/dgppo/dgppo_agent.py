@@ -1,8 +1,9 @@
 import dataclasses
 import importlib
 import time
+import warnings
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from skrl.agents.torch import Agent, AgentCfg
@@ -25,7 +26,6 @@ from .utils import (
     GraphData,
     align_safety_cost_heads,
     build_graph_data,
-    compute_pos_tracking_safety_costs,
     compute_cbf_advantages,
     compute_dec_ocp_gae,
     extract_graph_states_from_flat_obs,
@@ -110,88 +110,170 @@ class DGPPOAgentCfg(AgentCfg):
     num_envs: int | None = None
     _raw: dict[str, Any] = dataclasses.field(default_factory=dict, repr=False)
 
+    _ALIASES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "gae_lambda": ("lambda",),
+        "rewards_shaper_scale": ("reward_scale",),
+        "observation_preprocessor": ("state_preprocessor",),
+        "observation_preprocessor_kwargs": ("state_preprocessor_kwargs",),
+    }
+    _DEFAULT_WARNING_EXEMPT_KEYS: ClassVar[frozenset[str]] = frozenset({"_raw", "seed", "num_envs"})
+    _NESTED_DEFAULT_KEYS: ClassVar[frozenset[str]] = frozenset({"rnn", "gnn", "model", "debug"})
+
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "DGPPOAgentCfg":
-        raw = dict(data)
-        default_rnn = {"cell": "gru", "hidden": 64, "layers": 1}
-        default_gnn = {
-            "policy_layers": 1,
-            "critic_layers": 1,
-            "policy_out_dim": 64,
-            "critic_out_dim": 64,
-            "msg_dim": 32,
-            "n_heads": 3,
-        }
-        default_model = {
-            "policy_mlp_hid": [128, 64],
-            "critic_mlp_hid": [128, 64],
-            "scale_hid": 64,
-            "scale_final": 0.01,
-            "std_dev_init": 0.5,
-            "std_dev_min": 1e-5,
-        }
-        default_debug = {
-            "enabled": True,
-            "step_interval": 10,
-            "update_interval": 1,
-            "minibatch_interval": 1,
-            "sample_env_count": 8,
-            "log_minibatches": True,
-            "log_jsonl": True,
-            "log_tensorboard_scalars": True,
-            "log_on_done": True,
-            "rnn_done_norm_epsilon": 1e-6,
-            "anomaly_abs_threshold": 1e6,
-        }
-        experiment_data = raw.get("experiment", {})
-        experiment = (
-            experiment_data if isinstance(experiment_data, ExperimentCfg) else ExperimentCfg(**dict(experiment_data))
-        )
+        raw = dict(data or {})
+        cfg = cls()
+        cls._warn_defaulted_keys(raw, cfg)
 
-        return cls(
-            experiment=experiment,
-            alpha=float(raw.get("alpha", 10.0)),
-            cbf_eps=float(raw.get("cbf_eps", 1e-2)),
-            cbf_weight=float(raw.get("cbf_weight", 1.0)),
-            cbf_schedule=bool(raw.get("cbf_schedule", True)),
-            discount_factor=float(raw.get("discount_factor", 0.99)),
-            gae_lambda=float(raw.get("gae_lambda", raw.get("lambda", 0.95))),
-            bootstrap_on_truncated=bool(raw.get("bootstrap_on_truncated", False)),
-            learning_starts=int(raw.get("learning_starts", 0)),
-            rollouts=int(raw.get("rollouts", 32)),
-            rnn_step=int(raw.get("rnn_step", 16)),
-            learning_epochs=int(raw.get("learning_epochs", 8)),
-            mini_batches=int(raw.get("mini_batches", 8)),
-            ratio_clip=float(raw.get("ratio_clip", 0.2)),
-            entropy_loss_scale=float(raw.get("entropy_loss_scale", 0.0)),
-            vl_loss_scale=float(raw.get("vl_loss_scale", 1.0)),
-            vh_loss_scale=float(raw.get("vh_loss_scale", 1.0)),
-            grad_norm_clip=float(raw.get("grad_norm_clip", 2.0)),
-            rewards_shaper_scale=float(raw.get("rewards_shaper_scale", raw.get("reward_scale", 1.0))),
-            observation_preprocessor=raw.get("observation_preprocessor", raw.get("state_preprocessor")),
-            observation_preprocessor_kwargs=dict(
-                raw.get("observation_preprocessor_kwargs", raw.get("state_preprocessor_kwargs")) or {}
-            ),
-            value_preprocessor=raw.get("value_preprocessor"),
-            value_preprocessor_kwargs=dict(raw.get("value_preprocessor_kwargs") or {}),
-            lr_policy=float(raw.get("lr_policy", 3e-4)),
-            lr_vl=float(raw.get("lr_vl", 1e-3)),
-            lr_vh=float(raw.get("lr_vh", 1e-3)),
-            obs_radius=float(raw.get("obs_radius", 2.0)),
-            use_rnn=bool(raw.get("use_rnn", True)),
-            rnn={**default_rnn, **dict(raw.get("rnn", {}))},
-            gnn={**default_gnn, **dict(raw.get("gnn", {}))},
-            model={**default_model, **dict(raw.get("model", {}))},
-            debug={**default_debug, **dict(raw.get("debug", {}))},
-            seed=None if raw.get("seed") is None else int(raw["seed"]),
-            num_envs=None if raw.get("num_envs") is None else int(raw["num_envs"]),
-            _raw=raw,
-        )
+        def read(name: str) -> Any:
+            for key in (name, *cls._ALIASES.get(name, ())):
+                if key in raw:
+                    return raw[key]
+            return getattr(cfg, name)
+
+        cfg.experiment = cls._read_experiment(raw.get("experiment", cfg.experiment))
+        cfg.alpha = float(read("alpha"))
+        cfg.cbf_eps = float(read("cbf_eps"))
+        cfg.cbf_weight = float(read("cbf_weight"))
+        cfg.cbf_schedule = cls._as_bool(read("cbf_schedule"))
+        cfg.discount_factor = float(read("discount_factor"))
+        cfg.gae_lambda = float(read("gae_lambda"))
+        cfg.bootstrap_on_truncated = cls._as_bool(read("bootstrap_on_truncated"))
+        cfg.learning_starts = int(read("learning_starts"))
+        cfg.rollouts = int(read("rollouts"))
+        cfg.rnn_step = int(read("rnn_step"))
+        cfg.learning_epochs = int(read("learning_epochs"))
+        cfg.mini_batches = int(read("mini_batches"))
+        cfg.ratio_clip = float(read("ratio_clip"))
+        cfg.entropy_loss_scale = float(read("entropy_loss_scale"))
+        cfg.vl_loss_scale = float(read("vl_loss_scale"))
+        cfg.vh_loss_scale = float(read("vh_loss_scale"))
+        cfg.grad_norm_clip = float(read("grad_norm_clip"))
+        cfg.rewards_shaper_scale = float(read("rewards_shaper_scale"))
+        cfg.observation_preprocessor = read("observation_preprocessor")
+        cfg.observation_preprocessor_kwargs = cls._as_dict(read("observation_preprocessor_kwargs"))
+        cfg.value_preprocessor = read("value_preprocessor")
+        cfg.value_preprocessor_kwargs = cls._as_dict(read("value_preprocessor_kwargs"))
+        cfg.lr_policy = float(read("lr_policy"))
+        cfg.lr_vl = float(read("lr_vl"))
+        cfg.lr_vh = float(read("lr_vh"))
+        cfg.obs_radius = float(read("obs_radius"))
+        cfg.use_rnn = cls._as_bool(read("use_rnn"))
+        cfg.rnn = cls._merge_dict(cfg.rnn, raw.get("rnn"), "rnn")
+        cfg.gnn = cls._read_gnn(cfg.gnn, raw.get("gnn"))
+        cfg.model = cls._merge_dict(cfg.model, raw.get("model"), "model")
+        cfg.debug = cls._merge_dict(cfg.debug, raw.get("debug"), "debug")
+        cfg.seed = None if raw.get("seed") is None else int(raw["seed"])
+        cfg.num_envs = None if raw.get("num_envs") is None else int(raw["num_envs"])
+        cfg._raw = raw
+        return cfg
 
     def get(self, key: str, default: Any = None) -> Any:
-        if key in self._raw:
-            return self._raw[key]
-        return getattr(self, key, default)
+        if hasattr(self, key):
+            return getattr(self, key)
+        return self._raw.get(key, default)
+
+    @staticmethod
+    def _as_dict(value: Any) -> dict[str, Any]:
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping):
+            raise TypeError(f"Expected a mapping or null, got {type(value).__name__}")
+        return dict(value)
+
+    @staticmethod
+    def _as_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "1", "yes", "y", "on"}:
+                return True
+            if lowered in {"false", "0", "no", "n", "off"}:
+                return False
+        return bool(value)
+
+    @staticmethod
+    def _read_experiment(value: Any) -> ExperimentCfg:
+        if isinstance(value, ExperimentCfg):
+            return value
+        if value is None:
+            return ExperimentCfg()
+        if not isinstance(value, Mapping):
+            raise TypeError(f"Expected experiment to be a mapping, got {type(value).__name__}")
+        return ExperimentCfg(**dict(value))
+
+    @classmethod
+    def _merge_dict(cls, defaults: Mapping[str, Any], value: Any, name: str) -> dict[str, Any]:
+        if value is None:
+            return dict(defaults)
+        if not isinstance(value, Mapping):
+            raise TypeError(f"Expected {name} to be a mapping or null, got {type(value).__name__}")
+        return {**dict(defaults), **dict(value)}
+
+    @classmethod
+    def _read_gnn(cls, defaults: Mapping[str, Any], value: Any) -> dict[str, Any]:
+        gnn = cls._merge_dict(defaults, value, "gnn")
+        if not isinstance(value, Mapping) or "critic_layers" not in value:
+            return gnn
+
+        critic_layers = int(value["critic_layers"])
+        if "vl_layers" not in value:
+            gnn["vl_layers"] = critic_layers
+        if "vh_layers" not in value:
+            gnn["vh_layers"] = critic_layers
+        gnn.pop("critic_layers", None)
+        warnings.warn(
+            "DGPPOAgentCfg.gnn.critic_layers is deprecated and ambiguous; "
+            "use gnn.vl_layers and gnn.vh_layers instead.",
+            stacklevel=3,
+        )
+        return gnn
+
+    @classmethod
+    def _warn_defaulted_keys(cls, raw: Mapping[str, Any], defaults: "DGPPOAgentCfg") -> None:
+        missing = cls._missing_top_level_keys(raw, defaults)
+        missing.extend(cls._missing_nested_keys(raw, defaults))
+        if not missing:
+            return
+
+        if not raw:
+            message = "DGPPOAgentCfg received an empty config mapping; all DG-PPO parameters are using defaults."
+        else:
+            listed = ", ".join(missing)
+            message = f"DGPPOAgentCfg is using defaults for missing config keys: {listed}."
+        warnings.warn(message, stacklevel=3)
+
+    @classmethod
+    def _missing_top_level_keys(cls, raw: Mapping[str, Any], defaults: "DGPPOAgentCfg") -> list[str]:
+        missing = []
+        for field in dataclasses.fields(defaults):
+            name = field.name
+            if not field.init or name in cls._DEFAULT_WARNING_EXEMPT_KEYS:
+                continue
+            keys = (name, *cls._ALIASES.get(name, ()))
+            if all(key not in raw for key in keys):
+                missing.append(name)
+        return missing
+
+    @classmethod
+    def _missing_nested_keys(cls, raw: Mapping[str, Any], defaults: "DGPPOAgentCfg") -> list[str]:
+        missing = []
+        for name in sorted(cls._NESTED_DEFAULT_KEYS):
+            value = raw.get(name)
+            if value is None:
+                if name in raw:
+                    missing.append(name)
+                continue
+            if not isinstance(value, Mapping):
+                continue
+            for key in getattr(defaults, name):
+                if key in value:
+                    continue
+                if name == "gnn" and key in {"vl_layers", "vh_layers"} and "critic_layers" in value:
+                    continue
+                missing.append(f"{name}.{key}")
+        return missing
 
 
 class DGPPOAgent(Agent):
@@ -218,8 +300,6 @@ class DGPPOAgent(Agent):
             cfg=cfg,
         )
 
-        # self.training = False
-
         self.policy = policy.to(device)
         self.Vl = Vl.to(device)
         self.Vh = Vh.to(device)
@@ -229,7 +309,7 @@ class DGPPOAgent(Agent):
         self.device = torch.device(device)
 
         # Load hyperparameters
-        self.load_dgppo_hyperparameters()
+        self._load_hyperparameters_from_cfg()
         self._observation_preprocessor = self._make_preprocessor(
             preprocessor=self.cfg.observation_preprocessor,
             kwargs=self.cfg.observation_preprocessor_kwargs,
@@ -303,7 +383,7 @@ class DGPPOAgent(Agent):
             return
 
         # Rollout memory dimensions.
-        rollout_length = int(self.cfg.get("rollouts", 32))  # from AgentCfg
+        rollout_length = int(self.rollouts)
         n_agents = self.env.num_agents
         layout = self.env.unwrapped.graph_obs_layout
         n_obs = int(layout.get("n_obstacles", 0))
@@ -319,7 +399,7 @@ class DGPPOAgent(Agent):
         self._det_env_ids = torch.arange(0, split, device=self.device, dtype=torch.long)
         self._stoch_env_ids = torch.arange(split, self.env.num_envs, device=self.device, dtype=torch.long)
 
-        # Check these
+        # create memory
         self.memory = DGPPORolloutMemory(
             rollout_length=rollout_length,
             num_det_envs=int(self._det_env_ids.numel()),
@@ -337,13 +417,14 @@ class DGPPOAgent(Agent):
             rnn_cell=str(self.cfg.rnn.get("cell", "gru")),
         )
 
-        # Initial RNN carry for the rollout (B * A agents, regardless of env).
+        # Policy/Vh carry is per env-agent sequence; Vl carry is per env sequence.
         if self.policy.use_rnn:
             self._policy_rnn_state = self.policy.initialize_carry(
-                n_agents_total=self.env.num_envs * n_agents, device=self.device
+                num_sequences=self.env.num_envs * n_agents, device=self.device
             )
         if self.Vl.rnn is not None:
             self._vl_rnn_state = self.Vl.rnn.initialize_carry(self.env.num_envs, device=self.device)
+
         self._debug.log_setup(agent=self, trainer_cfg=trainer_cfg)
 
     def act(
@@ -374,14 +455,13 @@ class DGPPOAgent(Agent):
             action, log_prob, mean_action, new_rnn = self.policy.act(
                 graph,
                 rnn_state=self._policy_rnn_state,
-                n_agents_total=n_agents,
                 deterministic=not self.training,
             )
 
             if self.training:
                 self._last_vl_rnn_state = None if self._vl_rnn_state is None else self._vl_rnn_state.detach().clone()
-                vl, self._vl_rnn_state = self.Vl(graph, self._vl_rnn_state, n_agents)
-                vh, _ = self.Vh(graph, self._last_policy_rnn_state, n_agents)
+                vl, self._vl_rnn_state = self.Vl(graph, self._vl_rnn_state)
+                vh, _ = self.Vh(graph, self._last_policy_rnn_state)
                 self._current_Vl = self._inverse_preprocess_values(vl)
                 self._current_Vh = vh
 
@@ -390,15 +470,6 @@ class DGPPOAgent(Agent):
             self._policy_rnn_state = new_rnn
 
         self._last_log_prob = log_prob
-
-        # Deterministic actions
-        # action_mixed = action.clone()
-        # action_mixed[self._det_env_ids] = mean_action[self._det_env_ids]
-        # log_prob_mixed = torch.zeros_like(log_prob)
-        # log_prob_mixed[self._stoch_env_ids] = log_prob[self._stoch_env_ids]
-
-        # action_flat = action_mixed.reshape(self.env.num_envs, -1)
-        # mean_flat = mean_action.reshape(self.env.num_envs, -1)
 
         action[self._det_env_ids] = mean_action[self._det_env_ids]
         log_prob[self._det_env_ids] = 0.0  # Note: won't be used for deterministic envs
@@ -447,34 +518,12 @@ class DGPPOAgent(Agent):
         :param timesteps: Number of timesteps.
         """
 
-        # To handle skrl bookkeeping
-        super().record_transition(
-            observations=observations,
-            states=states,
-            actions=actions,
-            rewards=rewards,
-            next_observations=next_observations,
-            next_states=next_states,
-            terminated=terminated,
-            truncated=truncated,
-            infos=infos,
-            timestep=timestep,
-            timesteps=timesteps,
-        )
+        record_actions = actions
+        record_rewards = rewards
 
         if self.training:
 
             self._current_next_observations = next_observations
-
-            """ OPTIONAL FUTURE STUFF
-            # reward shaping
-            if self.cfg.rewards_shaper is not None:
-                rewards = self.cfg.rewards_shaper(rewards, timestep, timesteps)
-
-            # time-limit (truncation) bootstrapping
-            if self.cfg.time_limit_bootstrap:
-                rewards += self.cfg.discount_factor * self._current_values * truncated
-            """
 
             n_envs = self.env.num_envs
             n_agents = self.env.num_agents
@@ -482,9 +531,15 @@ class DGPPOAgent(Agent):
             n_constraints = int(getattr(self.env, "n_constraints", getattr(self.env.unwrapped, "n_constraints", 1)))
             agent_state, goal_state, obs_state = self._extract_graph_states(observations)
             actions = actions.reshape(n_envs, n_agents, action_dim)
-            rewards = rewards.reshape(n_envs)
+            rewards = self._rewards_from_observation_or_env(
+                observations=observations,
+                actions=record_actions,
+                rewards=rewards,
+                n_envs=n_envs,
+            )
             if self.rewards_shaper_scale != 1.0:
                 rewards = rewards * self.rewards_shaper_scale
+            record_rewards = rewards
             # DGPPO DEBUG FIX START: canonical live episode-boundary masks.
             terminated_1d = self._env_done_mask(terminated, n_envs)
             truncated_1d = self._env_done_mask(truncated, n_envs)
@@ -493,16 +548,12 @@ class DGPPOAgent(Agent):
             log_prob = self._last_log_prob.reshape(n_envs, n_agents)
             value_l_all = self._current_Vl.reshape(n_envs, -1).squeeze(-1)
             value_h_all = self._current_Vh.reshape(n_envs, n_agents, n_constraints)
-            # DGPPO DEBUG FIX START: real/env or adapter safety costs.
-            costs_all = self._costs_from_infos_or_adapter(
-                infos=infos,
-                agent_state=agent_state,
-                obs_state=obs_state,
+            costs_all = self._costs_from_observation(
+                observations=observations,
                 n_envs=n_envs,
                 n_agents=n_agents,
                 n_constraints=n_constraints,
             )
-            # DGPPO DEBUG FIX END: real/env or adapter safety costs.
 
             stc_rnn_state = self._select_policy_rnn_envs(self._last_policy_rnn_state, self._stoch_env_ids)
             det_rnn_state = self._select_policy_rnn_envs(self._last_policy_rnn_state, self._det_env_ids)
@@ -572,19 +623,18 @@ class DGPPOAgent(Agent):
             if self.memory.is_full:
                 with torch.no_grad():
                     next_graph = self._preprocess_graph_observations(self._build_graph(next_observations, next_states))
-                    vl_boot, _ = self.Vl(next_graph, self._vl_rnn_state, self.env.num_agents)
+                    vl_boot, _ = self.Vl(next_graph, self._vl_rnn_state)
                     vl_boot = self._inverse_preprocess_values(vl_boot)
-                    vh_boot, _ = self.Vh(next_graph, self._policy_rnn_state, self.env.num_agents)
+                    vh_boot, _ = self.Vh(next_graph, self._policy_rnn_state)
                     policy_reference_state = None
                     vh_boot_reference = None
                     if self.policy.rnn is not None and self._last_policy_rnn_state is not None:
                         _action, _log_prob, _mode, policy_reference_state = self.policy.act(
                             next_graph,
                             rnn_state=self._last_policy_rnn_state,
-                            n_agents_total=self.env.num_agents,
                             deterministic=True,
                         )
-                        vh_boot_reference, _ = self.Vh(next_graph, policy_reference_state, self.env.num_agents)
+                        vh_boot_reference, _ = self.Vh(next_graph, policy_reference_state)
                     elif self.policy.rnn is None:
                         vh_boot_reference = vh_boot
                 self._debug.log_bootstrap(
@@ -597,6 +647,21 @@ class DGPPOAgent(Agent):
                 )
                 self.memory.set_final_values("stc", vl_boot[self._stoch_env_ids], vh_boot[self._stoch_env_ids])
                 self.memory.set_final_values("det", vl_boot[self._det_env_ids], vh_boot[self._det_env_ids])
+
+        # To handle skrl bookkeeping after DG-PPO has selected its aligned reward signal.
+        super().record_transition(
+            observations=observations,
+            states=states,
+            actions=record_actions,
+            rewards=record_rewards,
+            next_observations=next_observations,
+            next_states=next_states,
+            terminated=terminated,
+            truncated=truncated,
+            infos=infos,
+            timestep=timestep,
+            timesteps=timesteps,
+        )
 
     def pre_interaction(self, *, timestep: int, timesteps: int) -> None:
         pass  # or super() — in any case does nothing for on-policy
@@ -836,7 +901,7 @@ class DGPPOAgent(Agent):
                 advantages=batch.advantages,
                 clip_eps=self.clip_eps,
                 entropy_scale=self.entropy_scale,
-                n_agents_total=batch.A,
+                n_agents=batch.A,
                 rnn_state=None,
             )
         policy_grad_norm = apply_policy_update(
@@ -897,31 +962,29 @@ class DGPPOAgent(Agent):
             "vh": value_info["vh"].detach(),
         }
 
-    def load_dgppo_hyperparameters(self) -> None:
-        self.gamma: float = float(self.cfg.get("discount_factor", 0.99))
-        self.gae_lambda: float = float(self.cfg.get("gae_lambda", self.cfg.get("lambda", 0.95)))
-        self.bootstrap_on_truncated: bool = bool(self.cfg.get("bootstrap_on_truncated", False))
-        self.learning_starts: int = int(self.cfg.get("learning_starts", 0))
-        self.rollouts: int = int(self.cfg.get("rollouts", 32))
-        self.rnn_step: int = int(self.cfg.get("rnn_step", min(16, self.rollouts)))
-        self.learning_epochs: int = int(self.cfg.get("learning_epochs", 8))
-        self.mini_batches: int = int(self.cfg.get("mini_batches", 8))
-        self.clip_eps: float = float(self.cfg.get("ratio_clip", 0.2))
-        self.alpha: float = float(self.cfg.get("alpha", 10.0))
-        self.cbf_eps: float = float(self.cfg.get("cbf_eps", 1e-2))
-        self.cbf_weight: float = float(self.cfg.get("cbf_weight", 1.0))
-        self.cbf_schedule: bool = bool(self.cfg.get("cbf_schedule", True))
-        self.grad_clip: float = float(self.cfg.get("grad_norm_clip", 2.0))
-        self.entropy_scale: float = float(self.cfg.get("entropy_loss_scale", 0.0))
-        self.vl_loss_scale: float = float(self.cfg.get("vl_loss_scale", 1.0))
-        self.vh_loss_scale: float = float(self.cfg.get("vh_loss_scale", 1.0))
-        self.obs_radius: float = float(self.cfg.get("obs_radius", 2.0))
-        self.lr_policy: float = float(self.cfg.get("lr_policy", 3e-4))
-        self.lr_vl: float = float(self.cfg.get("lr_vl", 1e-3))
-        self.lr_vh: float = float(self.cfg.get("lr_vh", 1e-3))
-        self.rewards_shaper_scale: float = float(
-            self.cfg.get("rewards_shaper_scale", self.cfg.get("reward_scale", 1.0))
-        )
+    def _load_hyperparameters_from_cfg(self) -> None:
+        self.gamma: float = float(self.cfg.discount_factor)
+        self.gae_lambda: float = float(self.cfg.gae_lambda)
+        self.bootstrap_on_truncated: bool = bool(self.cfg.bootstrap_on_truncated)
+        self.learning_starts: int = int(self.cfg.learning_starts)
+        self.rollouts: int = int(self.cfg.rollouts)
+        self.rnn_step: int = int(self.cfg.rnn_step)
+        self.learning_epochs: int = int(self.cfg.learning_epochs)
+        self.mini_batches: int = int(self.cfg.mini_batches)
+        self.clip_eps: float = float(self.cfg.ratio_clip)
+        self.alpha: float = float(self.cfg.alpha)
+        self.cbf_eps: float = float(self.cfg.cbf_eps)
+        self.cbf_weight: float = float(self.cfg.cbf_weight)
+        self.cbf_schedule: bool = bool(self.cfg.cbf_schedule)
+        self.grad_clip: float = float(self.cfg.grad_norm_clip)
+        self.entropy_scale: float = float(self.cfg.entropy_loss_scale)
+        self.vl_loss_scale: float = float(self.cfg.vl_loss_scale)
+        self.vh_loss_scale: float = float(self.cfg.vh_loss_scale)
+        self.obs_radius: float = float(self.cfg.obs_radius)
+        self.lr_policy: float = float(self.cfg.lr_policy)
+        self.lr_vl: float = float(self.cfg.lr_vl)
+        self.lr_vh: float = float(self.cfg.lr_vh)
+        self.rewards_shaper_scale: float = float(self.cfg.rewards_shaper_scale)
 
     def _make_preprocessor(self, *, preprocessor: Any, kwargs: Mapping[str, Any] | None, size: int) -> Any | None:
         preprocessor_cls = self._resolve_preprocessor(preprocessor)
@@ -1080,9 +1143,19 @@ class DGPPOAgent(Agent):
 
     def _extract_graph_states(self, observations: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Decode flat policy observations into graph node state tensors."""
+        base_env = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
+        cfg = getattr(base_env, "cfg", None)
+        if (
+            int(self.env.num_agents) > 1
+            and getattr(cfg, "obstacle_observation_mode", None) == "ray_caster"
+        ):
+            raise RuntimeError(
+                "DG-PPO ray-caster graph observations currently support one agent only. "
+                "Multi-agent ray-caster graphs need per-agent hit groups/obstacle nodes."
+            )
         return extract_graph_states_from_flat_obs(
             observations,
-            self.env.unwrapped.graph_obs_layout,
+            base_env.graph_obs_layout,
             n_agents=self.env.num_agents,
         )
 
@@ -1100,13 +1173,13 @@ class DGPPOAgent(Agent):
     def _select_policy_rnn_envs(
         self, rnn_state: torch.Tensor | None, env_ids: torch.Tensor | None
     ) -> torch.Tensor | None:
-        """Select env-major policy carry as ``[L, B*A, C, H]`` for memory."""
+        """Select env slots from a policy carry that stores one sequence per env-agent pair."""
         if rnn_state is None or env_ids is None:
             return None
-        L, _N, C, H = rnn_state.shape
-        A = self.env.num_agents
-        state = rnn_state.reshape(L, self.env.num_envs, A, C, H)
-        return state[:, env_ids].reshape(L, int(env_ids.numel()) * A, C, H)
+        num_layers, _num_sequences, num_carries, hidden_size = rnn_state.shape
+        n_agents = self.env.num_agents
+        state = rnn_state.reshape(num_layers, self.env.num_envs, n_agents, num_carries, hidden_size)
+        return state[:, env_ids].reshape(num_layers, int(env_ids.numel()) * n_agents, num_carries, hidden_size)
 
     def _select_env_rnn_envs(self, rnn_state: torch.Tensor | None, env_ids: torch.Tensor | None) -> torch.Tensor | None:
         if rnn_state is None or env_ids is None:
@@ -1118,6 +1191,21 @@ class DGPPOAgent(Agent):
         """Return a flat boolean mask with one entry per IsaacLab env."""
         return torch.as_tensor(mask, device=self.device, dtype=torch.bool).reshape(n_envs)
 
+    def _rewards_from_observation_or_env(
+        self,
+        *,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+        rewards: torch.Tensor,
+        n_envs: int,
+    ) -> torch.Tensor:
+        """Return a DG-PPO reward aligned with the stored rollout graph when available."""
+        base_env = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
+        reward_fn = getattr(base_env, "compute_dgppo_reward_from_observation_action", None)
+        if callable(reward_fn):
+            rewards = reward_fn(observations=observations, actions=actions)
+        return torch.as_tensor(rewards, device=self.device, dtype=torch.float32).reshape(n_envs)
+
     def _reset_rnn_states_for_done(self, done: torch.Tensor) -> None:
         """Reset recurrent state on ``terminated | truncated`` like skrl PPO_RNN."""
         self._policy_rnn_state = zero_policy_rnn_states_for_done(
@@ -1127,119 +1215,23 @@ class DGPPOAgent(Agent):
         )
         self._vl_rnn_state = zero_env_rnn_states_for_done(self._vl_rnn_state, done)
 
-    def _costs_from_infos_or_adapter(
+    def _costs_from_observation(
         self,
         *,
-        infos: Any,
-        agent_state: torch.Tensor,
-        obs_state: torch.Tensor,
+        observations: torch.Tensor,
         n_envs: int,
         n_agents: int,
         n_constraints: int,
     ) -> torch.Tensor:
-        """Return signed safety costs aligned with the stored rollout graph.
-
-        IsaacLab extras are produced after the physics step.  DG-PPO's safety
-        critic value in this transition is evaluated on ``observations`` before
-        that step, matching the JAX reference's ``get_cost(graph)`` convention.
-        For the local position-tracking task, derive costs from the same graph
-        state being stored instead of pairing Vh(s_t) with h(s_{t+1}).
-        """
-        if self._use_observation_aligned_cost_adapter():
-            return self._adapter_safety_costs(
-                agent_state=agent_state,
-                obs_state=obs_state,
-                n_constraints=n_constraints,
-            )
-
-        costs_all = None
-        if isinstance(infos, Mapping):
-            costs_all = infos.get("costs", infos.get("cost"))
-        if costs_all is None:
-            costs_all = self._adapter_safety_costs(
-                agent_state=agent_state,
-                obs_state=obs_state,
-                n_constraints=n_constraints,
-            )
-        else:
-            costs_all = torch.as_tensor(costs_all, device=self.device, dtype=torch.float32)
-            if costs_all.ndim == 1:
-                costs_all = costs_all[:, None, None]
-            elif costs_all.ndim == 2:
-                costs_all = costs_all[:, :, None]
-            costs_all = costs_all.reshape(n_envs, n_agents, -1)
-        return align_safety_cost_heads(costs_all.to(device=self.device, dtype=torch.float32), n_constraints)
-
-    def _use_observation_aligned_cost_adapter(self) -> bool:
-        """True for the Isaac position-tracking task whose extras are post-step."""
+        """Return DG-PPO safety costs from the same observation graph stored in memory."""
         base_env = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
-        cfg = getattr(base_env, "cfg", None)
-        return hasattr(base_env, "graph_obs_layout") and hasattr(cfg, "safety_obstacle_source")
-
-    def _adapter_safety_costs(
-        self,
-        *,
-        agent_state: torch.Tensor,
-        obs_state: torch.Tensor,
-        n_constraints: int,
-    ) -> torch.Tensor:
-        """Build signed safety costs from the stored graph observation."""
-        base_env = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
-        cfg = getattr(base_env, "cfg", None)
-        if cfg is None:
-            raise RuntimeError("DG-PPO safety-cost adapter requires an env cfg when no info['costs'] is available.")
-
-        safety_source = "geometry"
-        resolver = getattr(base_env, "_resolve_safety_obstacle_source_cfg", None)
-        if callable(resolver):
-            safety_source = str(resolver(cfg))
-        elif hasattr(cfg, "safety_obstacle_source"):
-            safety_source = str(getattr(cfg, "safety_obstacle_source"))
-
-        default_pillar_top_z = float(getattr(cfg, "arena_min")[2]) + float(getattr(cfg, "pillar_height", 0.0))
-        obstacle_cost_mode = "per_obstacle"
-        if safety_source == "ray_caster":
-            if obs_state.shape[1] == 0:
-                raise RuntimeError(
-                    "DG-PPO ray-caster safety source requires ray-hit obstacle nodes in the policy observation. "
-                    "Set enable_obstacle_observations=true and obstacle_observation_mode='ray_caster'."
-                )
-            physical_obs_state = obs_state
-            obstacle_cost_mode = "nearest_obstacle"
-            configured_safety_distance = float(getattr(cfg, "ray_caster_safety_distance", 0.0))
-            obstacle_radius = (
-                configured_safety_distance
-                if configured_safety_distance > 0.0
-                else float(getattr(cfg, "drone_collision_radius", 0.0))
+        cost_fn = getattr(base_env, "compute_dgppo_costs_from_observation", None)
+        if not callable(cost_fn):
+            raise RuntimeError(
+                "DG-PPO requires the environment to provide compute_dgppo_costs_from_observation(observations)."
             )
-        elif safety_source == "none":
-            physical_obs_state = obs_state.new_zeros(obs_state.shape[0], 0, agent_state.shape[-1])
-            obstacle_radius = 0.0
-        else:
-            if obs_state.shape[1] == 0:
-                raise RuntimeError(
-                    "DG-PPO geometry safety source requires obstacle nodes in the policy observation. "
-                    "Set enable_obstacle_observations=true with obstacle_observation_mode='pillars', "
-                    "or use safety_obstacle_source='ray_caster'/'none'."
-                )
-            physical_obs_state = obs_state
-            obstacle_radius = float(
-                getattr(base_env, "_pillar_collision_radius", getattr(cfg, "pillar_radius", 0.0))
-            )
-
-        arena_min = getattr(base_env, "_arena_min_safe", getattr(base_env, "_arena_min", getattr(cfg, "arena_min")))
-        arena_max = getattr(base_env, "_arena_max_safe", getattr(base_env, "_arena_max", getattr(cfg, "arena_max")))
-        min_altitude = torch.as_tensor(arena_min, device=agent_state.device)[2].detach().cpu().item()
-
-        costs = compute_pos_tracking_safety_costs(
-            agent_state=agent_state,
-            obs_state=physical_obs_state,
-            arena_min=arena_min,
-            arena_max=arena_max,
-            collision_altitude=float(min_altitude),
-            pillar_collision_radius=obstacle_radius,
-            pillar_top_z=float(getattr(base_env, "_pillar_top_z", default_pillar_top_z)),
-            obstacle_cost_mode=obstacle_cost_mode,
-        )
-        return align_safety_cost_heads(costs, n_constraints)
+        costs_all = cost_fn(observations=observations)
+        costs_all = torch.as_tensor(costs_all, device=self.device, dtype=torch.float32)
+        costs_all = costs_all.reshape(n_envs, n_agents, -1)
+        return align_safety_cost_heads(costs_all, n_constraints)
     # DGPPO DEBUG FIX END: live rollout mask/cost/RNN helpers.

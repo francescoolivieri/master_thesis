@@ -68,6 +68,7 @@ def instantiate_fixture_models(metadata: Mapping[str, object], arrays: Mapping[s
     policy = DGPPOPolicy(
         node_dim=spec.node_dim,
         edge_dim=spec.edge_dim,
+        n_agents=spec.num_agents,
         action_dim=spec.action_dim,
         gnn_layers=spec.actor_gnn_layers,
         gnn_out_dim=spec.policy_gnn_out_dim,
@@ -82,6 +83,7 @@ def instantiate_fixture_models(metadata: Mapping[str, object], arrays: Mapping[s
     Vl = DGPPOValueNet(
         node_dim=spec.node_dim,
         edge_dim=spec.edge_dim,
+        n_agents=spec.num_agents,
         gnn_layers=spec.Vl_gnn_layers,
         gnn_out_dim=spec.Vl_gnn_out_dim,
         gnn_msg_dim=32,
@@ -97,6 +99,7 @@ def instantiate_fixture_models(metadata: Mapping[str, object], arrays: Mapping[s
     Vh = DGPPOValueNet(
         node_dim=spec.node_dim,
         edge_dim=spec.edge_dim,
+        n_agents=spec.num_agents,
         gnn_layers=spec.Vh_gnn_layers,
         gnn_out_dim=spec.Vh_gnn_out_dim,
         gnn_msg_dim=32,

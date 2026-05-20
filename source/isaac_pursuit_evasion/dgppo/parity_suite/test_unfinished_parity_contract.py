@@ -142,10 +142,9 @@ def _compute_det_vh_forward_and_targets(fixture, models, *, num_envs: int) -> tu
             _action, _log_prob, _mode, final_rnn_state = models.policy.act(
                 final_graph,
                 rnn_state,
-                A,
                 deterministic=True,
             )
-            value, _ = models.Vh(final_graph, final_rnn_state, A)
+            value, _ = models.Vh(final_graph, final_rnn_state)
             final_Vh_det[b] = value
 
     bTp1ah_Vh_det = torch.cat([bTah_Vh_det, final_Vh_det[:, None]], dim=1)
@@ -299,7 +298,7 @@ def test_actor_distribution_mean_std_mode_parity() -> None:
         for b, t in _iter_bt(B, T):
             graph = fixture_graph_data(fixture, index=(b, t))
             rnn_state = _policy_rnn_state(fixture, b, t, use_rnn=models.spec.use_rnn)
-            dist, _ = models.policy.distribution(graph, rnn_state, A)
+            dist, _ = models.policy.distribution(graph, rnn_state)
             bTaU_mean[b, t] = dist.mean
             bTaU_std[b, t] = dist.std
             bTaU_mode[b, t] = dist.mode()
@@ -342,7 +341,7 @@ def test_policy_log_prob_parity() -> None:
             graph = fixture_graph_data(fixture, index=(b, t))
             bTa_action = fixture.tensor("inputs/rollout/actions")[b, t]
             rnn_state = _policy_rnn_state(fixture, b, t, use_rnn=models.spec.use_rnn)
-            log_prob, _, _ = models.policy.evaluate(graph, bTa_action, rnn_state, A)
+            log_prob, _, _ = models.policy.evaluate(graph, bTa_action, rnn_state)
             bTa_log_prob[b, t] = log_prob
 
     assert_parity_close(
@@ -367,7 +366,7 @@ def test_sampled_action_with_fixed_noise_parity() -> None:
             graph = fixture_graph_data(fixture, index=(b, t))
             bTaU_noise = fixture.tensor("checkpoints/actor/rollout/fixed_noise")[b, t]
             rnn_state = _policy_rnn_state(fixture, b, t, use_rnn=models.spec.use_rnn)
-            dist, _ = models.policy.distribution(graph, rnn_state, A)
+            dist, _ = models.policy.distribution(graph, rnn_state)
             bTaU_action[b, t] = dist.sample(noise=bTaU_noise)
 
     assert_parity_close(
@@ -395,11 +394,11 @@ def test_value_forward_parity() -> None:
             for t in range(T):
                 graph = fixture_graph_data(fixture, index=(b, t))
 
-                Vl, Vl_rnn_state = models.Vl(graph, Vl_rnn_state, A)
+                Vl, Vl_rnn_state = models.Vl(graph, Vl_rnn_state)
                 bT_Vl[b, t] = Vl.squeeze(0).squeeze(-1)
 
                 Vh_rnn_state = _policy_rnn_state(fixture, b, t, use_rnn=models.spec.use_rnn)
-                Vh, _ = models.Vh(graph, Vh_rnn_state, A)
+                Vh, _ = models.Vh(graph, Vh_rnn_state)
                 bTah_Vh[b, t] = Vh
 
     assert_parity_close(
@@ -619,7 +618,7 @@ def test_vh_gradient_norm_before_optimizer_step_parity() -> None:
                 t = int(chunk_ids[c, r].item())
                 graph = fixture_graph_data(fixture, index=(b, t), prefix="inputs/det_rollout/graph")
                 rnn_state = fixture.tensor("inputs/det_rollout/rnn_states")[b, t]
-                value, _ = models.Vh(graph, rnn_state, A)
+                value, _ = models.Vh(graph, rnn_state)
                 values[b, c, r] = value
 
     loss_vh = compute_value_l2_loss(values, targets[:, chunk_ids])
@@ -773,7 +772,7 @@ def test_one_optimizer_step_parity() -> None:
             for r in range(R):
                 t = int(chunk_ids[c, r].item())
                 det_graph = fixture_graph_data(fixture, index=(b, t), prefix="inputs/det_rollout/graph")
-                value, _ = models.Vh(det_graph, fixture.tensor("inputs/det_rollout/rnn_states")[b, t], A)
+                value, _ = models.Vh(det_graph, fixture.tensor("inputs/det_rollout/rnn_states")[b, t])
                 vh_values[b, c, r] = value
     vh_loss = compute_value_l2_loss(vh_values, targets[:, chunk_ids])
     vh_grad_norm = _apply_first_torch_adam_step(
@@ -877,7 +876,6 @@ def test_deterministic_replay_rollout_loop_parity() -> None:
                 action, _log_prob, _mode, rnn_state = models.policy.act(
                     graph,
                     rnn_state,
-                    A,
                     deterministic=True,
                 )
                 det_actions[b, t] = action
@@ -912,7 +910,6 @@ def test_deterministic_replay_rollout_loop_parity() -> None:
                     graph,
                     fixture.tensor("inputs/det_rollout/actions")[b, t],
                     rnn_state,
-                    A,
                 )
                 det_logp[b, t] = log_prob
         assert_parity_close(

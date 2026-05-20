@@ -166,7 +166,7 @@ def test_recurrent_update_done_masks_zero_post_step_carries_out_of_place() -> No
     (policy_reset.sum() + vl_reset.sum()).backward()
 
 
-def test_pos_tracking_safety_costs_emit_vertical_and_pillar_heads() -> None:
+def test_pos_tracking_safety_costs_emit_vertical_and_nearest_obstacle_heads() -> None:
     agent_state = torch.zeros(5, 1, 6)
     agent_state[:, 0, :3] = torch.tensor(
         [
@@ -183,14 +183,12 @@ def test_pos_tracking_safety_costs_emit_vertical_and_pillar_heads() -> None:
     costs = compute_pos_tracking_safety_costs(
         agent_state=agent_state,
         obs_state=obs_state,
-        arena_min=(-2.0, -2.0, 0.0),
-        arena_max=(2.0, 2.0, 2.0),
-        collision_altitude=0.2,
-        pillar_collision_radius=0.2,
-        pillar_top_z=1.8,
+        safe_arena_min=(-2.0, -2.0, 0.2),
+        safe_arena_max=(2.0, 2.0, 2.0),
+        obstacle_collision_distance=0.2,
     )
 
-    assert costs.shape == (5, 1, 3)
+    assert costs.shape == (5, 1, 2)
     assert torch.all(costs[0, 0] < 0.0)
     assert costs[1, 0, 0] > 0.0
     assert costs[2, 0, 1] > 0.0
@@ -198,7 +196,7 @@ def test_pos_tracking_safety_costs_emit_vertical_and_pillar_heads() -> None:
     assert costs[4, 0, 0] < 0.0
 
 
-def test_pos_tracking_safety_costs_can_reduce_to_nearest_obstacle_head() -> None:
+def test_pos_tracking_safety_costs_use_nearest_obstacle_head() -> None:
     agent_state = torch.zeros(2, 1, 8)
     agent_state[:, 0, :3] = torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]])
     obs_state = torch.zeros(2, 3, 8)
@@ -212,18 +210,29 @@ def test_pos_tracking_safety_costs_can_reduce_to_nearest_obstacle_head() -> None
     costs = compute_pos_tracking_safety_costs(
         agent_state=agent_state,
         obs_state=obs_state,
-        arena_min=(-2.0, -2.0, 0.0),
-        arena_max=(2.0, 2.0, 2.0),
-        collision_altitude=0.2,
-        pillar_collision_radius=0.3,
-        pillar_top_z=1.8,
-        obstacle_cost_mode="nearest_obstacle",
+        safe_arena_min=(-2.0, -2.0, 0.2),
+        safe_arena_max=(2.0, 2.0, 2.0),
+        obstacle_collision_distance=0.3,
     )
 
     assert costs.shape == (2, 1, 2)
     assert torch.all(costs[:, 0, 0] < 0.0)
     assert costs[0, 0, 1] > 0.0
     assert costs[1, 0, 1] < 0.0
+
+
+def test_pos_tracking_safety_costs_require_ray_obstacle_observations() -> None:
+    agent_state = torch.zeros(2, 1, 8)
+    obs_state = torch.zeros(2, 0, 8)
+
+    with pytest.raises(ValueError, match="ray obstacle observation"):
+        compute_pos_tracking_safety_costs(
+            agent_state=agent_state,
+            obs_state=obs_state,
+            safe_arena_min=(-2.0, -2.0, 0.2),
+            safe_arena_max=(2.0, 2.0, 2.0),
+            obstacle_collision_distance=0.3,
+        )
 
 
 def test_tanh_normal_supports_fixed_noise_sampling() -> None:

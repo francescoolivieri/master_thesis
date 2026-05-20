@@ -15,7 +15,7 @@ This repository is an Isaac Sim / IsaacLab project for Crazyflie Brushless reinf
 
 ## Working Rules
 
-- Keep changes narrow.
+- Keep changes narrow. Do not remove small comments present to help user readability of the code.
 - Do not edit generated run output, W&B output, checkpoints, `__pycache__`, or large `.npz`/`.pkl` artifacts unless the user explicitly asks.
 - Treat existing uncommitted changes as user work. Do not restore deleted or modified files unless asked.
 
@@ -37,7 +37,8 @@ If IsaacLab imports fail, first report that the IsaacLab environment appears ina
 - For documentation-only changes, no simulator validation is required.
 - For Python changes outside Isaac-dependent runtime paths, prefer a targeted import or unit-style smoke test when possible.
 - For IsaacLab environment or training changes, run the smallest practical headless smoke test and state if the local environment prevents it.
-- For DG-PPO algorithm changes, check logic by comparing it with the reference code and if thought needed, perform a parity checks or focused tensor-shape/kernel check.
+- For important DG-PPO algorithm changes, check logic by comparing it with the reference code and if thought highly needed, perform a parity checks or focused tensor-shape/kernel check. Do not force parity checks sacrificing code readability/correctness.
+- To verify behaviour of the agent in isaaclab in certain settings, do testing scripts and runs in headless with few agents. Important is to delete the manufactured scripts afterwards and report the tests/findings to the user.
 
 ## DG-PPO Port Goal
 

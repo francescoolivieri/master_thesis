@@ -868,6 +868,31 @@ def _apply_env_overrides_from_agent_cfg(env_cfg: Any, agent_cfg: Any) -> None:
         print(f"[INFO] Applied agent env overrides: {', '.join(sorted(applied))}")
 
 
+def _enforce_algorithm_env_contracts(env_cfg: Any, algorithm_name: str) -> None:
+    if algorithm_name != "dgppo":
+        return
+
+    forced_values = {
+        "enable_obstacle_observations": True,
+        "obstacle_observation_mode": "ray_caster",
+        "enable_ray_caster": True,
+    }
+    changed: list[str] = []
+    for key, value in forced_values.items():
+        if not hasattr(env_cfg, key):
+            continue
+        if getattr(env_cfg, key) != value:
+            setattr(env_cfg, key, value)
+            changed.append(key)
+
+    if changed:
+        print(
+            "[INFO] Enforced DG-PPO environment contract: "
+            f"{', '.join(sorted(changed))}. "
+            "Safety is trained through ray-caster cost heads, not scalar reward penalties."
+        )
+
+
 def _find_checkpoint_path(checkpoint_dir: Path, target_step: int) -> tuple[Optional[Path], Optional[int]]:
     if target_step <= 0:
         return None, None
@@ -1151,6 +1176,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.domain_randomization is not None and hasattr(env_cfg, "domain_randomization"):
         env_cfg.domain_randomization.enable = bool(args_cli.domain_randomization)
     _apply_env_overrides_from_agent_cfg(env_cfg, agent_cfg)
+    _enforce_algorithm_env_contracts(env_cfg, algorithm)
             
     # randomly sample a seed if seed = -1
     if args_cli.seed == -1:

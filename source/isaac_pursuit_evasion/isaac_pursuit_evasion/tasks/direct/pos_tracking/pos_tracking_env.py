@@ -26,7 +26,10 @@ from source.isaac_pursuit_evasion.controllers.rl_controllers import (
     CrazyflieRLBodyRatesWrapper,
     CrazyflieRLVelocityWrapper,
 )
-from source.isaac_pursuit_evasion.dgppo.utils import align_safety_cost_heads, compute_pos_tracking_safety_costs
+from source.isaac_pursuit_evasion.dgppo.utils import (
+    compute_pos_tracking_safety_costs,
+    extract_graph_states_from_flat_obs,
+)
 from source.isaac_pursuit_evasion.dynamics.propellers import Drone_cfg, Propellers
 
 from .pos_tracking_env_cfg import PosTrackingEnvCfg
@@ -74,17 +77,7 @@ class PosTrackingEnv(DirectRLEnv):
                 f"Unsupported ray_caster_observation_mode '{cfg.ray_caster_observation_mode}'. "
                 f"Expected one of {sorted(valid_ray_modes)}."
             )
-        valid_safety_sources = {"auto", "geometry", "ray_caster", "none"}
-        if cfg.safety_obstacle_source not in valid_safety_sources:
-            raise ValueError(
-                f"Unsupported safety_obstacle_source '{cfg.safety_obstacle_source}'. "
-                f"Expected one of {sorted(valid_safety_sources)}."
-            )
-        safety_source = self._resolve_safety_obstacle_source_cfg(cfg)
-        if (cfg.enable_obstacle_observations and cfg.obstacle_observation_mode == "ray_caster") or (
-            safety_source == "ray_caster"
-        ):
-            cfg.enable_ray_caster = True
+        cfg.enable_ray_caster = True
         cfg.observation_space = self._compute_obs_dim(cfg)
         cfg.state_space = cfg.observation_space
 
@@ -203,15 +196,6 @@ class PosTrackingEnv(DirectRLEnv):
         self._last_rewards = torch.zeros(self.num_envs, device=self.device)
         self._last_reward_components: dict[str, torch.Tensor] = {}
         self._last_episode_status = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
-        # DGPPO DEBUG FIX START: real env safety costs for DG-PPO.
-        self._last_dgppo_costs = torch.zeros(
-            self.num_envs,
-            self.num_agents,
-            self.n_constraints,
-            dtype=torch.float32,
-            device=self.device,
-        )
-        # DGPPO DEBUG FIX END: real env safety costs for DG-PPO.
 
         self._body_x_axis = torch.tensor([1.0, 0.0, 0.0], device=self.device)
 
@@ -314,7 +298,7 @@ class PosTrackingEnv(DirectRLEnv):
             agent_parts.append(self._yaw_sin_cos(self._robot.data.root_quat_w))
         agent_state_flat = torch.cat(agent_parts, dim=-1)
 
-        # Goal state: pos only (3) — vel is always zero, omitted
+        # Goal state: pos only (3) — vel is always zero for now, omitted
         goal_pos = self._reference_pos                          # (E, 3)
 
         # Obstacle state: xy only, flattened — vel/z always zero, omitted.
@@ -337,9 +321,7 @@ class PosTrackingEnv(DirectRLEnv):
     def _get_rewards(self) -> torch.Tensor:
         env_origins = self._terrain.env_origins
         pos_local = self._robot.data.root_pos_w - env_origins
-        # DGPPO DEBUG FIX START: publish signed safety costs through infos.
-        self._update_dgppo_costs(pos_local)
-        # DGPPO DEBUG FIX END: publish signed safety costs through infos.
+
         pos_error = torch.norm(self._reference_pos - pos_local, dim=-1)
 
         pos_reward = self.cfg.reward_pos * torch.exp(-self.cfg.reward_pos_scale * pos_error)
@@ -378,18 +360,14 @@ class PosTrackingEnv(DirectRLEnv):
 
         altitude_limit, xy_limit = self._arena_limit_masks(pos_local)
         pillar_collision = self._pillar_collision_mask(pos_local)
-        if self.cfg.include_safety_penalties_in_reward:
-            crash_pen = self._masked_penalty(rewards, altitude_limit, self.cfg.reward_crash)
-            bounds_pen = self._masked_penalty(rewards, xy_limit, self.cfg.reward_out_of_bounds)
-            pillar_pen = self._masked_penalty(rewards, pillar_collision, self.cfg.reward_pillar_collision)
-            rewards -= crash_pen + bounds_pen + pillar_pen
-            components["crash"] = -crash_pen
-            components["out_of_bounds"] = -bounds_pen
-            components["pillar_collision"] = -pillar_pen
-        else:
-            components["crash"] = torch.zeros_like(rewards)
-            components["out_of_bounds"] = torch.zeros_like(rewards)
-            components["pillar_collision"] = torch.zeros_like(rewards)
+        altitude_pen = self._masked_penalty(rewards, altitude_limit, self.cfg.penalty_altitude_limit)
+        xy_boundary_pen = self._masked_penalty(rewards, xy_limit, self.cfg.penalty_xy_boundary)
+        pillar_collision_pen = self._masked_penalty(rewards, pillar_collision, self.cfg.penalty_pillar_collision)
+        rewards -= altitude_pen + xy_boundary_pen + pillar_collision_pen
+
+        components["altitude_limit"] = -altitude_pen
+        components["xy_boundary"] = -xy_boundary_pen
+        components["pillar_collision"] = -pillar_collision_pen
 
         self._last_rewards = rewards
         self._last_reward_components = components
@@ -480,21 +458,11 @@ class PosTrackingEnv(DirectRLEnv):
 
     @property
     def n_constraints(self) -> int:
-        safety_source = self._resolve_safety_obstacle_source_cfg(self.cfg)
-        if safety_source == "ray_caster":
-            return 2
-        if safety_source == "none":
-            return 1
-        return 1 + getattr(self, "_num_pillars", len(self.cfg.pillar_positions_xy))
+        return 2
 
     @property
     def cost_components(self) -> tuple[str, ...]:
-        safety_source = self._resolve_safety_obstacle_source_cfg(self.cfg)
-        if safety_source == "ray_caster":
-            return ("vertical_bounds", "ray_obstacle")
-        if safety_source == "none":
-            return ("vertical_bounds",)
-        return ("vertical_bounds",) + tuple(f"pillar_{idx}" for idx in range(self._num_pillars))
+        return ("vertical_bounds", "ray_obstacle")
 
     @property
     def graph_obs_layout(self) -> dict:
@@ -511,6 +479,74 @@ class PosTrackingEnv(DirectRLEnv):
             "goal_end"    : goal_end,
             "obstacles_end"     : obstacles_end,
         }
+
+    def compute_dgppo_costs_from_observation(self, observations: torch.Tensor | dict) -> torch.Tensor:
+        """Return DG-PPO safety costs from the same graph observation stored in rollout memory."""
+        agent_state, _goal_state, obs_state = self._dgppo_graph_states_from_observation(observations)
+        return compute_pos_tracking_safety_costs(
+            agent_state=agent_state,
+            obs_state=obs_state,
+            safe_arena_min=self._arena_min_safe,
+            safe_arena_max=self._arena_max_safe,
+            obstacle_collision_distance=float(self.cfg.drone_collision_radius),
+        )
+
+    def compute_dgppo_reward_from_observation_action(
+        self,
+        observations: torch.Tensor | dict,
+        actions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the DG-PPO reward using only rollout observation/action data.
+
+        This mirrors the reference style ``reward = get_reward(graph, action)``.
+        Hidden post-step simulator terms, such as body rates, are intentionally
+        not used because they are not part of the stored DG-PPO graph.
+        """
+        agent_state, goal_state, _obs_state = self._dgppo_graph_states_from_observation(observations)
+        n_envs = agent_state.shape[0]
+        action = torch.as_tensor(actions, device=self.device, dtype=agent_state.dtype)
+        action = action.reshape(n_envs, -1)
+        if action.shape[0] != n_envs:
+            raise ValueError(f"DG-PPO reward got {action.shape[0]} action rows for {n_envs} observations.")
+
+        pos_local = agent_state[:, 0, :3]
+        goal_pos = goal_state[:, 0, :3]
+        pos_error = torch.linalg.vector_norm(goal_pos - pos_local, dim=-1)
+        rewards = float(self.cfg.reward_pos) * torch.exp(-float(self.cfg.reward_pos_scale) * pos_error)
+
+        if self.cfg.flag_yaw_tracking:
+            if agent_state.shape[-1] < 8:
+                raise RuntimeError("DG-PPO yaw reward requires yaw sin/cos in the graph observation.")
+            yaw_sin = agent_state[:, 0, 6]
+            yaw_cos = agent_state[:, 0, 7]
+            yaw_ref = self._reference_yaw.squeeze(-1).to(device=self.device, dtype=agent_state.dtype)
+            yaw_align = yaw_cos * torch.cos(yaw_ref) + yaw_sin * torch.sin(yaw_ref)
+            rewards = rewards + float(self.cfg.reward_yaw) * yaw_align
+
+        if self.cfg.flag_penalize_linvel:
+            lin_vel = agent_state[:, 0, 3:6]
+            rewards = rewards - float(self.cfg.reward_lin_vel) * torch.linalg.vector_norm(lin_vel, dim=-1)
+
+        if self.cfg.flag_action_smoothness_penalty:
+            raise RuntimeError(
+                "DG-PPO observation-aligned reward cannot reproduce action smoothness because previous actions "
+                "are not part of the stored graph observation."
+            )
+
+        return rewards
+
+    def _dgppo_graph_states_from_observation(
+        self,
+        observations: torch.Tensor | dict,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if isinstance(observations, dict):
+            observations = observations["policy"]
+        observations = torch.as_tensor(observations, device=self.device, dtype=torch.float32)
+        return extract_graph_states_from_flat_obs(
+            observations,
+            self.graph_obs_layout,
+            n_agents=self.num_agents,
+        )
 
     @staticmethod
     def _compute_obs_dim(cfg: PosTrackingEnvCfg) -> int:
@@ -540,12 +576,6 @@ class PosTrackingEnv(DirectRLEnv):
         if cfg.obstacle_observation_mode == "pillars" and cfg.enable_pillars:
             return len(cfg.pillar_positions_xy)
         return 0
-
-    @staticmethod
-    def _resolve_safety_obstacle_source_cfg(cfg: PosTrackingEnvCfg) -> str:
-        if cfg.safety_obstacle_source == "auto":
-            return "ray_caster" if cfg.obstacle_observation_mode == "ray_caster" else "geometry"
-        return str(cfg.safety_obstacle_source)
 
     @staticmethod
     def _make_ray_caster_cfg(cfg: PosTrackingEnvCfg) -> MultiMeshRayCasterCfg:
@@ -838,50 +868,6 @@ class PosTrackingEnv(DirectRLEnv):
         penalty = torch.zeros_like(reference)
         penalty[mask] = float(weight)
         return penalty
-
-    # DGPPO DEBUG FIX START: real env signed safety costs.
-    def _update_dgppo_costs(self, pos_local: torch.Tensor) -> None:
-        agent_state = pos_local.new_zeros(self.num_envs, self.num_agents, self._graph_state_dim)
-        agent_state[:, 0, :3] = pos_local
-        agent_state[:, 0, 3:6] = self._robot.data.root_lin_vel_w
-        if self._include_yaw_obs:
-            agent_state[:, 0, 6:8] = self._yaw_sin_cos(self._robot.data.root_quat_w)
-
-        safety_source = self._resolve_safety_obstacle_source_cfg(self.cfg)
-        obstacle_cost_mode = "per_obstacle"
-        obstacle_collision_radius = self._pillar_collision_radius
-        if safety_source == "ray_caster":
-            env_origins = self._terrain.env_origins
-            obstacle_xy = self._get_ray_obstacle_points_xy(env_origins, pos_local)
-            obs_state = pos_local.new_zeros(self.num_envs, obstacle_xy.shape[1], self._graph_state_dim)
-            obs_state[:, :, :2] = obstacle_xy
-            obstacle_cost_mode = "nearest_obstacle"
-            configured_safety_distance = float(self.cfg.ray_caster_safety_distance)
-            obstacle_collision_radius = (
-                configured_safety_distance
-                if configured_safety_distance > 0.0
-                else float(self.cfg.drone_collision_radius)
-            )
-        elif safety_source == "geometry" and self._num_pillars > 0:
-            obs_state = pos_local.new_zeros(self.num_envs, self._num_pillars, self._graph_state_dim)
-            obs_state[:, :, :2] = self._pillar_positions_xy.unsqueeze(0).expand(self.num_envs, -1, -1)
-        else:
-            obs_state = pos_local.new_zeros(self.num_envs, 0, self._graph_state_dim)
-
-        costs = compute_pos_tracking_safety_costs(
-            agent_state=agent_state,
-            obs_state=obs_state,
-            arena_min=self._arena_min_safe,
-            arena_max=self._arena_max_safe,
-            collision_altitude=float(self.cfg.arena_min[2] + self.cfg.arena_margin),
-            pillar_collision_radius=obstacle_collision_radius,
-            pillar_top_z=self._pillar_top_z,
-            obstacle_cost_mode=obstacle_cost_mode,
-        )
-        self._last_dgppo_costs = align_safety_cost_heads(costs, self.n_constraints)
-        if hasattr(self, "extras"):
-            self.extras["costs"] = self._last_dgppo_costs
-    # DGPPO DEBUG FIX END: real env signed safety costs.
 
     def _update_success_flags(self, pos_local: torch.Tensor) -> torch.Tensor:
         pos_error = torch.norm(self._reference_pos - pos_local, dim=-1)
@@ -1339,9 +1325,6 @@ class PosTrackingEnv(DirectRLEnv):
 
     def get_last_done_reasons(self) -> torch.Tensor:
         return self.get_last_episode_status()
-
-    def get_last_dgppo_costs(self) -> torch.Tensor:
-        return self._last_dgppo_costs
 
     def get_reference_pose(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self._reference_pos.clone(), self._reference_yaw.clone()

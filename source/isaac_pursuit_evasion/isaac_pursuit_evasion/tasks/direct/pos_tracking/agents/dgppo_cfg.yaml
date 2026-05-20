@@ -6,9 +6,7 @@ env:
   enable_obstacle_observations: true
   enable_ray_caster: true
   ray_caster_observation_mode: top_k_hits
-  safety_obstacle_source: ray_caster
   include_yaw_with_ray_caster: true
-  include_safety_penalties_in_reward: false
   terminate_on_safety_violation: false
   enable_clip_states: true
   terminate_on_out_of_boundaries: true
@@ -43,9 +41,9 @@ agent:
   # DG-PPO applies observation scaling to graph neural-network features after
   # raw-unit graph topology/cost construction. Value scaling is used for Vl
   # targets only; stored rollouts and CBF advantages remain in raw units.
-  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor: null #RunningStandardScaler
   observation_preprocessor_kwargs: null
-  value_preprocessor: RunningStandardScaler
+  value_preprocessor: null #RunningStandardScaler
   value_preprocessor_kwargs: null
   rewards_shaper_scale: 0.1
 
