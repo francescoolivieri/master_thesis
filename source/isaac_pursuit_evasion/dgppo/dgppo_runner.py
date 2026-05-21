@@ -1,6 +1,7 @@
 import torch
 from .dgppo_models import DGPPOValueNet, DGPPOPolicy
-from .dgppo_agent import DGPPOAgent, DGPPOAgentCfg
+from .dgppo_agent import DGPPOAgent
+from .dgppo_config import DGPPOAgentCfg
 from .utils import NUM_TYPE_INDICATORS
 
 
@@ -31,7 +32,6 @@ class DGPPORunner:
         base_env = env.unwrapped if hasattr(env, "unwrapped") else env
         device = torch.device(env.device)
 
-        n_agents = env.num_agents
         n_envs = env.num_envs
         n_agents = int(getattr(base_env, "num_agents", getattr(env, "num_agents", 1)))
         n_constraints = int(getattr(base_env, "n_constraints", 1))

@@ -27,8 +27,6 @@ class UpdateGraphBatch:
     advantages: torch.Tensor
     ql_targets: torch.Tensor
     qh_det_targets: torch.Tensor
-    rnn_states: torch.Tensor | None
-    vl_rnn_states: torch.Tensor | None
     det_rnn_states: torch.Tensor | None
     done_mask: torch.Tensor | None
     b: int
@@ -53,16 +51,20 @@ def build_update_graph_batch(
     det_graph: GraphData | None = None,
 ) -> UpdateGraphBatch:
     """Gather one env-minibatch and build/select stochastic/deterministic graphs."""
-    agent_s = view["bTa_agent_state"][idx]
-    goal_s = view["bTa_goal_state"][idx]
-    obs_s = view["bTo_obs_state"][idx]
     actions = view["bTa_actions"][idx]
-
     b, T, A, _ = actions.shape
 
     if graph is None:
+        agent_s = view["bTa_agent_state"][idx]
+        goal_s = view["bTa_goal_state"][idx]
+        obs_s = view["bTo_obs_state"][idx]
         graph = build_rollout_graph(
-            view={"bTa_agent_state": agent_s, "bTa_goal_state": goal_s, "bTo_obs_state": obs_s}, obs_radius=obs_radius
+            view={
+                "bTa_agent_state": agent_s,
+                "bTa_goal_state": goal_s,
+                "bTo_obs_state": obs_s,
+            },
+            obs_radius=obs_radius,
         )
     else:
         graph = select_rollout_envs(graph, idx=idx, T=T)
@@ -72,14 +74,16 @@ def build_update_graph_batch(
         det_goal_s = det_view["bTa_goal_state"][idx]
         det_obs_s = det_view["bTo_obs_state"][idx]
         det_graph = build_rollout_graph(
-            view={"bTa_agent_state": det_agent_s, "bTa_goal_state": det_goal_s, "bTo_obs_state": det_obs_s},
+            view={
+                "bTa_agent_state": det_agent_s,
+                "bTa_goal_state": det_goal_s,
+                "bTo_obs_state": det_obs_s,
+            },
             obs_radius=obs_radius,
         )
     else:
         det_graph = select_rollout_envs(det_graph, idx=idx, T=T)
 
-    rnn_states = view.get("bTa_rnn_states")
-    vl_rnn_states = view.get("bT_vl_rnn_states")
     det_rnn_states = det_view.get("bTa_rnn_states")
     done_mask = view.get("bT_done")
 
@@ -91,8 +95,6 @@ def build_update_graph_batch(
         advantages=advantages[idx],
         ql_targets=ql[idx],
         qh_det_targets=qh_det[idx],
-        rnn_states=rnn_states[idx] if rnn_states is not None else None,
-        vl_rnn_states=vl_rnn_states[idx] if vl_rnn_states is not None else None,
         det_rnn_states=det_rnn_states[idx] if det_rnn_states is not None else None,
         done_mask=done_mask[idx] if done_mask is not None else None,
         b=b,
@@ -199,24 +201,19 @@ def compute_rollout_policy_loss(
     entropy_scale: float,
     n_agents: int,
     chunk_graph: GraphData | None = None,
-    rnn_states: torch.Tensor | None = None,
     done_mask: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Evaluate policy loss over rollout envs and RNN chunks using production policy code.
-
-    If ``rnn_states`` is provided, it is expected as incoming per-step policy
-    carries. Chunk evaluation starts from the stored carry at each chunk's first
-    timestep.
-    """
+    """Evaluate policy loss over rollout envs and RNN chunks using production policy code."""
     B, T, A, action_dim = actions.shape
     chunk_ids_index = _canonical_chunk_ids(chunk_ids, device=actions.device)
     C, R = chunk_ids_index.shape
     compute_entropy = entropy_scale > 0
 
     if chunk_graph is None:
-        chunk_graph = rollout_graph_chunks(graph, chunk_ids=chunk_ids_index, T=T, B=B)
+        chunk_graph = rollout_graph_chunks(graph, chunk_ids=chunk_ids, T=T, B=B)
 
     action_chunks = actions[:, chunk_ids_index]
+    done_chunks = done_mask[:, chunk_ids_index] if done_mask is not None else None
     if policy.rnn is None:
         step_log_prob, step_entropy, _ = policy.evaluate(
             chunk_graph,
@@ -231,8 +228,8 @@ def compute_rollout_policy_loss(
             policy=policy,
             graph=chunk_graph,
             action_chunks=action_chunks,
-            rnn_states=rnn_states[:, chunk_ids_index[:, 0]] if rnn_states is not None else None,
-            done_chunks=done_mask[:, chunk_ids_index] if done_mask is not None else None,
+            rnn_states=None,
+            done_chunks=done_chunks,
             B=B,
             C=C,
             R=R,
@@ -304,7 +301,18 @@ def rollout_graph_chunks(graph: GraphData, *, chunk_ids: torch.Tensor, T: int, B
     truncated-BPTT chunk structure explicit so GNN/MLP work can be batched while
     the recurrent state still resets once per chunk.
     """
-    chunk_ids_index = _canonical_chunk_ids(chunk_ids, device=graph.nodes.device)
+    chunk_ids_index = _canonical_chunk_ids(chunk_ids, device=chunk_ids.device)
+    C, R = chunk_ids_index.shape
+    arange = torch.arange(T, device=chunk_ids_index.device, dtype=torch.long)
+    if chunk_ids_index.numel() == T and torch.equal(chunk_ids_index.reshape(-1), arange):
+        if graph.n_graphs != B * T:
+            raise ValueError(f"rollout graph has {graph.n_graphs} graphs, expected B*T={B * T}")
+        return graph._replace(
+            n_nodes=graph.n_nodes.reshape(B, C, R),
+            n_edges=graph.n_edges.reshape(B, C, R),
+        )
+
+    chunk_ids_index = chunk_ids_index.to(device=graph.nodes.device)
     env_ids = torch.arange(B, device=graph.nodes.device, dtype=torch.long).reshape(B, 1, 1)
     flat_ids = env_ids * T + chunk_ids_index.reshape(1, *chunk_ids_index.shape)
     return graph_data_select(graph, flat_ids)
@@ -321,8 +329,6 @@ def compute_value_losses(
     A: int,
     vl_loss_scale: float,
     vh_loss_scale: float,
-    rnn_states: torch.Tensor | None = None,
-    vl_rnn_states: torch.Tensor | None = None,
     det_rnn_states: torch.Tensor | None = None,
     done_mask: torch.Tensor | None = None,
     chunk_ids: torch.Tensor | None = None,
@@ -342,11 +348,10 @@ def compute_value_losses(
             chunk_ids=chunk_ids,
             A=A,
             loss_scale=vl_loss_scale,
-            rnn_states=vl_rnn_states,
             done_mask=done_mask,
             chunk_graph=chunk_graph,
         )
-        if det_rnn_states is None:
+        if Vh.rnn is not None and det_rnn_states is None:
             raise ValueError("Recurrent Vh update requires deterministic rollout RNN states")
         vh_info = compute_rollout_vh_loss(
             Vh=Vh,
@@ -386,6 +391,83 @@ def compute_value_l2_loss(prediction: torch.Tensor, target: torch.Tensor, *, sca
     return scale * 0.5 * F.mse_loss(prediction, target)
 
 
+def evaluate_vl_batch_from_states(
+    *,
+    Vl: DGPPOValueNet,
+    graph: GraphData,
+    rnn_states: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Evaluate centralized ``Vl`` on a graph batch using stored incoming carries."""
+    rnn_state = None
+    if Vl.rnn is not None:
+        if rnn_states is None:
+            raise ValueError("Recurrent Vl evaluation requires stored Vl RNN states")
+        rnn_state = _flatten_env_rnn_states(rnn_states)
+    values, _ = Vl(graph, rnn_state)
+    return values.reshape(graph.batch_shape + (values.shape[-1],)).squeeze(-1)
+
+
+def scan_rollout_vl_values(
+    *,
+    Vl: DGPPOValueNet,
+    graph: GraphData,
+    B: int,
+    T: int,
+    initial_rnn_state: torch.Tensor | None = None,
+    done_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Evaluate ``Vl`` and rebuild the incoming recurrent states for each step."""
+    if Vl.rnn is None:
+        values, _ = Vl(graph, None)
+        return values.reshape(B, T), None, None
+
+    if initial_rnn_state is None:
+        raise ValueError("Recurrent Vl scan requires the rollout-start Vl RNN state")
+
+    rnn_state = _flatten_env_rnn_states(initial_rnn_state)
+    features = Vl.gnn(graph, node_type=0, n_type=Vl.n_agents)
+    features = features.mean(dim=-2)
+    features = Vl.head(features).reshape(B, T, Vl.head.hid_sizes[-1])
+    values = features.new_empty((B, T, Vl.net.n_out))
+    rnn_states = initial_rnn_state.new_empty((B, T, *initial_rnn_state.shape[1:]))
+    for t in range(T):
+        rnn_states[:, t] = rnn_state.permute(1, 0, 2, 3)
+        value_features, rnn_state = Vl.rnn(features[:, t], rnn_state)
+        values[:, t] = Vl.net.value_out(value_features)
+        if done_mask is not None:
+            rnn_state = _reset_env_carry_after_done(rnn_state, done_mask[:, t])
+
+    return values.squeeze(-1), rnn_states, rnn_state.permute(1, 0, 2, 3)
+
+
+def evaluate_vh_batch_from_states(
+    *,
+    Vh: DGPPOValueNet,
+    graph: GraphData,
+    rnn_states: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Evaluate decomposed ``Vh`` on a graph batch using stored policy carries."""
+    rnn_state = None
+    if Vh.rnn is not None:
+        if rnn_states is None:
+            raise ValueError("Recurrent Vh evaluation requires stored policy RNN states")
+        rnn_state = _flatten_agent_rnn_states(rnn_states)
+    values, _ = Vh(graph, rnn_state)
+    return values.reshape(graph.batch_shape + (Vh.n_agents, values.shape[-1]))
+
+
+def evaluate_rollout_vh_values(
+    *,
+    Vh: DGPPOValueNet,
+    graph: GraphData,
+    B: int,
+    T: int,
+    rnn_states: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Evaluate ``Vh`` for a ``[B, T]`` rollout graph from stored policy carries."""
+    return evaluate_vh_batch_from_states(Vh=Vh, graph=graph, rnn_states=rnn_states).reshape(B, T, Vh.n_agents, -1)
+
+
 def compute_rollout_vl_loss(
     *,
     Vl: DGPPOValueNet,
@@ -394,21 +476,21 @@ def compute_rollout_vl_loss(
     chunk_ids: torch.Tensor,
     A: int,
     loss_scale: float = 1.0,
-    rnn_states: torch.Tensor | None = None,
     done_mask: torch.Tensor | None = None,
     chunk_graph: GraphData | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Compute the Vl update loss over rollout chunks using stored chunk-start RNN states when available."""
+    """Compute the Vl update loss over rollout chunks."""
     B, T = targets.shape
     chunk_ids_index = _canonical_chunk_ids(chunk_ids, device=targets.device)
     C, R = chunk_ids_index.shape
     if chunk_graph is None:
-        chunk_graph = rollout_graph_chunks(graph, chunk_ids=chunk_ids_index, T=T, B=B)
+        chunk_graph = rollout_graph_chunks(graph, chunk_ids=chunk_ids, T=T, B=B)
+    done_chunks = done_mask[:, chunk_ids_index] if done_mask is not None else None
     values = _evaluate_vl_chunks(
         Vl=Vl,
         graph=chunk_graph,
-        rnn_states=rnn_states[:, chunk_ids_index[:, 0]] if rnn_states is not None else None,
-        done_chunks=done_mask[:, chunk_ids_index] if done_mask is not None else None,
+        rnn_states=None,
+        done_chunks=done_chunks,
         B=B,
         C=C,
         R=R,
@@ -426,7 +508,7 @@ def compute_rollout_vh_loss(
     *,
     Vh: DGPPOValueNet,
     graph: GraphData,
-    rnn_states: torch.Tensor,
+    rnn_states: torch.Tensor | None,
     targets: torch.Tensor,
     chunk_ids: torch.Tensor,
     A: int,
@@ -438,11 +520,12 @@ def compute_rollout_vh_loss(
     chunk_ids_index = _canonical_chunk_ids(chunk_ids, device=targets.device)
     C, R = chunk_ids_index.shape
     if chunk_graph is None:
-        chunk_graph = rollout_graph_chunks(graph, chunk_ids=chunk_ids_index, T=T, B=B)
+        chunk_graph = rollout_graph_chunks(graph, chunk_ids=chunk_ids, T=T, B=B)
+    rnn_state_chunks = rnn_states[:, chunk_ids_index] if rnn_states is not None else None
     values = _evaluate_vh_chunks(
         Vh=Vh,
         graph=chunk_graph,
-        rnn_states=rnn_states[:, chunk_ids_index],
+        rnn_states=rnn_state_chunks,
         B=B,
         C=C,
         R=R,
@@ -649,7 +732,7 @@ def _evaluate_vh_chunks(
     *,
     Vh: DGPPOValueNet,
     graph: GraphData,
-    rnn_states: torch.Tensor,
+    rnn_states: torch.Tensor | None,
     B: int,
     C: int,
     R: int,
@@ -657,6 +740,8 @@ def _evaluate_vh_chunks(
     n_cost: int,
 ) -> torch.Tensor:
     """Evaluate deterministic Vh chunks in one batched call using stored policy RNN states."""
+    if Vh.rnn is not None and rnn_states is None:
+        raise ValueError("Recurrent Vh chunks require stored deterministic policy RNN states")
     rnn_state = _flatten_agent_rnn_states(rnn_states) if Vh.rnn is not None else None
     values, _ = Vh(graph, rnn_state)
     return values.reshape(B, C, R, A, n_cost)

@@ -18,12 +18,10 @@ Rollout memory used by DGPPOAgent.
     costs          (T, B, A, NH)
     terminated     (T, B)
     truncated      (T, B)
-    values_l       (T+1, B)
-    values_h       (T+1, B, A, NH)
     rnn_state      one policy carry per rollout step, env, and agent
-    vl_rnn_state   one centralized Vl carry per rollout step and env
 
-``values_l`` / ``values_h`` have one extra step for the terminal bootstrap.
+The final next-observation graph is stored separately so value targets can be
+recomputed with current network parameters.
 """
 
 from __future__ import annotations
@@ -80,39 +78,50 @@ class DGPPORolloutMemory(RandomMemory):
             self.create_tensor(f"{prefix}_log_probs", size=B * A, dtype=torch.float32, keep_dimensions=False)
             self.create_tensor(f"{prefix}_rewards", size=B, dtype=torch.float32, keep_dimensions=False)
             self.create_tensor(f"{prefix}_costs", size=B * A * NH, dtype=torch.float32, keep_dimensions=False)
-            # DGPPO DEBUG FIX START: rollout episode-boundary masks.
+            # Keep termination and truncation separate for target bootstrap semantics.
             self.create_tensor(f"{prefix}_terminated", size=B, dtype=torch.bool, keep_dimensions=False)
             self.create_tensor(f"{prefix}_truncated", size=B, dtype=torch.bool, keep_dimensions=False)
-            # DGPPO DEBUG FIX END: rollout episode-boundary masks.
-            self.create_tensor(f"{prefix}_values_l", size=B, dtype=torch.float32, keep_dimensions=False)
-            self.create_tensor(f"{prefix}_values_h", size=B * A * NH, dtype=torch.float32, keep_dimensions=False)
 
             if self.use_rnn:
                 rnn_size = B * A * self.rnn_layers * self.rnn_carries * self.rnn_hidden
                 self.create_tensor(f"{prefix}_rnn_states", size=rnn_size, dtype=torch.float32, keep_dimensions=False)
-            if self.use_vl_rnn:
-                vl_rnn_size = B * self.rnn_layers * self.rnn_carries * self.rnn_hidden
-                self.create_tensor(
-                    f"{prefix}_vl_rnn_states", size=vl_rnn_size, dtype=torch.float32, keep_dimensions=False
-                )
-
-        self._final_values_l = {
-            "stc": torch.zeros(self.n_stc_envs, dtype=torch.float32, device=device),
-            "det": torch.zeros(self.n_det_envs, dtype=torch.float32, device=device),
+        self._initial_vl_rnn_states = None
+        if self.use_vl_rnn:
+            self._initial_vl_rnn_states = {
+                "stc": torch.zeros(
+                    self.n_stc_envs,
+                    self.rnn_layers,
+                    self.rnn_carries,
+                    self.rnn_hidden,
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                "det": torch.zeros(
+                    self.n_det_envs,
+                    self.rnn_layers,
+                    self.rnn_carries,
+                    self.rnn_hidden,
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            }
+        self._final_agent_state = {
+            "stc": torch.zeros(self.n_stc_envs, A, S, dtype=torch.float32, device=device),
+            "det": torch.zeros(self.n_det_envs, A, S, dtype=torch.float32, device=device),
         }
-        self._final_values_h = {
-            "stc": torch.zeros(self.n_stc_envs, A, NH, dtype=torch.float32, device=device),
-            "det": torch.zeros(self.n_det_envs, A, NH, dtype=torch.float32, device=device),
+        self._final_goal_state = {
+            "stc": torch.zeros(self.n_stc_envs, A, S, dtype=torch.float32, device=device),
+            "det": torch.zeros(self.n_det_envs, A, S, dtype=torch.float32, device=device),
+        }
+        self._final_obs_state = {
+            "stc": torch.zeros(self.n_stc_envs, O, S, dtype=torch.float32, device=device),
+            "det": torch.zeros(self.n_det_envs, O, S, dtype=torch.float32, device=device),
         }
         self._cursor = 0
 
     def _tensor(self, name: str) -> torch.Tensor:
         """Return the flat per-step storage tensor created by skrl memory."""
         return self.tensors[name].squeeze(1)
-
-    # ------------------------------------------------------------------
-    # Check from here
-    # ------------------------------------------------------------------
 
     def reset(self) -> None:
         self._cursor = 0
@@ -135,8 +144,6 @@ class DGPPORolloutMemory(RandomMemory):
         stc_log_prob: torch.Tensor,
         stc_reward: torch.Tensor,
         stc_cost: torch.Tensor,
-        stc_value_l: torch.Tensor,
-        stc_value_h: torch.Tensor,
         det_agent_state: torch.Tensor,
         det_goal_state: torch.Tensor,
         det_obs_state: torch.Tensor,
@@ -144,16 +151,12 @@ class DGPPORolloutMemory(RandomMemory):
         det_log_prob: torch.Tensor,
         det_reward: torch.Tensor,
         det_cost: torch.Tensor,
-        det_value_l: torch.Tensor,
-        det_value_h: torch.Tensor,
         stc_terminated: Optional[torch.Tensor] = None,
         stc_truncated: Optional[torch.Tensor] = None,
         det_terminated: Optional[torch.Tensor] = None,
         det_truncated: Optional[torch.Tensor] = None,
         stc_rnn_state: Optional[torch.Tensor] = None,
         det_rnn_state: Optional[torch.Tensor] = None,
-        stc_vl_rnn_state: Optional[torch.Tensor] = None,
-        det_vl_rnn_state: Optional[torch.Tensor] = None,
     ) -> None:
         """Append one rollout step for both stochastic and deterministic splits."""
         t = self._cursor
@@ -167,12 +170,8 @@ class DGPPORolloutMemory(RandomMemory):
         self._tensor("stc_log_probs")[t] = stc_log_prob.reshape(-1)
         self._tensor("stc_rewards")[t] = stc_reward.reshape(-1)
         self._tensor("stc_costs")[t] = stc_cost.reshape(-1)
-        # DGPPO DEBUG FIX START: store stochastic episode-boundary masks.
         self._tensor("stc_terminated")[t] = self._canonical_done_mask(stc_terminated, self.n_stc_envs)
         self._tensor("stc_truncated")[t] = self._canonical_done_mask(stc_truncated, self.n_stc_envs)
-        # DGPPO DEBUG FIX END: store stochastic episode-boundary masks.
-        self._tensor("stc_values_l")[t] = stc_value_l.reshape(-1)
-        self._tensor("stc_values_h")[t] = stc_value_h.reshape(-1)
 
         self._tensor("det_agent_state")[t] = det_agent_state.reshape(-1)
         self._tensor("det_goal_state")[t] = det_goal_state.reshape(-1)
@@ -181,12 +180,8 @@ class DGPPORolloutMemory(RandomMemory):
         self._tensor("det_log_probs")[t] = det_log_prob.reshape(-1)
         self._tensor("det_rewards")[t] = det_reward.reshape(-1)
         self._tensor("det_costs")[t] = det_cost.reshape(-1)
-        # DGPPO DEBUG FIX START: store deterministic episode-boundary masks.
         self._tensor("det_terminated")[t] = self._canonical_done_mask(det_terminated, self.n_det_envs)
         self._tensor("det_truncated")[t] = self._canonical_done_mask(det_truncated, self.n_det_envs)
-        # DGPPO DEBUG FIX END: store deterministic episode-boundary masks.
-        self._tensor("det_values_l")[t] = det_value_l.reshape(-1)
-        self._tensor("det_values_h")[t] = det_value_h.reshape(-1)
 
         if self.use_rnn:
             if stc_rnn_state is not None:
@@ -197,16 +192,6 @@ class DGPPORolloutMemory(RandomMemory):
                 self._tensor("det_rnn_states")[t] = self._canonical_rnn_state(
                     det_rnn_state, self.n_det_envs
                 ).reshape(-1)
-        if self.use_vl_rnn:
-            if stc_vl_rnn_state is not None:
-                self._tensor("stc_vl_rnn_states")[t] = self._canonical_vl_rnn_state(
-                    stc_vl_rnn_state, self.n_stc_envs
-                ).reshape(-1)
-            if det_vl_rnn_state is not None:
-                self._tensor("det_vl_rnn_states")[t] = self._canonical_vl_rnn_state(
-                    det_vl_rnn_state, self.n_det_envs
-                ).reshape(-1)
-
         self._cursor += 1
 
     def _canonical_rnn_state(self, rnn_state: torch.Tensor, n_envs: int) -> torch.Tensor:
@@ -215,7 +200,13 @@ class DGPPORolloutMemory(RandomMemory):
         flat_shape = (self.rnn_layers, n_envs * A, self.rnn_carries, self.rnn_hidden)
         stored_shape = (n_envs, A, self.rnn_layers, self.rnn_carries, self.rnn_hidden)
         if rnn_state.shape == flat_shape:
-            return rnn_state.reshape(self.rnn_layers, n_envs, A, self.rnn_carries, self.rnn_hidden).permute(1, 2, 0, 3, 4)
+            return rnn_state.reshape(
+                self.rnn_layers,
+                n_envs,
+                A,
+                self.rnn_carries,
+                self.rnn_hidden,
+            ).permute(1, 2, 0, 3, 4)
         if rnn_state.shape == stored_shape:
             return rnn_state
         raise ValueError(
@@ -243,11 +234,31 @@ class DGPPORolloutMemory(RandomMemory):
             return torch.zeros(B, dtype=torch.bool, device=self.device)
         return torch.as_tensor(mask, device=self.device, dtype=torch.bool).reshape(B)
 
-    def set_final_values(self, split: str, value_l: torch.Tensor, value_h: torch.Tensor) -> None:
+    def set_final_state(
+        self,
+        split: str,
+        *,
+        agent_state: torch.Tensor,
+        goal_state: torch.Tensor,
+        obs_state: torch.Tensor,
+    ) -> None:
+        """Store the final next-observation graph."""
         if split not in ("stc", "det"):
             raise ValueError(f"Unknown split '{split}'")
-        self._final_values_l[split] = value_l.reshape(-1).to(self.device)
-        self._final_values_h[split] = value_h.to(self.device)
+        B = self.n_stc_envs if split == "stc" else self.n_det_envs
+        self._final_agent_state[split] = agent_state.reshape(B, self._n_agents, self._state_dim).to(self.device)
+        self._final_goal_state[split] = goal_state.reshape(B, self._n_agents, self._state_dim).to(self.device)
+        self._final_obs_state[split] = obs_state.reshape(B, self._n_obs, self._state_dim).to(self.device)
+
+    def set_initial_vl_state(self, split: str, rnn_state: Optional[torch.Tensor]) -> None:
+        """Store the centralized critic carry at the first rollout step."""
+        if rnn_state is None or not self.use_vl_rnn:
+            return
+        if split not in ("stc", "det"):
+            raise ValueError(f"Unknown split '{split}'")
+        B = self.n_stc_envs if split == "stc" else self.n_det_envs
+        assert self._initial_vl_rnn_states is not None
+        self._initial_vl_rnn_states[split] = self._canonical_vl_rnn_state(rnn_state, B).to(self.device)
 
     # Read-side helpers used by the update
     # ------------------------------------------------------------------
@@ -271,14 +282,8 @@ class DGPPORolloutMemory(RandomMemory):
         log_probs = self._tensor(f"{split}_log_probs").reshape(T, B, A)
         rewards = self._tensor(f"{split}_rewards").reshape(T, B)
         costs = self._tensor(f"{split}_costs").reshape(T, B, A, self._n_constraints)
-        # DGPPO DEBUG FIX START: expose masks to target/GAE computation.
         terminated = self._tensor(f"{split}_terminated").reshape(T, B)
         truncated = self._tensor(f"{split}_truncated").reshape(T, B)
-        # DGPPO DEBUG FIX END: expose masks to target/GAE computation.
-        values_l = self._tensor(f"{split}_values_l").reshape(T, B)
-        values_h = self._tensor(f"{split}_values_h").reshape(T, B, A, self._n_constraints)
-        v_l_tp1 = torch.cat([values_l, self._final_values_l[split].unsqueeze(0)], dim=0)
-        v_h_tp1 = torch.cat([values_h, self._final_values_h[split].unsqueeze(0)], dim=0)
 
         data = {
             "bT_l": -rewards.transpose(0, 1),
@@ -286,15 +291,14 @@ class DGPPORolloutMemory(RandomMemory):
             "bT_terminated": terminated.transpose(0, 1),
             "bT_truncated": truncated.transpose(0, 1),
             "bT_done": (terminated | truncated).transpose(0, 1),
-            "bTp1_Vl": v_l_tp1.transpose(0, 1),
-            "bTp1ah_Vh": v_h_tp1.transpose(0, 1),
-            "bTah_Vh": values_h.transpose(0, 1),
-            "bT_Vl": values_l.transpose(0, 1),
             "bTa_logp": log_probs.transpose(0, 1),
             "bTa_actions": actions.transpose(0, 1),
             "bTa_agent_state": agent_state.transpose(0, 1),
             "bTa_goal_state": goal_state.transpose(0, 1),
             "bTo_obs_state": obs_state.transpose(0, 1),
+            "b_final_agent_state": self._final_agent_state[split],
+            "b_final_goal_state": self._final_goal_state[split],
+            "b_final_obs_state": self._final_obs_state[split],
         }
 
         if self.use_rnn:
@@ -303,19 +307,13 @@ class DGPPORolloutMemory(RandomMemory):
             )
             data["bTa_rnn_states"] = rnn_states.permute(1, 0, 3, 2, 4, 5)
         if self.use_vl_rnn:
-            vl_rnn_states = self._tensor(f"{split}_vl_rnn_states").reshape(
-                T, B, self.rnn_layers, self.rnn_carries, self.rnn_hidden
-            )
-            data["bT_vl_rnn_states"] = vl_rnn_states.permute(1, 0, 2, 3, 4)
+            assert self._initial_vl_rnn_states is not None
+            data["b_initial_vl_rnn_state"] = self._initial_vl_rnn_states[split]
 
         return data
 
     def sample_minibatches(self, num_mini_batches: int) -> list[torch.Tensor]:
         """Return randomized chunks of env indices over the stochastic split.
-
-        DGPPO's PPO loop shuffles env indices and passes ``B/num_minibatches``
-        trajectories per step, matching the JAX reference
-        (``update_inner`` in ``dgppo/algo/dgppo.py``).
         """
         if num_mini_batches <= 0:
             raise ValueError(f"num_mini_batches must be > 0, got {num_mini_batches}")

@@ -50,7 +50,7 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     """Configuration for the position tracking environment."""
 
     # Simulation settings
-    episode_length_s = 10.0
+    episode_length_s = 9.92
     sim_frequency = 500
     policy_rate_hz = 50
     pid_loop_rate_hz = 500
@@ -157,7 +157,7 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     pos_tolerance: float = 0.15
     yaw_tolerance: float = 0.25
     success_hold_time_s: float = 1.0 # prev: 0.5
-    terminate_on_success: bool = True
+    terminate_on_success: bool = False
 
     # Episode reset policy. Safety violations are the inner constraints (floor,
     # ceiling, arena faces, pillars). Out-of-boundaries is the outer envelope,

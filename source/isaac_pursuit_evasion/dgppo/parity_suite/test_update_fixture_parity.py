@@ -6,7 +6,7 @@ from .parity_test_utils import assert_parity_close, importorskip, load_update_fi
 
 torch = importorskip("torch")
 
-from dgppo.update_helpers import build_update_graph_batch, rollout_graph_slice
+from dgppo.update_helpers import build_rollout_graph, build_update_graph_batch, rollout_graph_slice
 from dgppo.utils import compute_cbf_advantages, compute_policy_surrogate
 
 
@@ -131,3 +131,50 @@ def test_build_update_graph_batch_uses_production_graph_builder(num_envs: int) -
             assert int(graph.receivers.min()) >= 0
             assert int(graph.senders.max()) < graph.nodes.shape[0]
             assert int(graph.receivers.max()) < graph.nodes.shape[0]
+
+
+def test_build_update_graph_batch_reuses_prebuilt_graph_without_state_gather() -> None:
+    B, T, A, O, S = 3, 2, 2, 1, 4
+    action_dim = 3
+    n_cost = 2
+
+    graph_view = {
+        "bTa_agent_state": torch.randn(B, T, A, S),
+        "bTa_goal_state": torch.randn(B, T, A, S),
+        "bTo_obs_state": torch.randn(B, T, O, S),
+    }
+    graph = build_rollout_graph(view=graph_view, obs_radius=2.0)
+    det_graph = build_rollout_graph(view=graph_view, obs_radius=2.0)
+
+    sentinel = object()
+    view = {
+        "bTa_agent_state": sentinel,
+        "bTa_goal_state": sentinel,
+        "bTo_obs_state": sentinel,
+        "bTa_actions": torch.randn(B, T, A, action_dim),
+        "bTa_logp": torch.randn(B, T, A),
+    }
+    det_view = {
+        "bTa_agent_state": sentinel,
+        "bTa_goal_state": sentinel,
+        "bTo_obs_state": sentinel,
+        "bTa_actions": torch.randn(B, T, A, action_dim),
+        "bTa_logp": torch.randn(B, T, A),
+    }
+    idx = torch.tensor([2, 0], dtype=torch.long)
+
+    batch = build_update_graph_batch(
+        idx=idx,
+        view=view,
+        det_view=det_view,
+        qh_det=torch.randn(B, T, A, n_cost),
+        ql=torch.randn(B, T),
+        advantages=torch.randn(B, T, A),
+        obs_radius=2.0,
+        graph=graph,
+        det_graph=det_graph,
+    )
+
+    assert batch.actions.shape == (idx.numel(), T, A, action_dim)
+    assert batch.graph.n_graphs == idx.numel() * T
+    assert batch.det_graph.n_graphs == idx.numel() * T

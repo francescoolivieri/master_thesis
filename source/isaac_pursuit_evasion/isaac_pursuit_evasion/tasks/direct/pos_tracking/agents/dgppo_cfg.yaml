@@ -9,7 +9,7 @@ env:
   include_yaw_with_ray_caster: true
   terminate_on_safety_violation: false
   enable_clip_states: true
-  terminate_on_out_of_boundaries: true
+  terminate_on_out_of_boundaries: false
 
 # - DG-PPO hyper-parameters, consumed by DGPPOAgentCfg / DGPPOAgent / DGPPORunner
 agent:
@@ -24,8 +24,8 @@ agent:
   obs_radius: 8.0
 
   # PPO / GAE
-  rollouts:         512       # steps collected per update (per env)
-  learning_epochs:  3
+  rollouts:         496       # steps collected per update (per env), 9.92s at 50 Hz
+  learning_epochs:  1
   mini_batches:     12
 
   discount_factor:  0.995
@@ -36,22 +36,13 @@ agent:
   lr_policy: 2.0e-4
   lr_vl:     1.0e-3
   lr_vh:     1.0e-3
-  # TODO: add scheduler (KLAdaptiveLR)
 
-  # DG-PPO applies observation scaling to graph neural-network features after
-  # raw-unit graph topology/cost construction. Value scaling is used for Vl
-  # targets only; stored rollouts and CBF advantages remain in raw units.
-  observation_preprocessor: null #RunningStandardScaler
-  observation_preprocessor_kwargs: null
-  value_preprocessor: null #RunningStandardScaler
-  value_preprocessor_kwargs: null
   rewards_shaper_scale: 0.1
-
 
   learning_starts:  0
   
   ratio_clip:       0.2
-  grad_norm_clip:   2.0
+  grad_norm_clip:   0.5
   # TODO: add value_clip
 
   entropy_loss_scale: 0.01
@@ -87,22 +78,6 @@ agent:
     std_dev_min: 1.0e-5
 
   # TODO: add activations selection to the relevant models (ex. elu,relu, etc.)
-
-  
-  # Live-training diagnostics. This branch is intentionally debug-heavy:
-  # JSONL events are written under each run's dgppo_debug/ directory.
-  debug:
-    enabled: false
-    step_interval: 10
-    update_interval: 1
-    minibatch_interval: 1
-    sample_env_count: 8
-    log_minibatches: true
-    log_jsonl: true
-    log_tensorboard_scalars: true
-    log_on_done: true
-    rnn_done_norm_epsilon: 1.0e-6
-    anomaly_abs_threshold: 1000000.0
 
   # skrl experiment logging
   experiment:

@@ -820,10 +820,13 @@ def _log_agent_preprocessors(agent: Any, agent_cfg: dict) -> None:
     cfg_agent = agent_cfg.get("agent", {}) if isinstance(agent_cfg, dict) else {}
     cfg_state = cfg_agent.get("observation_preprocessor", cfg_agent.get("state_preprocessor"))
     cfg_value = cfg_agent.get("value_preprocessor")
-    print(f"[INFO] Agent preprocessor config: observation/state={cfg_state}, value={cfg_value}")
 
     state_pre = getattr(agent, "_observation_preprocessor", getattr(agent, "_state_preprocessor", None))
     value_pre = getattr(agent, "_value_preprocessor", None)
+    if cfg_state is None and cfg_value is None and state_pre is None and value_pre is None:
+        return
+
+    print(f"[INFO] Agent preprocessor config: observation/state={cfg_state}, value={cfg_value}")
 
     def _describe(pre: Any) -> str:
         if pre is None:

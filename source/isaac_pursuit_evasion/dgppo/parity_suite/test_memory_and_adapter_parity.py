@@ -34,8 +34,6 @@ def test_rollout_memory_layout_matches_jax_update_fixture(num_envs: int) -> None
     logp = fixture.tensor("inputs/rollout/log_pis")
     rewards = fixture.tensor("inputs/rollout/rewards")
     costs = fixture.tensor("inputs/rollout/costs")
-    values_l = fixture.tensor("checkpoints/update/value/bT_Vl")
-    values_h = fixture.tensor("checkpoints/update/value/bTah_Vh")
 
     B, T, A, S = agent_state.shape
     action_dim = actions.shape[-1]
@@ -64,8 +62,6 @@ def test_rollout_memory_layout_matches_jax_update_fixture(num_envs: int) -> None
             stc_log_prob=logp[:, t],
             stc_reward=rewards[:, t],
             stc_cost=costs[:, t],
-            stc_value_l=values_l[:, t],
-            stc_value_h=values_h[:, t],
             det_agent_state=agent_state[:, t],
             det_goal_state=goal_state[:, t],
             det_obs_state=obs_state,
@@ -73,33 +69,12 @@ def test_rollout_memory_layout_matches_jax_update_fixture(num_envs: int) -> None
             det_log_prob=logp[:, t],
             det_reward=rewards[:, t],
             det_cost=costs[:, t],
-            det_value_l=values_l[:, t],
-            det_value_h=values_h[:, t],
         )
 
-    memory.set_final_values(
-        "stc",
-        fixture.tensor("checkpoints/update/value/bTp1_Vl")[:, -1],
-        fixture.tensor("checkpoints/update/value/bTp1ah_Vh")[:, -1],
-    )
     view = memory.as_bTah_view("stc")
 
     assert_parity_close(view["bT_l"], -rewards, stage=f"num_envs={num_envs}/memory", tensor_name="bT_l")
     assert_parity_close(view["bTah_hs"], costs, stage=f"num_envs={num_envs}/memory", tensor_name="bTah_hs")
-    assert_parity_close(view["bT_Vl"], values_l, stage=f"num_envs={num_envs}/memory", tensor_name="bT_Vl")
-    assert_parity_close(
-        view["bTp1_Vl"],
-        fixture.arrays["checkpoints/update/value/bTp1_Vl"],
-        stage=f"num_envs={num_envs}/memory",
-        tensor_name="bTp1_Vl",
-    )
-    assert_parity_close(view["bTah_Vh"], values_h, stage=f"num_envs={num_envs}/memory", tensor_name="bTah_Vh")
-    assert_parity_close(
-        view["bTp1ah_Vh"],
-        fixture.arrays["checkpoints/update/value/bTp1ah_Vh"],
-        stage=f"num_envs={num_envs}/memory",
-        tensor_name="bTp1ah_Vh",
-    )
     assert not view["bT_terminated"].any()
     assert not view["bT_truncated"].any()
 
@@ -126,7 +101,6 @@ def test_rollout_memory_stores_split_done_masks() -> None:
     zeros_obs = torch.zeros(B, O, S)
     zeros_action = torch.zeros(B, A, Da)
     zeros_cost = torch.zeros(B, A, NH)
-    zeros_value_h = torch.zeros(B, A, NH)
     zeros_env = torch.zeros(B)
     zeros_logp = torch.zeros(B, A)
 
@@ -144,8 +118,6 @@ def test_rollout_memory_stores_split_done_masks() -> None:
             stc_log_prob=zeros_logp,
             stc_reward=zeros_env,
             stc_cost=zeros_cost,
-            stc_value_l=zeros_env,
-            stc_value_h=zeros_value_h,
             stc_terminated=stc_terminated[t],
             stc_truncated=stc_truncated[t],
             det_agent_state=zeros_agent,
@@ -155,8 +127,6 @@ def test_rollout_memory_stores_split_done_masks() -> None:
             det_log_prob=zeros_logp,
             det_reward=zeros_env,
             det_cost=zeros_cost,
-            det_value_l=zeros_env,
-            det_value_h=zeros_value_h,
             det_terminated=det_terminated[t],
             det_truncated=det_truncated[t],
         )
@@ -171,7 +141,7 @@ def test_rollout_memory_stores_split_done_masks() -> None:
     assert torch.equal(stc_view["bT_done"], stc_view["bT_terminated"] | stc_view["bT_truncated"])
 
 
-def test_rollout_memory_stores_policy_and_vl_rnn_carries() -> None:
+def test_rollout_memory_stores_policy_carries_and_initial_vl_carry() -> None:
     importorskip("skrl.memories.torch")
     from dgppo.dgppo_memory import DGPPORolloutMemory
 
@@ -198,17 +168,19 @@ def test_rollout_memory_stores_policy_and_vl_rnn_carries() -> None:
     zeros_obs = torch.zeros(B, O, S)
     zeros_action = torch.zeros(B, A, Da)
     zeros_cost = torch.zeros(B, A, NH)
-    zeros_value_h = torch.zeros(B, A, NH)
     zeros_env = torch.zeros(B)
     zeros_logp = torch.zeros(B, A)
 
     stc_policy_states = []
-    stc_vl_states = []
+    initial_vl_state = None
     for t in range(T):
         policy_state = torch.arange(L * B * A * C * H, dtype=torch.float32).reshape(L, B * A, C, H) + 100 * t
         vl_state = torch.arange(L * B * C * H, dtype=torch.float32).reshape(L, B, C, H) + 1000 * t
         stc_policy_states.append(policy_state.reshape(L, B, A, C, H).permute(1, 0, 2, 3, 4))
-        stc_vl_states.append(vl_state.permute(1, 0, 2, 3))
+        if t == 0:
+            initial_vl_state = vl_state.permute(1, 0, 2, 3)
+            memory.set_initial_vl_state("stc", vl_state)
+            memory.set_initial_vl_state("det", vl_state)
         memory.add(
             stc_agent_state=zeros_agent,
             stc_goal_state=zeros_agent,
@@ -217,8 +189,6 @@ def test_rollout_memory_stores_policy_and_vl_rnn_carries() -> None:
             stc_log_prob=zeros_logp,
             stc_reward=zeros_env,
             stc_cost=zeros_cost,
-            stc_value_l=zeros_env,
-            stc_value_h=zeros_value_h,
             det_agent_state=zeros_agent,
             det_goal_state=zeros_agent,
             det_obs_state=zeros_obs,
@@ -226,17 +196,14 @@ def test_rollout_memory_stores_policy_and_vl_rnn_carries() -> None:
             det_log_prob=zeros_logp,
             det_reward=zeros_env,
             det_cost=zeros_cost,
-            det_value_l=zeros_env,
-            det_value_h=zeros_value_h,
             stc_rnn_state=policy_state,
             det_rnn_state=policy_state,
-            stc_vl_rnn_state=vl_state,
-            det_vl_rnn_state=vl_state,
         )
 
     view = memory.as_bTah_view("stc")
+    assert initial_vl_state is not None
     assert torch.equal(view["bTa_rnn_states"], torch.stack(stc_policy_states, dim=1))
-    assert torch.equal(view["bT_vl_rnn_states"], torch.stack(stc_vl_states, dim=1))
+    assert torch.equal(view["b_initial_vl_rnn_state"], initial_vl_state)
 
 
 @pytest.mark.parametrize("num_envs", [2, 6])
@@ -331,7 +298,12 @@ def test_build_graph_data_preserves_node_order_types_and_padding_state() -> None
     assert torch.equal(env0.nodes[4:5, 4:], torch.tensor([[1.0, 0.0, 0.0]]))
     assert torch.equal(env0.nodes[5:, :], torch.zeros_like(env0.nodes[5:, :]))
 
-    assert_parity_close(graph.get_type_states(AGENT_TYPE, 2), agent_state, stage="graph_nodes", tensor_name="agent_states")
+    assert_parity_close(
+        graph.get_type_states(AGENT_TYPE, 2),
+        agent_state,
+        stage="graph_nodes",
+        tensor_name="agent_states",
+    )
     assert_parity_close(graph.get_type_states(GOAL_TYPE, 2), goal_state, stage="graph_nodes", tensor_name="goal_states")
     assert_parity_close(graph.get_type_states(OBS_TYPE, 1), obs_state, stage="graph_nodes", tensor_name="obs_states")
 
@@ -521,3 +493,73 @@ def test_gnn_policy_and_value_shapes_for_rollout_and_chunk_graphs() -> None:
     assert vl_state.shape == (1, B * T, 1, rnn_hidden)
     assert vh.shape == (B * T, A, n_constraints)
     assert vh_state.shape == (1, B * T * A, 1, rnn_hidden)
+
+
+def test_scan_rollout_vl_values_batches_backbone_once(monkeypatch) -> None:
+    importorskip("torch_geometric")
+
+    from dgppo.dgppo_models import DGPPOValueNet
+    from dgppo.update_helpers import build_rollout_graph, rollout_graph_timestep, scan_rollout_vl_values
+
+    B, T, A, O, S = 2, 4, 3, 1, 5
+    rnn_hidden = 7
+    graph = build_rollout_graph(
+        view={
+            "bTa_agent_state": torch.randn(B, T, A, S),
+            "bTa_goal_state": torch.randn(B, T, A, S),
+            "bTo_obs_state": torch.randn(B, T, O, S),
+        },
+        obs_radius=10.0,
+    )
+    Vl = DGPPOValueNet(
+        node_dim=S + NUM_TYPE_INDICATORS,
+        edge_dim=S,
+        n_agents=A,
+        gnn_layers=1,
+        gnn_out_dim=8,
+        gnn_msg_dim=6,
+        gnn_heads=2,
+        mlp_hid=(9,),
+        use_rnn=True,
+        rnn_hidden=rnn_hidden,
+        n_out=1,
+        decompose=False,
+    )
+    initial = Vl.rnn.initialize_carry(B).permute(1, 0, 2, 3) + 0.25
+    done_mask = torch.zeros(B, T, dtype=torch.bool)
+    done_mask[0, 1] = True
+
+    expected_values = graph.nodes.new_empty((B, T))
+    expected_states = initial.new_empty((B, T, *initial.shape[1:]))
+    rnn_state = initial.permute(1, 0, 2, 3)
+    for t in range(T):
+        expected_states[:, t] = rnn_state.permute(1, 0, 2, 3)
+        value, rnn_state = Vl(rollout_graph_timestep(graph, t=t, T=T, B=B), rnn_state)
+        expected_values[:, t] = value.squeeze(-1)
+        if done_mask[:, t].any():
+            rnn_state = rnn_state.clone()
+            rnn_state[:, done_mask[:, t]] = 0.0
+    expected_final = rnn_state.permute(1, 0, 2, 3)
+
+    call_count = 0
+    original_forward = Vl.gnn.forward
+
+    def counted_forward(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return original_forward(*args, **kwargs)
+
+    monkeypatch.setattr(Vl.gnn, "forward", counted_forward)
+    values, states, final_state = scan_rollout_vl_values(
+        Vl=Vl,
+        graph=graph,
+        B=B,
+        T=T,
+        initial_rnn_state=initial,
+        done_mask=done_mask,
+    )
+
+    assert call_count == 1
+    assert_parity_close(values, expected_values, stage="vl_scan", tensor_name="values")
+    assert_parity_close(states, expected_states, stage="vl_scan", tensor_name="states")
+    assert_parity_close(final_state, expected_final, stage="vl_scan", tensor_name="final_state")

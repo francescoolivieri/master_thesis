@@ -60,7 +60,6 @@ def compute_dec_ocp_gae(
     B, T, A, NH = Tah_hs.shape
     device, dtype = Tah_hs.device, Tah_hs.dtype
 
-    # DGPPO DEBUG FIX START: episode-boundary target masks.
     continue_mask = _gae_continue_mask(
         T_terminated=T_terminated,
         T_truncated=T_truncated,
@@ -70,7 +69,6 @@ def compute_dec_ocp_gae(
         device=device,
         dtype=dtype,
     )
-    # DGPPO DEBUG FIX END: episode-boundary target masks.
 
     Qs = torch.zeros((B, T, A, NH + 1), device=device, dtype=dtype)
     time_ids = torch.arange(T + 1, device=device)
@@ -124,7 +122,6 @@ def compute_dec_ocp_gae(
     return Qs[:, :, :, :NH], Qs[:, :, 0, NH]
 
 
-# DGPPO DEBUG FIX START: episode-boundary and safety-cost helper functions.
 def _gae_continue_mask(
     *,
     T_terminated: torch.Tensor | None,
