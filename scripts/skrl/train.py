@@ -1335,6 +1335,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if algorithm != "dgppo":
         runner = Runner(env, agent_cfg)
     else:
+        agent_cfg["agent"]["debug_rollout_plot_interval"] = int(video_interval_steps)
         
         # skrl's default runner is not compatible with DGPPO, so we use our ad-hoc.
         # DGPPORunner exposes the same interface as the default runner.

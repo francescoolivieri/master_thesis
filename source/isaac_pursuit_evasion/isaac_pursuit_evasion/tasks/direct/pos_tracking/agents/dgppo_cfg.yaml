@@ -30,14 +30,14 @@ agent:
 
   discount_factor:  0.995
   gae_lambda:           0.95
-  bootstrap_on_truncated: false
+  bootstrap_on_truncated: true
 
   # Learning rates
   lr_policy: 2.0e-4
   lr_vl:     1.0e-3
   lr_vh:     1.0e-3
 
-  rewards_shaper_scale: 0.1
+  rewards_shaper_scale: 1
 
   learning_starts:  0
   
@@ -95,7 +95,7 @@ agent:
 
 # - Trainer settings, read by skrl SequentialTrainer
 trainer:
-  timesteps: 50000 #15000
+  timesteps: 1000000 #15000
   environment_info: log
   headless: true
   disable_progressbar: false

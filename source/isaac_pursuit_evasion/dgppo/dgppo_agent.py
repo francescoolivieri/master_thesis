@@ -1,6 +1,7 @@
 import dataclasses
 import time
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -94,9 +95,13 @@ class UpdateStats:
     """Accumulated scalar tensors from all minibatches in one update."""
 
     loss_policy: torch.Tensor
+    loss_policy_total: torch.Tensor
     loss_value_l: torch.Tensor
     loss_value_h: torch.Tensor
     clip_frac: torch.Tensor
+    entropy_mean: torch.Tensor
+    entropy_bonus: torch.Tensor
+    approx_kl: torch.Tensor
     n_minibatches: int
 
 
@@ -175,6 +180,9 @@ class DGPPOAgent(Agent):
         self._vl_rnn_state = None
         self._env_split = self._make_env_split()
         self._act_cache: ActCache | None = None
+        self._debug_rollout_plot_count = 0
+        self._debug_rollout_plot_bucket = -1
+        self._debug_warnings: set[str] = set()
 
     def _make_env_split(self) -> EnvSplit:
         if self.env.num_envs < 2 or (self.env.num_envs % 2) != 0:
@@ -528,7 +536,7 @@ class DGPPOAgent(Agent):
             timestep=timestep,
             timesteps=timesteps,
         )
-        self._track_update_targets(view=view, targets=targets)
+        self._track_update_targets(view=view, det_view=det_view, targets=targets)
 
         stats = self._run_update_epochs(
             memory=memory,
@@ -548,8 +556,13 @@ class DGPPOAgent(Agent):
 
         update_summary = self._summarize_update(stats)
         self._track_update_summary(update_summary)
+        self._maybe_log_debug_rollout(view=view, timestep=timestep)
 
         memory.reset()
+
+    def write_checkpoint(self, *, timestep: int, timesteps: int) -> None:
+        super().write_checkpoint(timestep=timestep, timesteps=timesteps)
+        self._maybe_save_critic_debug_snapshot(timestep=timestep)
 
     def _compute_update_targets(
         self,
@@ -687,24 +700,35 @@ class DGPPOAgent(Agent):
         )
         return self._unflatten_policy_batch_rnn_state(final_state, batch_size=rnn_states.shape[0])
 
-    def _track_update_targets(self, *, view: dict[str, torch.Tensor], targets: UpdateTargets) -> None:
+    def _track_update_targets(
+        self,
+        *,
+        view: dict[str, torch.Tensor],
+        det_view: dict[str, torch.Tensor],
+        targets: UpdateTargets,
+    ) -> None:
         """Track rollout-level metrics before minibatch optimization starts."""
         self._track_scalars(
             {
-                "DGPPO/safe_rate": targets.adv_info["bTa_is_safe"].float().mean(),
-                "DGPPO/adv_raw_mean": targets.adv_info["bT_Al_raw"].mean(),
-                "DGPPO/low_level_cost_mean": view["bT_l"].mean(),
-                "DGPPO/ql_mean": targets.ql.mean(),
-                "DGPPO/ql_abs_max": targets.ql.abs().max(),
-                "DGPPO/vl_rollout_mean": targets.bT_vl.mean(),
-                "DGPPO/vl_target_error_mean": targets.vl_error.mean(),
-                "DGPPO/vl_target_error_abs_mean": targets.vl_error.abs().mean(),
-                "DGPPO/rollout_terminated_rate": view["bT_terminated"].float().mean(),
-                "DGPPO/rollout_truncated_rate": view["bT_truncated"].float().mean(),
-                "DGPPO/bootstrap_on_truncated": float(self.bootstrap_on_truncated),
+                "DGPPO/cbf/reward_advantage_used_pct": 100.0 * targets.adv_info["bTa_reward_used"].float().mean(),
+                "DGPPO/cbf/active_steps_pct": 100.0 * targets.adv_info["bTa_cbf_active"].float().mean(),
+                "DGPPO/cbf/penalty_mean": targets.adv_info["bTa_cbf_penalty"].mean(),
+                "DGPPO/advantage/reward_raw_mean": targets.adv_info["bT_Al_raw"].mean(),
+                "DGPPO/advantage/final_mean": targets.advantages.mean(),
+                "DGPPO/advantage/final_abs_max": targets.advantages.abs().max(),
+                "DGPPO/critic_targets/low_level_cost_mean": view["bT_l"].mean(),
+                "DGPPO/critic_targets/ql_mean": targets.ql.mean(),
+                "DGPPO/critic_targets/ql_abs_max": targets.ql.abs().max(),
+                "DGPPO/critic_targets/vl_rollout_mean": targets.bT_vl.mean(),
+                "DGPPO/critic_targets/vl_error_abs_mean": targets.vl_error.abs().mean(),
+                "DGPPO/rollout/stochastic/terminated_steps_pct": 100.0 * view["bT_terminated"].float().mean(),
+                "DGPPO/rollout/stochastic/truncated_steps_pct": 100.0 * view["bT_truncated"].float().mean(),
+                "DGPPO/rollout/deterministic/terminated_steps_pct": 100.0 * det_view["bT_terminated"].float().mean(),
+                "DGPPO/rollout/deterministic/truncated_steps_pct": 100.0 * det_view["bT_truncated"].float().mean(),
             }
         )
-        self._track_safety_cost_metrics(view["bTah_hs"])
+        self._track_rollout_safety_metrics(view=view, det_view=det_view)
+        self._track_rnn_metrics(view=view)
 
     def _run_update_epochs(
         self,
@@ -723,9 +747,13 @@ class DGPPOAgent(Agent):
     ) -> UpdateStats:
         """Run all PPO epochs and accumulate minibatch summaries."""
         loss_policy = initial_targets.advantages.new_zeros(())
+        loss_policy_total = initial_targets.advantages.new_zeros(())
         loss_value_l = initial_targets.advantages.new_zeros(())
         loss_value_h = initial_targets.advantages.new_zeros(())
         clip_frac = initial_targets.advantages.new_zeros(())
+        entropy_mean = initial_targets.advantages.new_zeros(())
+        entropy_bonus = initial_targets.advantages.new_zeros(())
+        approx_kl = initial_targets.advantages.new_zeros(())
         n_minibatches = 0
 
         for epoch in range(self.learning_epochs):
@@ -755,16 +783,24 @@ class DGPPOAgent(Agent):
                     chunk_ids=chunk_ids,
                 )
                 loss_policy += info["loss_p"]
+                loss_policy_total += info["loss_p_total"]
                 loss_value_l += info["loss_vl"]
                 loss_value_h += info["loss_vh"]
                 clip_frac += info["clip_frac"]
+                entropy_mean += info["entropy_mean"]
+                entropy_bonus += info["entropy_bonus"]
+                approx_kl += info["approx_kl"]
                 n_minibatches += 1
 
         return UpdateStats(
             loss_policy=loss_policy,
+            loss_policy_total=loss_policy_total,
             loss_value_l=loss_value_l,
             loss_value_h=loss_value_h,
             clip_frac=clip_frac,
+            entropy_mean=entropy_mean,
+            entropy_bonus=entropy_bonus,
+            approx_kl=approx_kl,
             n_minibatches=n_minibatches,
         )
 
@@ -772,10 +808,14 @@ class DGPPOAgent(Agent):
         inv_n = 1.0 / float(stats.n_minibatches)
         return {
             "loss_policy": float((stats.loss_policy * inv_n).item()),
+            "loss_policy_total": float((stats.loss_policy_total * inv_n).item()),
             "loss_value_l": float((stats.loss_value_l * inv_n).item()),
             "loss_value_l_rmse": float(torch.sqrt((2.0 * stats.loss_value_l * inv_n).clamp_min(0.0)).item()),
             "loss_value_h": float((stats.loss_value_h * inv_n).item()),
             "clip_frac": float((stats.clip_frac * inv_n).item()),
+            "entropy_mean": float((stats.entropy_mean * inv_n).item()),
+            "entropy_bonus": float((stats.entropy_bonus * inv_n).item()),
+            "approx_kl": float((stats.approx_kl * inv_n).item()),
             "lr_policy": float(self._policy_opt.param_groups[0]["lr"]),
             "lr_vl": float(self._vl_opt.param_groups[0]["lr"]),
             "lr_vh": float(self._vh_opt.param_groups[0]["lr"]),
@@ -784,14 +824,18 @@ class DGPPOAgent(Agent):
     def _track_update_summary(self, summary: Mapping[str, float]) -> None:
         self._track_scalars(
             {
-                "DGPPO/loss_policy": summary["loss_policy"],
-                "DGPPO/loss_value_l": summary["loss_value_l"],
-                "DGPPO/loss_value_l_rmse": summary["loss_value_l_rmse"],
-                "DGPPO/loss_value_h": summary["loss_value_h"],
-                "DGPPO/clip_frac": summary["clip_frac"],
-                "DGPPO/lr_policy": summary["lr_policy"],
-                "DGPPO/lr_vl": summary["lr_vl"],
-                "DGPPO/lr_vh": summary["lr_vh"],
+                "DGPPO/loss/policy_surrogate": summary["loss_policy"],
+                "DGPPO/loss/policy_total": summary["loss_policy_total"],
+                "DGPPO/loss/critic_low_level_vl": summary["loss_value_l"],
+                "DGPPO/loss/critic_low_level_vl_rmse": summary["loss_value_l_rmse"],
+                "DGPPO/loss/critic_safety_vh": summary["loss_value_h"],
+                "DGPPO/policy/clip_frac": summary["clip_frac"],
+                "DGPPO/policy/entropy": summary["entropy_mean"],
+                "DGPPO/policy/entropy_bonus": summary["entropy_bonus"],
+                "DGPPO/policy/approx_kl": summary["approx_kl"],
+                "DGPPO/optimizer/lr_policy": summary["lr_policy"],
+                "DGPPO/optimizer/lr_vl": summary["lr_vl"],
+                "DGPPO/optimizer/lr_vh": summary["lr_vh"],
             }
         )
 
@@ -854,6 +898,9 @@ class DGPPOAgent(Agent):
                 n_agents=batch.A,
                 rnn_state=None,
             )
+        with torch.no_grad():
+            log_ratio = policy_info["log_prob_delta"]
+            approx_kl = ((policy_info["ratio"] - 1.0) - log_ratio).mean()
         apply_policy_update(
             optimizer=self._policy_opt,
             loss=policy_info["loss_policy_total"],
@@ -893,9 +940,13 @@ class DGPPOAgent(Agent):
 
         return {
             "loss_p": policy_info["loss_policy"].detach(),
+            "loss_p_total": policy_info["loss_policy_total"].detach(),
             "loss_vl": value_info["loss_vl"].detach(),
             "loss_vh": value_info["loss_vh"].detach(),
             "clip_frac": policy_info["clip_frac"].detach(),
+            "entropy_mean": policy_info["entropy_mean"].detach(),
+            "entropy_bonus": policy_info["entropy_bonus"].detach(),
+            "approx_kl": approx_kl.detach(),
         }
 
     def _track_scalars(self, scalars: Mapping[str, float | torch.Tensor]) -> None:
@@ -927,6 +978,7 @@ class DGPPOAgent(Agent):
         self.lr_vl: float = float(self.cfg.lr_vl)
         self.lr_vh: float = float(self.cfg.lr_vh)
         self.rewards_shaper_scale: float = float(self.cfg.rewards_shaper_scale)
+        self.debug_rollout_plot_interval: int = int(self.cfg.get("debug_rollout_plot_interval", 0) or 0)
 
     def _cbf_scale(self, *, timestep: int, timesteps: int) -> float:
         """Piecewise-constant CBF weight schedule."""
@@ -949,24 +1001,373 @@ class DGPPOAgent(Agent):
             rnn_step = T
         return torch.arange(T, device=device, dtype=torch.long).reshape(-1, rnn_step)
 
-    def _track_safety_cost_metrics(self, safety_costs: torch.Tensor) -> None:
-        """Track signed safety costs without hiding opposing heads in a mean."""
-        if safety_costs.numel() == 0 or safety_costs.shape[-1] == 0:
+    def _track_rollout_safety_metrics(
+        self,
+        *,
+        view: dict[str, torch.Tensor],
+        det_view: dict[str, torch.Tensor],
+    ) -> None:
+        """Track raw rollout safety with explicit stochastic/deterministic scope."""
+        stc_masks = self._rollout_safety_masks(view)
+        det_masks = self._rollout_safety_masks(det_view)
+        if not stc_masks:
             return
-        max_per_agent = safety_costs.max(dim=-1).values
-        self.track_data("DGPPO/safety_cost_max", float(safety_costs.max().item()))
-        self.track_data("DGPPO/safety_cost_violation_rate", float((max_per_agent >= 0.0).float().mean().item()))
+
+        stc_any = self._combine_safety_masks(stc_masks)
+        det_any = self._combine_safety_masks(det_masks)
+        metrics = {
+            "DGPPO/safety/stochastic/rollouts_with_violation_pct": self._rollout_violation_pct(stc_any),
+            "DGPPO/safety/stochastic/violation_steps_pct": self._step_violation_pct(stc_any),
+            "DGPPO/safety/deterministic/rollouts_with_violation_pct": self._rollout_violation_pct(det_any),
+        }
+        for name, mask in stc_masks.items():
+            metrics[f"DGPPO/safety/{name}/rollouts_pct"] = self._rollout_violation_pct(mask)
+            metrics[f"DGPPO/safety/{name}/steps_pct"] = self._step_violation_pct(mask)
+        self._track_scalars(metrics)
+
+    def _rollout_safety_masks(self, view: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Return boolean safety masks in ``[B, T, A]`` layout."""
+        agent_state = view["bTa_agent_state"]
+        pos = agent_state[..., :3]
+        masks: dict[str, torch.Tensor] = {}
 
         base_env = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
-        components = tuple(getattr(base_env, "cost_components", ()))
-        for idx, label in enumerate(components[: safety_costs.shape[-1]]):
-            head = safety_costs[..., idx]
-            metric_label = str(label).replace(" ", "_").replace("/", "_")
-            self.track_data(f"DGPPO/safety_cost/{metric_label}_max", float(head.max().item()))
-            self.track_data(
-                f"DGPPO/safety_cost/{metric_label}_violation_rate",
-                float((head >= 0.0).float().mean().item()),
+        safe_min = getattr(base_env, "_arena_min_safe", None)
+        safe_max = getattr(base_env, "_arena_max_safe", None)
+        if safe_min is not None and safe_max is not None:
+            safe_min_t = torch.as_tensor(safe_min, device=pos.device, dtype=pos.dtype)
+            safe_max_t = torch.as_tensor(safe_max, device=pos.device, dtype=pos.dtype)
+            masks["vertical_bounds"] = (pos[..., 2] < safe_min_t[2]) | (pos[..., 2] > safe_max_t[2])
+            masks["xy_boundary"] = torch.any(
+                (pos[..., :2] < safe_min_t[:2]) | (pos[..., :2] > safe_max_t[:2]),
+                dim=-1,
             )
+
+        if view["bTah_hs"].shape[-1] > 1:
+            masks["ray_obstacle"] = view["bTah_hs"][..., 1] >= 0.0
+
+        pillar_mask = self._pillar_collision_mask_from_positions(pos)
+        if pillar_mask is not None:
+            masks["pillar_collision"] = pillar_mask
+        return masks
+
+    def _pillar_collision_mask_from_positions(self, pos: torch.Tensor) -> torch.Tensor | None:
+        """Approximate env pillar collision from rollout positions in ``[B, T, A, 3]`` layout."""
+        base_env = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
+        pillar_xy = getattr(base_env, "_pillar_positions_xy", None)
+        if pillar_xy is None:
+            return None
+        pillar_xy = torch.as_tensor(pillar_xy, device=pos.device, dtype=pos.dtype)
+        if pillar_xy.numel() == 0:
+            return torch.zeros(pos.shape[:-1], dtype=torch.bool, device=pos.device)
+
+        radius = float(getattr(base_env, "_pillar_collision_radius", 0.0))
+        top_z = float(getattr(base_env, "_pillar_top_z", float("inf")))
+        cfg = getattr(base_env, "cfg", None)
+        arena_min = getattr(cfg, "arena_min", (-float("inf"), -float("inf"), -float("inf")))
+        min_z = float(arena_min[2])
+
+        dxy = torch.linalg.vector_norm(pos[..., None, :2] - pillar_xy.view(1, 1, 1, -1, 2), dim=-1)
+        inside_radius = torch.any(dxy <= radius, dim=-1)
+        inside_height = (pos[..., 2] >= min_z) & (pos[..., 2] <= top_z)
+        return inside_radius & inside_height
+
+    @staticmethod
+    def _combine_safety_masks(masks: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        combined: torch.Tensor | None = None
+        for mask in masks.values():
+            combined = mask if combined is None else (combined | mask)
+        if combined is None:
+            raise ValueError("Cannot combine an empty safety mask mapping")
+        return combined
+
+    @staticmethod
+    def _rollout_violation_pct(mask: torch.Tensor) -> torch.Tensor:
+        return 100.0 * mask.any(dim=tuple(range(1, mask.ndim))).float().mean()
+
+    @staticmethod
+    def _step_violation_pct(mask: torch.Tensor) -> torch.Tensor:
+        return 100.0 * mask.float().mean()
+
+    def _track_rnn_metrics(self, *, view: dict[str, torch.Tensor]) -> None:
+        """Track compact RNN health metrics for recurrent DG-PPO runs."""
+        metrics: dict[str, torch.Tensor] = {
+            "DGPPO/rnn/done_reset_steps_pct": 100.0 * view["bT_done"].float().mean(),
+        }
+        policy_states = view.get("bTa_rnn_states")
+        if policy_states is not None:
+            metrics.update(self._rnn_state_metrics("policy_state", policy_states))
+        if self._vl_rnn_state is not None:
+            metrics.update(self._rnn_state_metrics("vl_state", self._vl_rnn_state))
+        self._track_scalars(metrics)
+
+    @staticmethod
+    def _rnn_state_metrics(prefix: str, states: torch.Tensor) -> dict[str, torch.Tensor]:
+        finite = torch.isfinite(states)
+        safe_states = torch.where(finite, states, torch.zeros_like(states))
+        norms = torch.linalg.vector_norm(safe_states.reshape(-1, safe_states.shape[-1]), dim=-1)
+        return {
+            f"DGPPO/rnn/{prefix}_norm_mean": norms.mean(),
+            f"DGPPO/rnn/{prefix}_norm_max": norms.max(),
+            f"DGPPO/rnn/{prefix}_nonfinite_pct": 100.0 * (~finite).float().mean(),
+        }
+
+    def _maybe_log_debug_rollout(self, *, view: dict[str, torch.Tensor], timestep: int) -> None:
+        """Save a compact visual summary of one stochastic rollout."""
+        interval = int(getattr(self, "debug_rollout_plot_interval", 0))
+        if interval <= 0:
+            return
+        step = int(timestep) + 1
+        bucket = step // interval
+        if self._debug_rollout_plot_count > 0 and bucket <= self._debug_rollout_plot_bucket:
+            return
+        try:
+            path = self._save_rollout_summary_plot(view=view, step=step)
+            self._debug_rollout_plot_bucket = bucket
+            self._debug_rollout_plot_count += 1
+            self._log_wandb_image("DGPPO/debug/rollout_summary", path=path, step=step)
+        except Exception as exc:
+            self._warn_debug_once("rollout_plot", f"Failed to save DG-PPO rollout plot: {exc}")
+
+    def _save_rollout_summary_plot(self, *, view: dict[str, torch.Tensor], step: int) -> Path:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        pos = view["bTa_agent_state"][0, :, 0, :3].detach().to("cpu")
+        goal = view["bTa_goal_state"][0, :, 0, :3].detach().to("cpu")
+        safety_masks = self._rollout_safety_masks({key: value[:1] for key, value in view.items()})
+        masks = {name: mask[0, :, 0].detach().to("cpu").bool() for name, mask in safety_masks.items()}
+        unsafe = torch.stack(tuple(masks.values()), dim=0).any(dim=0) if masks else None
+        t = torch.arange(pos.shape[0])
+        goal_distance = torch.linalg.vector_norm(goal[:, :3] - pos[:, :3], dim=-1)
+
+        fig, axes = plt.subplots(
+            2,
+            2,
+            figsize=(12, 8),
+            dpi=140,
+            gridspec_kw={"height_ratios": [1.35, 1.0]},
+        )
+        ax_xy, ax_z, ax_dist, ax_safety = axes.flatten()
+        fig.suptitle(f"DG-PPO stochastic rollout summary at step {step}", fontsize=13)
+
+        self._draw_debug_xy_context(ax_xy)
+        ax_xy.plot(pos[:, 0], pos[:, 1], color="black", linewidth=1.8, label="trajectory")
+        ax_xy.scatter(pos[:1, 0], pos[:1, 1], marker="o", facecolor="white", edgecolor="black", s=55, label="start")
+        ax_xy.scatter(pos[-1:, 0], pos[-1:, 1], marker="s", color="black", s=42, label="last")
+        ax_xy.scatter(goal[-1:, 0], goal[-1:, 1], marker="*", color="#cc7a00", s=115, label="goal")
+        if unsafe is not None and bool(unsafe.any().item()):
+            bad = pos[unsafe]
+            ax_xy.scatter(bad[:, 0], bad[:, 1], marker="x", color="black", s=42, linewidths=1.3, label="violation")
+        self._set_debug_xy_limits(ax_xy, pos=pos, goal=goal)
+        ax_xy.set_title("XY top-down")
+        ax_xy.set_xlabel("x")
+        ax_xy.set_ylabel("y")
+        ax_xy.set_aspect("equal", adjustable="box")
+        ax_xy.grid(True, linewidth=0.4, alpha=0.35)
+        ax_xy.legend(loc="best", fontsize=8)
+
+        ax_z.plot(t, pos[:, 2], color="black", linewidth=1.8, label="z trajectory")
+        bounds = self._debug_arena_bounds()
+        if bounds is not None:
+            mn, mx = bounds
+            ax_z.axhspan(mn[2], mx[2], color="0.90", alpha=0.6, label="safe altitude band")
+            ax_z.axhline(mn[2], color="black", linestyle="--", linewidth=1.0, label="min safe z")
+            ax_z.axhline(mx[2], color="black", linestyle=":", linewidth=1.4, label="max safe z")
+        vertical = masks.get("vertical_bounds")
+        if vertical is not None and bool(vertical.any().item()):
+            ax_z.scatter(t[vertical], pos[vertical, 2], marker="x", color="black", s=35, label="vertical violation")
+        ax_z.set_title("Altitude over rollout")
+        ax_z.set_xlabel("rollout step")
+        ax_z.set_ylabel("z")
+        ax_z.grid(True, linewidth=0.4, alpha=0.35)
+        ax_z.legend(loc="best", fontsize=8)
+
+        ax_dist.plot(t, goal_distance, color="black", linewidth=1.8)
+        ax_dist.axhline(0.0, color="black", linestyle=":", linewidth=1.0)
+        ax_dist.set_title("Distance to goal")
+        ax_dist.set_xlabel("rollout step")
+        ax_dist.set_ylabel("meters")
+        ax_dist.grid(True, linewidth=0.4, alpha=0.35)
+
+        names = list(masks)
+        marker_cycle = ["x", "o", "s", "^"]
+        for row, name in enumerate(names):
+            mask = masks[name]
+            ax_safety.hlines(row, 0, max(int(t[-1].item()), 1), color="0.82", linewidth=1.0)
+            if bool(mask.any().item()):
+                ax_safety.scatter(
+                    t[mask],
+                    torch.full_like(t[mask], row),
+                    marker=marker_cycle[row % len(marker_cycle)],
+                    color="black",
+                    s=30,
+                    linewidths=1.0,
+                )
+        ax_safety.set_title("Safety violations by constraint")
+        ax_safety.set_xlabel("rollout step")
+        ax_safety.set_yticks(range(len(names)))
+        ax_safety.set_yticklabels(names)
+        ax_safety.set_ylim(-0.6, max(len(names) - 0.4, 0.6))
+        ax_safety.grid(True, axis="x", linewidth=0.4, alpha=0.35)
+
+        fig.tight_layout()
+
+        out_dir = Path(self.experiment_dir) / "debug" / "rollouts"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"rollout_summary_step_{step}.png"
+        fig.savefig(path)
+        plt.close(fig)
+        return path
+
+    def _draw_debug_xy_context(self, ax: Any) -> None:
+        from matplotlib.patches import Circle, Rectangle
+
+        bounds = self._debug_arena_bounds()
+        if bounds is not None:
+            mn, mx = bounds
+            ax.add_patch(
+                Rectangle(
+                    (mn[0], mn[1]),
+                    mx[0] - mn[0],
+                    mx[1] - mn[1],
+                    fill=False,
+                    edgecolor="black",
+                    linewidth=1.2,
+                    linestyle="--",
+                    label="safe XY bounds",
+                )
+            )
+        pillars = self._debug_pillars_cpu()
+        if pillars is None:
+            return
+        pillar_xy, radius = pillars
+        for center in pillar_xy:
+            ax.add_patch(
+                Circle(
+                    (float(center[0]), float(center[1])),
+                    radius,
+                    facecolor="0.70",
+                    edgecolor="black",
+                    alpha=0.45,
+                    linewidth=0.8,
+                )
+            )
+
+    def _set_debug_xy_limits(self, ax: Any, *, pos: torch.Tensor, goal: torch.Tensor) -> None:
+        bounds = self._debug_arena_bounds()
+        if bounds is not None:
+            mn, mx = bounds
+            ax.set_xlim(mn[0], mx[0])
+            ax.set_ylim(mn[1], mx[1])
+            return
+        xy = torch.cat([pos[:, :2], goal[:, :2]], dim=0)
+        lo = xy.min(dim=0).values - 0.5
+        hi = xy.max(dim=0).values + 0.5
+        ax.set_xlim(float(lo[0]), float(hi[0]))
+        ax.set_ylim(float(lo[1]), float(hi[1]))
+
+    def _debug_pillars_cpu(self) -> tuple[torch.Tensor, float] | None:
+        base_env = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
+        pillar_xy = getattr(base_env, "_pillar_positions_xy", None)
+        if pillar_xy is None:
+            return None
+        if isinstance(pillar_xy, torch.Tensor):
+            pillar_xy = pillar_xy.detach().to(device="cpu", dtype=torch.float32)
+        else:
+            pillar_xy = torch.as_tensor(pillar_xy, device="cpu", dtype=torch.float32)
+        if pillar_xy.numel() == 0:
+            return None
+        radius = float(getattr(base_env, "_pillar_collision_radius", 0.0))
+        return pillar_xy, radius
+
+    def _debug_arena_bounds(self) -> tuple[list[float], list[float]] | None:
+        base_env = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
+        safe_min = getattr(base_env, "_arena_min_safe", None)
+        safe_max = getattr(base_env, "_arena_max_safe", None)
+        if safe_min is None or safe_max is None:
+            return None
+        mn = self._tensor_to_cpu_float(safe_min).tolist()
+        mx = self._tensor_to_cpu_float(safe_max).tolist()
+        return mn, mx
+
+    def _maybe_save_critic_debug_snapshot(self, *, timestep: int) -> None:
+        try:
+            out_dir = Path(self.experiment_dir) / "debug" / "critics"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            path = out_dir / f"critics_step_{timestep}.pt"
+            torch.save(self._critic_debug_payload(timestep=timestep), path)
+            self._log_wandb_artifact(path=path, name="dgppo-critic-debug-snapshots", kind="critic_snapshot")
+        except Exception as exc:
+            self._warn_debug_once("critic_snapshot", f"Failed to save DG-PPO critic debug snapshot: {exc}")
+
+    def _critic_debug_payload(self, *, timestep: int) -> dict[str, Any]:
+        base_env = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
+        return {
+            "timestep": int(timestep),
+            "Vl": self._state_dict_to_cpu(self.Vl.state_dict()),
+            "Vh": self._state_dict_to_cpu(self.Vh.state_dict()),
+            "metadata": {
+                "obs_radius": float(self.obs_radius),
+                "num_agents": int(self.env.num_agents),
+                "n_constraints": int(getattr(base_env, "n_constraints", 1)),
+                "graph_obs_layout": dict(getattr(base_env, "graph_obs_layout", {})),
+                "arena_min_safe": self._tensor_to_list(getattr(base_env, "_arena_min_safe", None)),
+                "arena_max_safe": self._tensor_to_list(getattr(base_env, "_arena_max_safe", None)),
+                "pillar_positions_xy": self._tensor_to_list(getattr(base_env, "_pillar_positions_xy", None)),
+                "pillar_collision_radius": float(getattr(base_env, "_pillar_collision_radius", 0.0)),
+                "pillar_top_z": float(getattr(base_env, "_pillar_top_z", 0.0)),
+                "rnn": dict(self.cfg.rnn),
+                "gnn": dict(self.cfg.gnn),
+                "model": dict(self.cfg.model),
+            },
+        }
+
+    @staticmethod
+    def _state_dict_to_cpu(state_dict: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return {key: value.detach().to("cpu") for key, value in state_dict.items()}
+
+    @staticmethod
+    def _tensor_to_list(value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return value.detach().to("cpu").tolist()
+        return value
+
+    @staticmethod
+    def _tensor_to_cpu_float(value: Any) -> torch.Tensor:
+        if isinstance(value, torch.Tensor):
+            return value.detach().to(device="cpu", dtype=torch.float32)
+        return torch.as_tensor(value, device="cpu", dtype=torch.float32)
+
+    def _log_wandb_image(self, key: str, *, path: Path, step: int) -> None:
+        try:
+            import wandb
+
+            if wandb.run is not None:
+                wandb.log({key: wandb.Image(str(path), caption=path.stem)}, step=step)
+        except Exception:
+            pass
+
+    def _log_wandb_artifact(self, *, path: Path, name: str, kind: str) -> None:
+        try:
+            import wandb
+
+            if wandb.run is not None:
+                artifact = wandb.Artifact(name=name, type=kind)
+                artifact.add_file(str(path))
+                wandb.log_artifact(artifact)
+        except Exception:
+            pass
+
+    def _warn_debug_once(self, key: str, message: str) -> None:
+        if key in self._debug_warnings:
+            return
+        self._debug_warnings.add(key)
+        print(f"[WARN] {message}")
 
     def _extract_graph_states(self, observations: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Decode flat policy observations into graph node state tensors."""
