@@ -74,12 +74,12 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     altitude_outer_margin: float = 0.2  # add margin to altitudes
 
     enable_walls: bool = True
-    wall_thickness: float = 0.05
+    wall_thickness: float = 0.2
     wall_extra_margin: float = 0.0
 
     enable_pillars: bool = True
     pillar_positions_xy: tuple[tuple[float, float], ...] = ((-0.7, 0.0), (0.7, 0.0))
-    pillar_radius: float = 0.18
+    pillar_radius: float = 0.2
     pillar_height: float = 1.8
     drone_collision_radius: float = 0.09
 
@@ -140,7 +140,7 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     ref_pos_max = (1.5, 1.0, 1.5)
     ref_yaw_range = (-math.pi, math.pi)
     ref_update_interval_s: float = 0.0  # 0 means static target per episode
-    reference_obstacle_clearance: float = 0.2
+    reference_obstacle_clearance: float = 0.2  # so target is not at the boundary with obstacle
 
     # Reward and penalty weights (signs applied in env)
     reward_pos: float = 1.0

@@ -572,7 +572,7 @@ class PosTrackingEnv(DirectRLEnv):
         if cfg.obstacle_observation_mode == "ray_caster":
             if cfg.ray_caster_observation_mode == "ray_ordered_hits":
                 return max(1, int(cfg.ray_caster_num_rays))
-            return max(0, int(cfg.ray_caster_top_k_hits))
+            return max(1, int(cfg.ray_caster_top_k_hits))
         if cfg.obstacle_observation_mode == "pillars" and cfg.enable_pillars:
             return len(cfg.pillar_positions_xy)
         return 0

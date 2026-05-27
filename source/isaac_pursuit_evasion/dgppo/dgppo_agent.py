@@ -361,6 +361,7 @@ class DGPPOAgent(Agent):
             self._store_final_rollout_state_if_full(next_observations=next_observations)
 
         # To handle skrl bookkeeping after DG-PPO has selected its aligned reward signal.
+        record_rewards = torch.as_tensor(record_rewards, device=self.device, dtype=torch.float32).reshape_as(rewards)
         super().record_transition(
             observations=observations,
             states=states,
@@ -526,21 +527,9 @@ class DGPPOAgent(Agent):
         final_graph = self._build_final_rollout_graph(view)
         det_final_graph = self._build_final_rollout_graph(det_view)
         chunk_ids = self._rnn_chunk_ids(T=view["bTa_actions"].shape[1], device=torch.device("cpu"))
-        targets = self._compute_update_targets(
-            view=view,
-            det_view=det_view,
-            graph=graph,
-            det_graph=det_graph,
-            final_graph=final_graph,
-            det_final_graph=det_final_graph,
-            timestep=timestep,
-            timesteps=timesteps,
-        )
-        self._track_update_targets(view=view, det_view=det_view, targets=targets)
 
         stats = self._run_update_epochs(
             memory=memory,
-            initial_targets=targets,
             view=view,
             det_view=det_view,
             graph=graph,
@@ -734,7 +723,6 @@ class DGPPOAgent(Agent):
         self,
         *,
         memory: DGPPORolloutMemory,
-        initial_targets: UpdateTargets,
         view: dict[str, torch.Tensor],
         det_view: dict[str, torch.Tensor],
         graph: GraphData,
@@ -746,29 +734,29 @@ class DGPPOAgent(Agent):
         timesteps: int,
     ) -> UpdateStats:
         """Run all PPO epochs and accumulate minibatch summaries."""
-        loss_policy = initial_targets.advantages.new_zeros(())
-        loss_policy_total = initial_targets.advantages.new_zeros(())
-        loss_value_l = initial_targets.advantages.new_zeros(())
-        loss_value_h = initial_targets.advantages.new_zeros(())
-        clip_frac = initial_targets.advantages.new_zeros(())
-        entropy_mean = initial_targets.advantages.new_zeros(())
-        entropy_bonus = initial_targets.advantages.new_zeros(())
-        approx_kl = initial_targets.advantages.new_zeros(())
+        loss_policy = view["bT_l"].new_zeros(())
+        loss_policy_total = view["bT_l"].new_zeros(())
+        loss_value_l = view["bT_l"].new_zeros(())
+        loss_value_h = view["bT_l"].new_zeros(())
+        clip_frac = view["bT_l"].new_zeros(())
+        entropy_mean = view["bT_l"].new_zeros(())
+        entropy_bonus = view["bT_l"].new_zeros(())
+        approx_kl = view["bT_l"].new_zeros(())
         n_minibatches = 0
 
         for epoch in range(self.learning_epochs):
-            targets = initial_targets
-            if epoch > 0:
-                targets = self._compute_update_targets(
-                    view=view,
-                    det_view=det_view,
-                    graph=graph,
-                    det_graph=det_graph,
-                    final_graph=final_graph,
-                    det_final_graph=det_final_graph,
-                    timestep=timestep,
-                    timesteps=timesteps,
-                )
+            targets = self._compute_update_targets(
+                view=view,
+                det_view=det_view,
+                graph=graph,
+                det_graph=det_graph,
+                final_graph=final_graph,
+                det_final_graph=det_final_graph,
+                timestep=timestep,
+                timesteps=timesteps,
+            )
+            if epoch == 0:
+                self._track_update_targets(view=view, det_view=det_view, targets=targets)
             sampled_batches = memory.sample_minibatches(self.mini_batches)
             for idx in sampled_batches:
                 info = self._update_minibatch(

@@ -9,7 +9,7 @@ env:
   include_yaw_with_ray_caster: true
   terminate_on_safety_violation: false
   enable_clip_states: true
-  terminate_on_out_of_boundaries: false
+  terminate_on_out_of_boundaries: true
 
 # - DG-PPO hyper-parameters, consumed by DGPPOAgentCfg / DGPPOAgent / DGPPORunner
 agent:
@@ -30,7 +30,7 @@ agent:
 
   discount_factor:  0.995
   gae_lambda:           0.95
-  bootstrap_on_truncated: true
+  bootstrap_on_truncated: false
 
   # Learning rates
   lr_policy: 2.0e-4
@@ -45,13 +45,13 @@ agent:
   grad_norm_clip:   0.5
   # TODO: add value_clip
 
-  entropy_loss_scale: 0.01
+  entropy_loss_scale: 0.001
   vl_loss_scale:    1.0
   vh_loss_scale:    1.0
   
 
   # RNN
-  use_rnn: true
+  use_rnn: false
   rnn_step: 16
   rnn:
     cell:   gru
@@ -74,7 +74,7 @@ agent:
     critic_mlp_hid: [64, 64]
     scale_hid: 64
     scale_final: 0.01
-    std_dev_init: 0.5
+    std_dev_init: 0.15
     std_dev_min: 1.0e-5
 
   # TODO: add activations selection to the relevant models (ex. elu,relu, etc.)
