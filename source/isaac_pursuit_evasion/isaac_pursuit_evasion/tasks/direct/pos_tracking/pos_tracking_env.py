@@ -344,8 +344,8 @@ class PosTrackingEnv(DirectRLEnv):
         body_roll_pitch_penalty = -self.cfg.reward_body_rates_roll_pitch * roll_pitch
         body_yaw_penalty = -self.cfg.reward_body_rates_yaw * yaw
 
-        rewards -= body_roll_pitch_penalty + body_yaw_penalty
-        components["body_rates"] = -body_roll_pitch_penalty -body_yaw_penalty
+        rewards += body_roll_pitch_penalty + body_yaw_penalty
+        components["body_rates"] = body_roll_pitch_penalty -body_yaw_penalty
 
         # SIMPLER VERSION:
         # body_rates = self._robot.data.root_ang_vel_b
