@@ -334,7 +334,7 @@ class PosTrackingEnv(DirectRLEnv):
         }
 
         # Body rates penalties
-        if self.cfg.agent_action_mode == "body_rates":
+        if self.cfg.control_mode == "RL_rates":
             raise RuntimeError( "Body rates rewards has to be implemented." )
         else:
             ang_vel_b = self._robot.data.root_ang_vel_b
