@@ -26,7 +26,6 @@ recomputed with current network parameters.
 
 from __future__ import annotations
 
-from typing import Optional
 from skrl.memories.torch import RandomMemory
 
 import torch
@@ -53,7 +52,6 @@ class DGPPORolloutMemory(RandomMemory):
     ):
         super().__init__(memory_size=rollout_length, num_envs=1, device=device)
 
-        S, A, O, NH, Da = state_dim, n_agents, n_obs, n_constraints, action_dim
         self.n_det_envs = int(num_det_envs)
         self.n_stc_envs = int(num_stc_envs)
         self.rollout_length = int(rollout_length)
@@ -70,21 +68,57 @@ class DGPPORolloutMemory(RandomMemory):
         self.rnn_hidden = rnn_hidden
         self.rnn_carries = 1 if rnn_cell == "gru" else 2
 
-        for prefix, B in (("stc", self.n_stc_envs), ("det", self.n_det_envs)):
-            self.create_tensor(f"{prefix}_agent_state", size=B * A * S, dtype=torch.float32, keep_dimensions=False)
-            self.create_tensor(f"{prefix}_goal_state", size=B * A * S, dtype=torch.float32, keep_dimensions=False)
-            self.create_tensor(f"{prefix}_obs_state", size=B * O * S, dtype=torch.float32, keep_dimensions=False)
-            self.create_tensor(f"{prefix}_actions", size=B * A * Da, dtype=torch.float32, keep_dimensions=False)
-            self.create_tensor(f"{prefix}_log_probs", size=B * A, dtype=torch.float32, keep_dimensions=False)
-            self.create_tensor(f"{prefix}_rewards", size=B, dtype=torch.float32, keep_dimensions=False)
-            self.create_tensor(f"{prefix}_costs", size=B * A * NH, dtype=torch.float32, keep_dimensions=False)
+        num_agents = self._n_agents
+        num_obs = self._n_obs
+        state_dim = self._state_dim
+        action_dim = self._action_dim
+        num_constraints = self._n_constraints
+
+        for split, num_envs in (("stc", self.n_stc_envs), ("det", self.n_det_envs)):
+            self.create_tensor(
+                f"{split}_agent_state",
+                size=num_envs * num_agents * state_dim,
+                dtype=torch.float32,
+                keep_dimensions=False,
+            )
+            self.create_tensor(
+                f"{split}_goal_state",
+                size=num_envs * num_agents * state_dim,
+                dtype=torch.float32,
+                keep_dimensions=False,
+            )
+            self.create_tensor(
+                f"{split}_obs_state",
+                size=num_envs * num_obs * state_dim,
+                dtype=torch.float32,
+                keep_dimensions=False,
+            )
+            self.create_tensor(
+                f"{split}_actions",
+                size=num_envs * num_agents * action_dim,
+                dtype=torch.float32,
+                keep_dimensions=False,
+            )
+            self.create_tensor(
+                f"{split}_log_probs",
+                size=num_envs * num_agents,
+                dtype=torch.float32,
+                keep_dimensions=False,
+            )
+            self.create_tensor(f"{split}_rewards", size=num_envs, dtype=torch.float32, keep_dimensions=False)
+            self.create_tensor(
+                f"{split}_costs",
+                size=num_envs * num_agents * num_constraints,
+                dtype=torch.float32,
+                keep_dimensions=False,
+            )
             # Keep termination and truncation separate for target bootstrap semantics.
-            self.create_tensor(f"{prefix}_terminated", size=B, dtype=torch.bool, keep_dimensions=False)
-            self.create_tensor(f"{prefix}_truncated", size=B, dtype=torch.bool, keep_dimensions=False)
+            self.create_tensor(f"{split}_terminated", size=num_envs, dtype=torch.bool, keep_dimensions=False)
+            self.create_tensor(f"{split}_truncated", size=num_envs, dtype=torch.bool, keep_dimensions=False)
 
             if self.use_rnn:
-                rnn_size = B * A * self.rnn_layers * self.rnn_carries * self.rnn_hidden
-                self.create_tensor(f"{prefix}_rnn_states", size=rnn_size, dtype=torch.float32, keep_dimensions=False)
+                rnn_size = num_envs * num_agents * self.rnn_layers * self.rnn_carries * self.rnn_hidden
+                self.create_tensor(f"{split}_rnn_states", size=rnn_size, dtype=torch.float32, keep_dimensions=False)
         self._initial_vl_rnn_states = None
         if self.use_vl_rnn:
             self._initial_vl_rnn_states = {
@@ -106,16 +140,16 @@ class DGPPORolloutMemory(RandomMemory):
                 ),
             }
         self._final_agent_state = {
-            "stc": torch.zeros(self.n_stc_envs, A, S, dtype=torch.float32, device=device),
-            "det": torch.zeros(self.n_det_envs, A, S, dtype=torch.float32, device=device),
+            "stc": torch.zeros(self.n_stc_envs, num_agents, state_dim, dtype=torch.float32, device=device),
+            "det": torch.zeros(self.n_det_envs, num_agents, state_dim, dtype=torch.float32, device=device),
         }
         self._final_goal_state = {
-            "stc": torch.zeros(self.n_stc_envs, A, S, dtype=torch.float32, device=device),
-            "det": torch.zeros(self.n_det_envs, A, S, dtype=torch.float32, device=device),
+            "stc": torch.zeros(self.n_stc_envs, num_agents, state_dim, dtype=torch.float32, device=device),
+            "det": torch.zeros(self.n_det_envs, num_agents, state_dim, dtype=torch.float32, device=device),
         }
         self._final_obs_state = {
-            "stc": torch.zeros(self.n_stc_envs, O, S, dtype=torch.float32, device=device),
-            "det": torch.zeros(self.n_det_envs, O, S, dtype=torch.float32, device=device),
+            "stc": torch.zeros(self.n_stc_envs, num_obs, state_dim, dtype=torch.float32, device=device),
+            "det": torch.zeros(self.n_det_envs, num_obs, state_dim, dtype=torch.float32, device=device),
         }
         self._cursor = 0
 
@@ -151,12 +185,12 @@ class DGPPORolloutMemory(RandomMemory):
         det_log_prob: torch.Tensor,
         det_reward: torch.Tensor,
         det_cost: torch.Tensor,
-        stc_terminated: Optional[torch.Tensor] = None,
-        stc_truncated: Optional[torch.Tensor] = None,
-        det_terminated: Optional[torch.Tensor] = None,
-        det_truncated: Optional[torch.Tensor] = None,
-        stc_rnn_state: Optional[torch.Tensor] = None,
-        det_rnn_state: Optional[torch.Tensor] = None,
+        stc_terminated: torch.Tensor | None = None,
+        stc_truncated: torch.Tensor | None = None,
+        det_terminated: torch.Tensor | None = None,
+        det_truncated: torch.Tensor | None = None,
+        stc_rnn_state: torch.Tensor | None = None,
+        det_rnn_state: torch.Tensor | None = None,
     ) -> None:
         """Append one rollout step for both stochastic and deterministic splits."""
         t = self._cursor
@@ -194,16 +228,16 @@ class DGPPORolloutMemory(RandomMemory):
                 ).reshape(-1)
         self._cursor += 1
 
-    def _canonical_rnn_state(self, rnn_state: torch.Tensor, n_envs: int) -> torch.Tensor:
+    def _canonical_rnn_state(self, rnn_state: torch.Tensor, num_envs: int) -> torch.Tensor:
         """Return policy carry with env and agent as the first two dimensions."""
-        A = self._n_agents
-        flat_shape = (self.rnn_layers, n_envs * A, self.rnn_carries, self.rnn_hidden)
-        stored_shape = (n_envs, A, self.rnn_layers, self.rnn_carries, self.rnn_hidden)
+        num_agents = self._n_agents
+        flat_shape = (self.rnn_layers, num_envs * num_agents, self.rnn_carries, self.rnn_hidden)
+        stored_shape = (num_envs, num_agents, self.rnn_layers, self.rnn_carries, self.rnn_hidden)
         if rnn_state.shape == flat_shape:
             return rnn_state.reshape(
                 self.rnn_layers,
-                n_envs,
-                A,
+                num_envs,
+                num_agents,
                 self.rnn_carries,
                 self.rnn_hidden,
             ).permute(1, 2, 0, 3, 4)
@@ -215,10 +249,10 @@ class DGPPORolloutMemory(RandomMemory):
             f"{flat_shape} or {stored_shape}"
         )
 
-    def _canonical_vl_rnn_state(self, rnn_state: torch.Tensor, n_envs: int) -> torch.Tensor:
+    def _canonical_vl_rnn_state(self, rnn_state: torch.Tensor, num_envs: int) -> torch.Tensor:
         """Return centralized Vl carry with env as the first dimension."""
-        expected_flat = (self.rnn_layers, n_envs, self.rnn_carries, self.rnn_hidden)
-        expected_stored = (n_envs, self.rnn_layers, self.rnn_carries, self.rnn_hidden)
+        expected_flat = (self.rnn_layers, num_envs, self.rnn_carries, self.rnn_hidden)
+        expected_stored = (num_envs, self.rnn_layers, self.rnn_carries, self.rnn_hidden)
         if rnn_state.shape == expected_flat:
             return rnn_state.permute(1, 0, 2, 3)
         if rnn_state.shape == expected_stored:
@@ -228,11 +262,18 @@ class DGPPORolloutMemory(RandomMemory):
             f"{tuple(rnn_state.shape)}; expected {expected_flat} or {expected_stored}"
         )
 
-    def _canonical_done_mask(self, mask: Optional[torch.Tensor], B: int) -> torch.Tensor:
-        """Return a flat boolean mask of length ``B`` for one rollout split."""
+    def _canonical_done_mask(self, mask: torch.Tensor | None, num_envs: int) -> torch.Tensor:
+        """Return a flat boolean mask of length ``num_envs`` for one rollout split."""
         if mask is None:
-            return torch.zeros(B, dtype=torch.bool, device=self.device)
-        return torch.as_tensor(mask, device=self.device, dtype=torch.bool).reshape(B)
+            return torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        return torch.as_tensor(mask, device=self.device, dtype=torch.bool).reshape(num_envs)
+
+    def _num_envs_for_split(self, split: str) -> int:
+        if split == "stc":
+            return self.n_stc_envs
+        if split == "det":
+            return self.n_det_envs
+        raise ValueError(f"Unknown split '{split}'")
 
     def set_final_state(
         self,
@@ -243,47 +284,48 @@ class DGPPORolloutMemory(RandomMemory):
         obs_state: torch.Tensor,
     ) -> None:
         """Store the final next-observation graph."""
-        if split not in ("stc", "det"):
-            raise ValueError(f"Unknown split '{split}'")
-        B = self.n_stc_envs if split == "stc" else self.n_det_envs
-        self._final_agent_state[split] = agent_state.reshape(B, self._n_agents, self._state_dim).to(self.device)
-        self._final_goal_state[split] = goal_state.reshape(B, self._n_agents, self._state_dim).to(self.device)
-        self._final_obs_state[split] = obs_state.reshape(B, self._n_obs, self._state_dim).to(self.device)
+        num_envs = self._num_envs_for_split(split)
+        self._final_agent_state[split] = agent_state.reshape(
+            num_envs, self._n_agents, self._state_dim
+        ).to(self.device)
+        self._final_goal_state[split] = goal_state.reshape(
+            num_envs, self._n_agents, self._state_dim
+        ).to(self.device)
+        self._final_obs_state[split] = obs_state.reshape(num_envs, self._n_obs, self._state_dim).to(self.device)
 
-    def set_initial_vl_state(self, split: str, rnn_state: Optional[torch.Tensor]) -> None:
+    def set_initial_vl_state(self, split: str, rnn_state: torch.Tensor | None) -> None:
         """Store the centralized critic carry at the first rollout step."""
         if rnn_state is None or not self.use_vl_rnn:
             return
-        if split not in ("stc", "det"):
-            raise ValueError(f"Unknown split '{split}'")
-        B = self.n_stc_envs if split == "stc" else self.n_det_envs
+        num_envs = self._num_envs_for_split(split)
         assert self._initial_vl_rnn_states is not None
-        self._initial_vl_rnn_states[split] = self._canonical_vl_rnn_state(rnn_state, B).to(self.device)
+        self._initial_vl_rnn_states[split] = self._canonical_vl_rnn_state(rnn_state, num_envs).to(self.device)
 
     # Read-side helpers used by the update
     # ------------------------------------------------------------------
 
-    def as_bTah_view(self, split: str) -> dict[str, torch.Tensor]:
-        """Return tensors transposed to the ``(B, T, ...)`` layout expected
-        by :func:`train_dgppo.compute_dec_ocp_gae` /
-        :func:`compute_cbf_advantages`.
-        """
-        if split not in ("stc", "det"):
-            raise ValueError(f"Unknown split '{split}'")
-        B = self.n_stc_envs if split == "stc" else self.n_det_envs
-        A = self._n_agents
-        O = self._n_obs
-        T = self.rollout_length
+    def as_update_view(self, split: str) -> dict[str, torch.Tensor]:
+        """Return a rollout split in the ``[B, T, ...]`` layout used by the update."""
+        num_envs = self._num_envs_for_split(split)
+        num_agents = self._n_agents
+        num_obs = self._n_obs
+        rollout_length = self.rollout_length
 
-        agent_state = self._tensor(f"{split}_agent_state").reshape(T, B, A, self._state_dim)
-        goal_state = self._tensor(f"{split}_goal_state").reshape(T, B, A, self._state_dim)
-        obs_state = self._tensor(f"{split}_obs_state").reshape(T, B, O, self._state_dim)
-        actions = self._tensor(f"{split}_actions").reshape(T, B, A, self._action_dim)
-        log_probs = self._tensor(f"{split}_log_probs").reshape(T, B, A)
-        rewards = self._tensor(f"{split}_rewards").reshape(T, B)
-        costs = self._tensor(f"{split}_costs").reshape(T, B, A, self._n_constraints)
-        terminated = self._tensor(f"{split}_terminated").reshape(T, B)
-        truncated = self._tensor(f"{split}_truncated").reshape(T, B)
+        agent_state = self._tensor(f"{split}_agent_state").reshape(
+            rollout_length, num_envs, num_agents, self._state_dim
+        )
+        goal_state = self._tensor(f"{split}_goal_state").reshape(
+            rollout_length, num_envs, num_agents, self._state_dim
+        )
+        obs_state = self._tensor(f"{split}_obs_state").reshape(rollout_length, num_envs, num_obs, self._state_dim)
+        actions = self._tensor(f"{split}_actions").reshape(rollout_length, num_envs, num_agents, self._action_dim)
+        log_probs = self._tensor(f"{split}_log_probs").reshape(rollout_length, num_envs, num_agents)
+        rewards = self._tensor(f"{split}_rewards").reshape(rollout_length, num_envs)
+        costs = self._tensor(f"{split}_costs").reshape(
+            rollout_length, num_envs, num_agents, self._n_constraints
+        )
+        terminated = self._tensor(f"{split}_terminated").reshape(rollout_length, num_envs)
+        truncated = self._tensor(f"{split}_truncated").reshape(rollout_length, num_envs)
 
         data = {
             "bT_l": -rewards.transpose(0, 1),
@@ -303,7 +345,12 @@ class DGPPORolloutMemory(RandomMemory):
 
         if self.use_rnn:
             rnn_states = self._tensor(f"{split}_rnn_states").reshape(
-                T, B, A, self.rnn_layers, self.rnn_carries, self.rnn_hidden
+                rollout_length,
+                num_envs,
+                num_agents,
+                self.rnn_layers,
+                self.rnn_carries,
+                self.rnn_hidden,
             )
             data["bTa_rnn_states"] = rnn_states.permute(1, 0, 3, 2, 4, 5)
         if self.use_vl_rnn:
@@ -312,17 +359,20 @@ class DGPPORolloutMemory(RandomMemory):
 
         return data
 
+    def as_bTah_view(self, split: str) -> dict[str, torch.Tensor]:
+        """Compatibility alias for older tests and scripts."""
+        return self.as_update_view(split)
+
     def sample_minibatches(self, num_mini_batches: int) -> list[torch.Tensor]:
-        """Return randomized chunks of env indices over the stochastic split.
-        """
+        """Return randomized chunks of env indices over the stochastic split."""
         if num_mini_batches <= 0:
             raise ValueError(f"num_mini_batches must be > 0, got {num_mini_batches}")
-        B = self.n_stc_envs
-        perm = torch.randperm(B, device=self.device)
+        num_envs = self.n_stc_envs
+        perm = torch.randperm(num_envs, device=self.device)
         chunks = torch.tensor_split(perm, num_mini_batches)
-        return [idx for idx in chunks if idx.numel() > 0]
+        return [env_ids for env_ids in chunks if env_ids.numel() > 0]
 
     def minibatch_iter(self, num_mini_batches: int):
         """Yield randomized chunks of env indices over the stochastic split."""
-        for idx in self.sample_minibatches(num_mini_batches):
-            yield idx
+        for env_ids in self.sample_minibatches(num_mini_batches):
+            yield env_ids

@@ -876,7 +876,6 @@ def _enforce_algorithm_env_contracts(env_cfg: Any, algorithm_name: str) -> None:
         return
 
     forced_values = {
-        "enable_obstacle_observations": True,
         "obstacle_observation_mode": "ray_caster",
         "enable_ray_caster": True,
     }

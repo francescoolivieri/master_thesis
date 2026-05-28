@@ -50,7 +50,7 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     """Configuration for the position tracking environment."""
 
     # Simulation settings
-    episode_length_s = 9.92
+    episode_length_s = 8.32
     sim_frequency = 500
     policy_rate_hz = 50
     pid_loop_rate_hz = 500
@@ -105,9 +105,6 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     flag_yaw_tracking: bool = False
     flag_penalize_linvel: bool = False
     flag_action_smoothness_penalty: bool = False
-    include_yaw_in_observations: bool = False
-    include_yaw_with_ray_caster: bool = True
-    enable_obstacle_observations: bool = True
     obstacle_observation_mode: Literal["pillars", "ray_caster", "none"] = "ray_caster"
 
     # Ray-caster / LiDAR observations. Set obstacle_observation_mode="ray_caster"
@@ -143,15 +140,22 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     reference_obstacle_clearance: float = 0.2  # so target is not at the boundary with obstacle
 
     # Reward and penalty weights (signs applied in env)
-    reward_pos: float = 1.0
-    reward_pos_scale: float = 1.5
+    reward_pos: float = 0.5
+    reward_pos_scale: float = 2.0
     reward_yaw: float = 0.3
-    reward_body_rates: float = 0.001
+    # reward_body_rates: float = 0.0015 , UNUSED -> basically sum of reward_body_rates_roll_pitch & yaw
+    reward_body_rates_roll_pitch: float = 0.01
+    reward_body_rates_yaw: float = 0.003
     reward_lin_vel: float = 0.02
-    reward_action_smoothness: float = 0.02
-    penalty_altitude_limit: float = 10.0
-    penalty_xy_boundary: float = 10.0
-    penalty_pillar_collision: float = 10.0
+    reward_action_smoothness: float = 0.01
+    # Optional split smoothness weights.
+    # If None, the corresponding weight falls back to reward_action_smoothness.
+    reward_action_smoothness_rpy: float = 0.01
+    reward_action_smoothness_thrust: float  = 0.1
+    
+    penalty_altitude_limit: float = 5.0
+    penalty_xy_boundary: float = 5.0
+    penalty_pillar_collision: float = 5.0
 
     # Success criteria
     pos_tolerance: float = 0.15

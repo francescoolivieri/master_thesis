@@ -71,7 +71,7 @@ def test_rollout_memory_layout_matches_jax_update_fixture(num_envs: int) -> None
             det_cost=costs[:, t],
         )
 
-    view = memory.as_bTah_view("stc")
+    view = memory.as_update_view("stc")
 
     assert_parity_close(view["bT_l"], -rewards, stage=f"num_envs={num_envs}/memory", tensor_name="bT_l")
     assert_parity_close(view["bTah_hs"], costs, stage=f"num_envs={num_envs}/memory", tensor_name="bTah_hs")
@@ -131,8 +131,8 @@ def test_rollout_memory_stores_split_done_masks() -> None:
             det_truncated=det_truncated[t],
         )
 
-    stc_view = memory.as_bTah_view("stc")
-    det_view = memory.as_bTah_view("det")
+    stc_view = memory.as_update_view("stc")
+    det_view = memory.as_update_view("det")
 
     assert torch.equal(stc_view["bT_terminated"], torch.stack(stc_terminated, dim=1))
     assert torch.equal(stc_view["bT_truncated"], torch.stack(stc_truncated, dim=1))
@@ -200,10 +200,43 @@ def test_rollout_memory_stores_policy_carries_and_initial_vl_carry() -> None:
             det_rnn_state=policy_state,
         )
 
-    view = memory.as_bTah_view("stc")
+    view = memory.as_update_view("stc")
     assert initial_vl_state is not None
     assert torch.equal(view["bTa_rnn_states"], torch.stack(stc_policy_states, dim=1))
     assert torch.equal(view["b_initial_vl_rnn_state"], initial_vl_state)
+
+
+def test_dgppo_reward_recompute_passes_reward_auxiliary_data() -> None:
+    importorskip("skrl.agents.torch")
+    from types import SimpleNamespace
+
+    from dgppo.dgppo_agent import DGPPOAgent
+
+    body_rates = torch.tensor([[3.0, 4.0, 0.0], [0.0, 0.0, 2.0]])
+
+    class BaseEnv:
+        def get_dgppo_reward_auxiliary_data(self) -> dict[str, torch.Tensor]:
+            return {"body_rates": body_rates}
+
+        def compute_dgppo_reward_from_observation_action(
+            self,
+            observations: torch.Tensor,
+            actions: torch.Tensor,
+            reward_aux: dict[str, torch.Tensor] | None = None,
+        ) -> torch.Tensor:
+            assert reward_aux is not None
+            return torch.linalg.vector_norm(reward_aux["body_rates"], dim=-1)
+
+    agent = SimpleNamespace(env=SimpleNamespace(unwrapped=BaseEnv()), device=torch.device("cpu"))
+    rewards = DGPPOAgent._rewards_from_observation_or_env(
+        agent,
+        observations=torch.zeros(2, 4),
+        actions=torch.zeros(2, 1),
+        rewards=torch.zeros(2),
+        n_envs=2,
+    )
+
+    assert torch.equal(rewards, torch.tensor([5.0, 2.0]))
 
 
 @pytest.mark.parametrize("num_envs", [2, 6])

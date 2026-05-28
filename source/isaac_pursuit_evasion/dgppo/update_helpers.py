@@ -29,13 +29,9 @@ class UpdateGraphBatch:
     qh_det_targets: torch.Tensor
     det_rnn_states: torch.Tensor | None
     done_mask: torch.Tensor | None
-    b: int
-    T: int
-    A: int
-
-    @property
-    def chunk_ids(self) -> torch.Tensor:
-        return torch.arange(self.T, device=self.actions.device).reshape(1, self.T)
+    batch_size: int
+    rollout_length: int
+    n_agents: int
 
 
 def build_update_graph_batch(
@@ -52,7 +48,7 @@ def build_update_graph_batch(
 ) -> UpdateGraphBatch:
     """Gather one env-minibatch and build/select stochastic/deterministic graphs."""
     actions = view["bTa_actions"][idx]
-    b, T, A, _ = actions.shape
+    batch_size, rollout_length, n_agents, _action_dim = actions.shape
 
     if graph is None:
         agent_s = view["bTa_agent_state"][idx]
@@ -67,7 +63,7 @@ def build_update_graph_batch(
             obs_radius=obs_radius,
         )
     else:
-        graph = select_rollout_envs(graph, idx=idx, T=T)
+        graph = select_rollout_envs(graph, idx=idx, T=rollout_length)
 
     if det_graph is None:
         det_agent_s = det_view["bTa_agent_state"][idx]
@@ -82,7 +78,7 @@ def build_update_graph_batch(
             obs_radius=obs_radius,
         )
     else:
-        det_graph = select_rollout_envs(det_graph, idx=idx, T=T)
+        det_graph = select_rollout_envs(det_graph, idx=idx, T=rollout_length)
 
     det_rnn_states = det_view.get("bTa_rnn_states")
     done_mask = view.get("bT_done")
@@ -97,9 +93,9 @@ def build_update_graph_batch(
         qh_det_targets=qh_det[idx],
         det_rnn_states=det_rnn_states[idx] if det_rnn_states is not None else None,
         done_mask=done_mask[idx] if done_mask is not None else None,
-        b=b,
-        T=T,
-        A=A,
+        batch_size=batch_size,
+        rollout_length=rollout_length,
+        n_agents=n_agents,
     )
 
 
@@ -108,12 +104,12 @@ def build_rollout_graph(*, view: dict[str, torch.Tensor], obs_radius: float) -> 
     agent_s = view["bTa_agent_state"]
     goal_s = view["bTa_goal_state"]
     obs_s = view["bTo_obs_state"]
-    B, T, A, _ = agent_s.shape
-    BT = B * T
+    batch_size, rollout_length, n_agents, _state_dim = agent_s.shape
+    flat_batch_size = batch_size * rollout_length
     return build_graph_data(
-        agent_state=agent_s.reshape(BT, A, -1),
-        goal_state=goal_s.reshape(BT, A, -1),
-        obs_state=obs_s.reshape(BT, obs_s.shape[2], obs_s.shape[3]),
+        agent_state=agent_s.reshape(flat_batch_size, n_agents, -1),
+        goal_state=goal_s.reshape(flat_batch_size, n_agents, -1),
+        obs_state=obs_s.reshape(flat_batch_size, obs_s.shape[2], obs_s.shape[3]),
         obs_radius=obs_radius,
     )
 
@@ -142,7 +138,7 @@ def compute_policy_loss(
         graph,
         action=actions.reshape(n_agents, -1),
         rnn_state=rnn_state,
-        compute_entropy=entropy_scale > 0,
+        compute_entropy=True,
     )
     log_prob = log_prob.reshape_as(old_logp)
     loss_info = compute_policy_loss_from_log_prob(
@@ -207,7 +203,7 @@ def compute_rollout_policy_loss(
     B, T, A, action_dim = actions.shape
     chunk_ids_index = _canonical_chunk_ids(chunk_ids, device=actions.device)
     C, R = chunk_ids_index.shape
-    compute_entropy = entropy_scale > 0
+    compute_entropy = True
 
     if chunk_graph is None:
         chunk_graph = rollout_graph_chunks(graph, chunk_ids=chunk_ids, T=T, B=B)
@@ -326,7 +322,7 @@ def compute_value_losses(
     det_graph: GraphData,
     ql_targets: torch.Tensor,
     qh_det_targets: torch.Tensor,
-    A: int,
+    n_agents: int,
     vl_loss_scale: float,
     vh_loss_scale: float,
     det_rnn_states: torch.Tensor | None = None,
@@ -336,17 +332,20 @@ def compute_value_losses(
     det_chunk_graph: GraphData | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute the real low-level and safety critic losses for one minibatch."""
-    b, T = ql_targets.shape
+    batch_size, rollout_length = ql_targets.shape
 
     if Vl.rnn is not None or Vh.rnn is not None:
         if chunk_ids is None:
-            chunk_ids = torch.arange(T, device=ql_targets.device).reshape(1, T)
+            chunk_ids = torch.arange(rollout_length, device=ql_targets.device).reshape(
+                1,
+                rollout_length,
+            )
         vl_info = compute_rollout_vl_loss(
             Vl=Vl,
             graph=graph,
             targets=ql_targets,
             chunk_ids=chunk_ids,
-            A=A,
+            A=n_agents,
             loss_scale=vl_loss_scale,
             done_mask=done_mask,
             chunk_graph=chunk_graph,
@@ -359,7 +358,7 @@ def compute_value_losses(
             rnn_states=det_rnn_states,
             targets=qh_det_targets,
             chunk_ids=chunk_ids,
-            A=A,
+            A=n_agents,
             loss_scale=vh_loss_scale,
             chunk_graph=det_chunk_graph,
         )
@@ -371,11 +370,11 @@ def compute_value_losses(
         }
 
     vl, _ = Vl(graph, None)
-    vl = vl.reshape(b, T)
+    vl = vl.reshape(batch_size, rollout_length)
     loss_vl = compute_value_l2_loss(vl, ql_targets, scale=vl_loss_scale)
 
     vh, _ = Vh(det_graph, None)
-    vh = vh.reshape(b, T, A, -1)
+    vh = vh.reshape(batch_size, rollout_length, n_agents, -1)
     loss_vh = compute_value_l2_loss(vh, qh_det_targets, scale=vh_loss_scale)
 
     return {

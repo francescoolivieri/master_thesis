@@ -3,10 +3,8 @@ seed: 42
 # Environment overrides consumed by scripts/skrl/train.py before gym.make(...).
 env:
   obstacle_observation_mode: ray_caster
-  enable_obstacle_observations: true
   enable_ray_caster: true
   ray_caster_observation_mode: top_k_hits
-  include_yaw_with_ray_caster: true
   terminate_on_safety_violation: false
   enable_clip_states: true
   terminate_on_out_of_boundaries: true
@@ -18,15 +16,15 @@ agent:
   alpha:        15    # CBF class-K multiplier
   cbf_eps:      0.01    # CBF slack (h >= -eps is "safe enough")
   cbf_weight:   1.0     # weight on the CBF penalty term
-  cbf_schedule: false   
+  cbf_schedule: true   
 
   # Graph / observation radius for graph builder
   obs_radius: 8.0
 
   # PPO / GAE
-  rollouts:         496       # steps collected per update (per env), 9.92s at 50 Hz
-  learning_epochs:  1
-  mini_batches:     12
+  rollouts:         416       # steps collected per update (per env), max 416 (episode 8.32 sec)
+  learning_epochs:  2
+  mini_batches:     4
 
   discount_factor:  0.995
   gae_lambda:           0.95
@@ -63,16 +61,16 @@ agent:
     policy_layers: 2
     vl_layers: 2
     vh_layers: 1
-    policy_out_dim: 64
-    critic_out_dim: 64
-    msg_dim:  32
+    policy_out_dim: 128
+    critic_out_dim: 128
+    msg_dim:  64
     n_heads:  3
 
   # MLP / policy-head architecture
   model:
-    policy_mlp_hid: [64, 64]
-    critic_mlp_hid: [64, 64]
-    scale_hid: 64
+    policy_mlp_hid: [128, 128]
+    critic_mlp_hid: [128, 128]
+    scale_hid: 128
     scale_final: 0.01
     std_dev_init: 0.15
     std_dev_min: 1.0e-5

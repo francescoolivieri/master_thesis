@@ -82,27 +82,9 @@ class UpdateTargets:
     """Returns and advantages consumed by the PPO minibatch loop."""
 
     qh_det: torch.Tensor
-    ql: torch.Tensor
     ql_value_targets: torch.Tensor
-    bT_vl: torch.Tensor
     advantages: torch.Tensor
     adv_info: dict[str, torch.Tensor]
-    vl_error: torch.Tensor
-
-
-@dataclasses.dataclass(frozen=True)
-class UpdateStats:
-    """Accumulated scalar tensors from all minibatches in one update."""
-
-    loss_policy: torch.Tensor
-    loss_policy_total: torch.Tensor
-    loss_value_l: torch.Tensor
-    loss_value_h: torch.Tensor
-    clip_frac: torch.Tensor
-    entropy_mean: torch.Tensor
-    entropy_bonus: torch.Tensor
-    approx_kl: torch.Tensor
-    n_minibatches: int
 
 
 class DGPPOAgent(Agent):
@@ -519,8 +501,8 @@ class DGPPOAgent(Agent):
         if memory is None or memory.cursor < self.rollouts:
             return
 
-        view = memory.as_bTah_view("stc")
-        det_view = memory.as_bTah_view("det")
+        view = memory.as_update_view("stc")
+        det_view = memory.as_update_view("det")
 
         graph = build_rollout_graph(view=view, obs_radius=self.obs_radius)
         det_graph = build_rollout_graph(view=det_view, obs_radius=self.obs_radius)
@@ -528,23 +510,35 @@ class DGPPOAgent(Agent):
         det_final_graph = self._build_final_rollout_graph(det_view)
         chunk_ids = self._rnn_chunk_ids(T=view["bTa_actions"].shape[1], device=torch.device("cpu"))
 
-        stats = self._run_update_epochs(
-            memory=memory,
-            view=view,
-            det_view=det_view,
-            graph=graph,
-            det_graph=det_graph,
-            final_graph=final_graph,
-            det_final_graph=det_final_graph,
-            chunk_ids=chunk_ids,
-            timestep=timestep,
-            timesteps=timesteps,
-        )
-        if stats.n_minibatches == 0:
+        update_info: dict[str, torch.Tensor] | None = None
+        for _epoch in range(self.learning_epochs):
+            targets = self._compute_update_targets(
+                view=view,
+                det_view=det_view,
+                graph=graph,
+                det_graph=det_graph,
+                final_graph=final_graph,
+                det_final_graph=det_final_graph,
+                timestep=timestep,
+                timesteps=timesteps,
+            )
+            for env_ids in memory.sample_minibatches(self.mini_batches):
+                update_info = self._update_minibatch(
+                    env_ids=env_ids,
+                    targets=targets,
+                    view=view,
+                    det_view=det_view,
+                    graph=graph,
+                    det_graph=det_graph,
+                    chunk_ids=chunk_ids,
+                )
+            if update_info is not None:
+                update_info["eval/safe_data"] = targets.adv_info["bTa_is_safe"].float().mean().detach()
+
+        if update_info is None:
             return
 
-        update_summary = self._summarize_update(stats)
-        self._track_update_summary(update_summary)
+        self._track_scalars(update_info)
         self._maybe_log_debug_rollout(view=view, timestep=timestep)
 
         memory.reset()
@@ -567,14 +561,14 @@ class DGPPOAgent(Agent):
     ) -> UpdateTargets:
         """Compute rollout returns and CBF-shaped PPO advantages."""
         with torch.no_grad():
-            B, T = view["bT_l"].shape
-            det_B, det_T = det_view["bT_l"].shape
+            batch_size, rollout_length = view["bT_l"].shape
+            det_batch_size, det_rollout_length = det_view["bT_l"].shape
 
-            vl_model, _, final_vl_state = scan_rollout_vl_values(
+            bT_vl, _, final_vl_state = scan_rollout_vl_values(
                 Vl=self.Vl,
                 graph=graph,
-                B=B,
-                T=T,
+                B=batch_size,
+                T=rollout_length,
                 initial_rnn_state=view.get("b_initial_vl_rnn_state"),
                 done_mask=view.get("bT_done"),
             )
@@ -583,83 +577,77 @@ class DGPPOAgent(Agent):
                 graph=final_graph,
                 rnn_states=final_vl_state,
             )
-            vl = vl_model
-            vh = evaluate_rollout_vh_values(
+            bTah_vh = evaluate_rollout_vh_values(
                 Vh=self.Vh,
                 graph=graph,
-                B=B,
-                T=T,
+                B=batch_size,
+                T=rollout_length,
                 rnn_states=view.get("bTa_rnn_states"),
             )
-            final_rnn_state = self._advance_final_policy_state(final_graph, view)
+            final_policy_state = self._advance_final_policy_state(final_graph, view)
             final_vh = evaluate_vh_batch_from_states(
                 Vh=self.Vh,
                 graph=final_graph,
-                rnn_states=final_rnn_state,
+                rnn_states=final_policy_state,
             )
-            vh_det = evaluate_rollout_vh_values(
+            bTah_vh_det = evaluate_rollout_vh_values(
                 Vh=self.Vh,
                 graph=det_graph,
-                B=det_B,
-                T=det_T,
+                B=det_batch_size,
+                T=det_rollout_length,
                 rnn_states=det_view.get("bTa_rnn_states"),
             )
-            det_final_rnn_state = self._advance_final_policy_state(det_final_graph, det_view)
+            det_final_policy_state = self._advance_final_policy_state(det_final_graph, det_view)
             final_vh_det = evaluate_vh_batch_from_states(
                 Vh=self.Vh,
                 graph=det_final_graph,
-                rnn_states=det_final_rnn_state,
+                rnn_states=det_final_policy_state,
             )
 
-            vl_tp1 = torch.cat([vl, final_vl[:, None]], dim=1)
-            vh_tp1 = torch.cat([vh, final_vh[:, None]], dim=1)
-            vh_det_tp1 = torch.cat([vh_det, final_vh_det[:, None]], dim=1)
+            bTp1_vl = torch.cat([bT_vl, final_vl[:, None]], dim=1)
+            bTp1ah_vh = torch.cat([bTah_vh, final_vh[:, None]], dim=1)
+            bTp1ah_vh_det = torch.cat([bTah_vh_det, final_vh_det[:, None]], dim=1)
 
-            _qh_stc, ql = compute_dec_ocp_gae(
+            _bTah_qh, bT_ql = compute_dec_ocp_gae(
                 Tah_hs=view["bTah_hs"],
                 T_l=view["bT_l"],
-                Tp1ah_Vh=vh_tp1,
-                Tp1_Vl=vl_tp1,
+                Tp1ah_Vh=bTp1ah_vh,
+                Tp1_Vl=bTp1_vl,
                 disc_gamma=self.gamma,
                 gae_lambda=self.gae_lambda,
                 T_terminated=view["bT_terminated"],
                 T_truncated=view["bT_truncated"],
                 bootstrap_on_truncated=self.bootstrap_on_truncated,
             )
-            qh_det, _ = compute_dec_ocp_gae(
+            bTah_qh_det, _ = compute_dec_ocp_gae(
                 Tah_hs=det_view["bTah_hs"],
                 T_l=det_view["bT_l"],
-                Tp1ah_Vh=vh_det_tp1,
-                Tp1_Vl=vl_tp1,
+                Tp1ah_Vh=bTp1ah_vh_det,
+                Tp1_Vl=bTp1_vl,
                 disc_gamma=self.gamma,
                 gae_lambda=self.gae_lambda,
                 T_terminated=det_view["bT_terminated"],
                 T_truncated=det_view["bT_truncated"],
                 bootstrap_on_truncated=self.bootstrap_on_truncated,
             )
-            ql_value_targets = ql
-
-            cbf_scale = self._cbf_scale(timestep=timestep, timesteps=timesteps)
             adv_info = compute_cbf_advantages(
-                bT_Ql=ql,
-                bT_Vl=vl,
-                bTah_Vh=vh,
-                bTp1ah_Vh=vh_tp1,
+                bT_Ql=bT_ql,
+                bT_Vl=bT_vl,
+                bTah_Vh=bTah_vh,
+                bTp1ah_Vh=bTp1ah_vh,
                 alpha=self.alpha,
                 cbf_eps=self.cbf_eps,
                 cbf_weight=self.cbf_weight,
                 dt=self.env._step_dt,
-                cbf_scale=cbf_scale,
+                cbf_scale=self._cbf_scale(timestep=timestep, timesteps=timesteps),
                 bT_done=view["bT_done"],
             )
+
         return UpdateTargets(
-            qh_det=qh_det.detach(),
-            ql=ql.detach(),
-            ql_value_targets=ql_value_targets.detach(),
-            bT_vl=vl.detach(),
+            qh_det=bTah_qh_det.detach(),
+            ql_value_targets=bT_ql.detach(),
             advantages=adv_info["bTa_A"].detach(),
             adv_info=adv_info,
-            vl_error=(ql - vl).detach(),
         )
 
     def _build_final_rollout_graph(self, view: dict[str, torch.Tensor]) -> GraphData:
@@ -689,151 +677,11 @@ class DGPPOAgent(Agent):
         )
         return self._unflatten_policy_batch_rnn_state(final_state, batch_size=rnn_states.shape[0])
 
-    def _track_update_targets(
-        self,
-        *,
-        view: dict[str, torch.Tensor],
-        det_view: dict[str, torch.Tensor],
-        targets: UpdateTargets,
-    ) -> None:
-        """Track rollout-level metrics before minibatch optimization starts."""
-        self._track_scalars(
-            {
-                "DGPPO/cbf/reward_advantage_used_pct": 100.0 * targets.adv_info["bTa_reward_used"].float().mean(),
-                "DGPPO/cbf/active_steps_pct": 100.0 * targets.adv_info["bTa_cbf_active"].float().mean(),
-                "DGPPO/cbf/penalty_mean": targets.adv_info["bTa_cbf_penalty"].mean(),
-                "DGPPO/advantage/reward_raw_mean": targets.adv_info["bT_Al_raw"].mean(),
-                "DGPPO/advantage/final_mean": targets.advantages.mean(),
-                "DGPPO/advantage/final_abs_max": targets.advantages.abs().max(),
-                "DGPPO/critic_targets/low_level_cost_mean": view["bT_l"].mean(),
-                "DGPPO/critic_targets/ql_mean": targets.ql.mean(),
-                "DGPPO/critic_targets/ql_abs_max": targets.ql.abs().max(),
-                "DGPPO/critic_targets/vl_rollout_mean": targets.bT_vl.mean(),
-                "DGPPO/critic_targets/vl_error_abs_mean": targets.vl_error.abs().mean(),
-                "DGPPO/rollout/stochastic/terminated_steps_pct": 100.0 * view["bT_terminated"].float().mean(),
-                "DGPPO/rollout/stochastic/truncated_steps_pct": 100.0 * view["bT_truncated"].float().mean(),
-                "DGPPO/rollout/deterministic/terminated_steps_pct": 100.0 * det_view["bT_terminated"].float().mean(),
-                "DGPPO/rollout/deterministic/truncated_steps_pct": 100.0 * det_view["bT_truncated"].float().mean(),
-            }
-        )
-        self._track_rollout_safety_metrics(view=view, det_view=det_view)
-        self._track_rnn_metrics(view=view)
-
-    def _run_update_epochs(
-        self,
-        *,
-        memory: DGPPORolloutMemory,
-        view: dict[str, torch.Tensor],
-        det_view: dict[str, torch.Tensor],
-        graph: GraphData,
-        det_graph: GraphData,
-        final_graph: GraphData,
-        det_final_graph: GraphData,
-        chunk_ids: torch.Tensor,
-        timestep: int,
-        timesteps: int,
-    ) -> UpdateStats:
-        """Run all PPO epochs and accumulate minibatch summaries."""
-        loss_policy = view["bT_l"].new_zeros(())
-        loss_policy_total = view["bT_l"].new_zeros(())
-        loss_value_l = view["bT_l"].new_zeros(())
-        loss_value_h = view["bT_l"].new_zeros(())
-        clip_frac = view["bT_l"].new_zeros(())
-        entropy_mean = view["bT_l"].new_zeros(())
-        entropy_bonus = view["bT_l"].new_zeros(())
-        approx_kl = view["bT_l"].new_zeros(())
-        n_minibatches = 0
-
-        for epoch in range(self.learning_epochs):
-            targets = self._compute_update_targets(
-                view=view,
-                det_view=det_view,
-                graph=graph,
-                det_graph=det_graph,
-                final_graph=final_graph,
-                det_final_graph=det_final_graph,
-                timestep=timestep,
-                timesteps=timesteps,
-            )
-            if epoch == 0:
-                self._track_update_targets(view=view, det_view=det_view, targets=targets)
-            sampled_batches = memory.sample_minibatches(self.mini_batches)
-            for idx in sampled_batches:
-                info = self._update_minibatch(
-                    idx=idx,
-                    Qh_det=targets.qh_det,
-                    Ql=targets.ql_value_targets,
-                    bTa_A=targets.advantages,
-                    view=view,
-                    det_view=det_view,
-                    graph=graph,
-                    det_graph=det_graph,
-                    chunk_ids=chunk_ids,
-                )
-                loss_policy += info["loss_p"]
-                loss_policy_total += info["loss_p_total"]
-                loss_value_l += info["loss_vl"]
-                loss_value_h += info["loss_vh"]
-                clip_frac += info["clip_frac"]
-                entropy_mean += info["entropy_mean"]
-                entropy_bonus += info["entropy_bonus"]
-                approx_kl += info["approx_kl"]
-                n_minibatches += 1
-
-        return UpdateStats(
-            loss_policy=loss_policy,
-            loss_policy_total=loss_policy_total,
-            loss_value_l=loss_value_l,
-            loss_value_h=loss_value_h,
-            clip_frac=clip_frac,
-            entropy_mean=entropy_mean,
-            entropy_bonus=entropy_bonus,
-            approx_kl=approx_kl,
-            n_minibatches=n_minibatches,
-        )
-
-    def _summarize_update(self, stats: UpdateStats) -> dict[str, float]:
-        inv_n = 1.0 / float(stats.n_minibatches)
-        return {
-            "loss_policy": float((stats.loss_policy * inv_n).item()),
-            "loss_policy_total": float((stats.loss_policy_total * inv_n).item()),
-            "loss_value_l": float((stats.loss_value_l * inv_n).item()),
-            "loss_value_l_rmse": float(torch.sqrt((2.0 * stats.loss_value_l * inv_n).clamp_min(0.0)).item()),
-            "loss_value_h": float((stats.loss_value_h * inv_n).item()),
-            "clip_frac": float((stats.clip_frac * inv_n).item()),
-            "entropy_mean": float((stats.entropy_mean * inv_n).item()),
-            "entropy_bonus": float((stats.entropy_bonus * inv_n).item()),
-            "approx_kl": float((stats.approx_kl * inv_n).item()),
-            "lr_policy": float(self._policy_opt.param_groups[0]["lr"]),
-            "lr_vl": float(self._vl_opt.param_groups[0]["lr"]),
-            "lr_vh": float(self._vh_opt.param_groups[0]["lr"]),
-        }
-
-    def _track_update_summary(self, summary: Mapping[str, float]) -> None:
-        self._track_scalars(
-            {
-                "DGPPO/loss/policy_surrogate": summary["loss_policy"],
-                "DGPPO/loss/policy_total": summary["loss_policy_total"],
-                "DGPPO/loss/critic_low_level_vl": summary["loss_value_l"],
-                "DGPPO/loss/critic_low_level_vl_rmse": summary["loss_value_l_rmse"],
-                "DGPPO/loss/critic_safety_vh": summary["loss_value_h"],
-                "DGPPO/policy/clip_frac": summary["clip_frac"],
-                "DGPPO/policy/entropy": summary["entropy_mean"],
-                "DGPPO/policy/entropy_bonus": summary["entropy_bonus"],
-                "DGPPO/policy/approx_kl": summary["approx_kl"],
-                "DGPPO/optimizer/lr_policy": summary["lr_policy"],
-                "DGPPO/optimizer/lr_vl": summary["lr_vl"],
-                "DGPPO/optimizer/lr_vh": summary["lr_vh"],
-            }
-        )
-
     def _update_minibatch(
         self,
         *,
-        idx: torch.Tensor,
-        Qh_det: torch.Tensor,
-        Ql: torch.Tensor,
-        bTa_A: torch.Tensor,
+        env_ids: torch.Tensor,
+        targets: UpdateTargets,
         view: dict[str, torch.Tensor],
         det_view: dict[str, torch.Tensor],
         graph: GraphData,
@@ -843,12 +691,12 @@ class DGPPOAgent(Agent):
         """Single PPO minibatch step"""
 
         batch = build_update_graph_batch(
-            idx=idx,
+            idx=env_ids,
             view=view,
             det_view=det_view,
-            qh_det=Qh_det,
-            ql=Ql,
-            advantages=bTa_A,
+            qh_det=targets.qh_det,
+            ql=targets.ql_value_targets,
+            advantages=targets.advantages,
             obs_radius=self.obs_radius,
             graph=graph,
             det_graph=det_graph,
@@ -856,8 +704,18 @@ class DGPPOAgent(Agent):
         chunk_graph = None
         det_chunk_graph = None
         if self.policy.rnn is not None or self.Vl.rnn is not None or self.Vh.rnn is not None:
-            chunk_graph = rollout_graph_chunks(batch.graph, chunk_ids=chunk_ids, T=batch.T, B=batch.b)
-            det_chunk_graph = rollout_graph_chunks(batch.det_graph, chunk_ids=chunk_ids, T=batch.T, B=batch.b)
+            chunk_graph = rollout_graph_chunks(
+                batch.graph,
+                chunk_ids=chunk_ids,
+                T=batch.rollout_length,
+                B=batch.batch_size,
+            )
+            det_chunk_graph = rollout_graph_chunks(
+                batch.det_graph,
+                chunk_ids=chunk_ids,
+                T=batch.rollout_length,
+                B=batch.batch_size,
+            )
 
         # ---- Policy ----
         if self.policy.rnn is not None:
@@ -870,7 +728,7 @@ class DGPPOAgent(Agent):
                 chunk_ids=chunk_ids,
                 clip_eps=self.clip_eps,
                 entropy_scale=self.entropy_scale,
-                n_agents=batch.A,
+                n_agents=batch.n_agents,
                 chunk_graph=chunk_graph,
                 done_mask=batch.done_mask,
             )
@@ -883,13 +741,12 @@ class DGPPOAgent(Agent):
                 advantages=batch.advantages,
                 clip_eps=self.clip_eps,
                 entropy_scale=self.entropy_scale,
-                n_agents=batch.A,
+                n_agents=batch.n_agents,
                 rnn_state=None,
             )
         with torch.no_grad():
-            log_ratio = policy_info["log_prob_delta"]
-            approx_kl = ((policy_info["ratio"] - 1.0) - log_ratio).mean()
-        apply_policy_update(
+            total_variation_dist = 0.5 * torch.abs(policy_info["ratio"] - 1.0).mean()
+        policy_grad_norm = apply_policy_update(
             optimizer=self._policy_opt,
             loss=policy_info["loss_policy_total"],
             parameters=self.policy.parameters(),
@@ -904,7 +761,7 @@ class DGPPOAgent(Agent):
             det_graph=batch.det_graph,
             ql_targets=batch.ql_targets,
             qh_det_targets=batch.qh_det_targets,
-            A=batch.A,
+            n_agents=batch.n_agents,
             vl_loss_scale=self.vl_loss_scale,
             vh_loss_scale=self.vh_loss_scale,
             det_rnn_states=batch.det_rnn_states,
@@ -913,13 +770,13 @@ class DGPPOAgent(Agent):
             chunk_graph=chunk_graph,
             det_chunk_graph=det_chunk_graph,
         )
-        apply_value_update(
+        vl_grad_norm = apply_value_update(
             optimizer=self._vl_opt,
             loss=value_info["loss_vl"],
             parameters=self._vl_grad_params,
             grad_clip=self.grad_clip,
         )
-        apply_value_update(
+        vh_grad_norm = apply_value_update(
             optimizer=self._vh_opt,
             loss=value_info["loss_vh"],
             parameters=self._vh_grad_params,
@@ -927,14 +784,21 @@ class DGPPOAgent(Agent):
         )
 
         return {
-            "loss_p": policy_info["loss_policy"].detach(),
-            "loss_p_total": policy_info["loss_policy_total"].detach(),
-            "loss_vl": value_info["loss_vl"].detach(),
-            "loss_vh": value_info["loss_vh"].detach(),
-            "clip_frac": policy_info["clip_frac"].detach(),
-            "entropy_mean": policy_info["entropy_mean"].detach(),
-            "entropy_bonus": policy_info["entropy_bonus"].detach(),
-            "approx_kl": approx_kl.detach(),
+            "Vl/loss": value_info["loss_vl"].detach(),
+            "Vl/grad_norm": vl_grad_norm.detach(),
+            "Vl/has_nan": (~torch.isfinite(vl_grad_norm)).to(dtype=value_info["loss_vl"].dtype).detach(),
+            "Vl/max_target": batch.ql_targets.max().detach(),
+            "Vl/min_target": batch.ql_targets.min().detach(),
+            "Vh/loss_Vh": value_info["loss_vh"].detach(),
+            "Vh/grad_Vh_norm": vh_grad_norm.detach(),
+            "Vh/grad_Vh_has_nan": (~torch.isfinite(vh_grad_norm)).to(dtype=value_info["loss_vh"].dtype).detach(),
+            "policy/loss": policy_info["loss_policy_total"].detach(),
+            "policy/clip_frac": policy_info["clip_frac"].detach(),
+            "policy/entropy": policy_info["entropy_mean"].detach(),
+            "policy/total_variation_dist": total_variation_dist.detach(),
+            "policy/grad_norm": policy_grad_norm.detach(),
+            "policy/has_nan": (~torch.isfinite(policy_grad_norm)).to(dtype=policy_info["loss_policy"].dtype).detach(),
+            "policy/log_pi_min": batch.old_logp.min().detach(),
         }
 
     def _track_scalars(self, scalars: Mapping[str, float | torch.Tensor]) -> None:
@@ -989,30 +853,6 @@ class DGPPOAgent(Agent):
             rnn_step = T
         return torch.arange(T, device=device, dtype=torch.long).reshape(-1, rnn_step)
 
-    def _track_rollout_safety_metrics(
-        self,
-        *,
-        view: dict[str, torch.Tensor],
-        det_view: dict[str, torch.Tensor],
-    ) -> None:
-        """Track raw rollout safety with explicit stochastic/deterministic scope."""
-        stc_masks = self._rollout_safety_masks(view)
-        det_masks = self._rollout_safety_masks(det_view)
-        if not stc_masks:
-            return
-
-        stc_any = self._combine_safety_masks(stc_masks)
-        det_any = self._combine_safety_masks(det_masks)
-        metrics = {
-            "DGPPO/safety/stochastic/rollouts_with_violation_pct": self._rollout_violation_pct(stc_any),
-            "DGPPO/safety/stochastic/violation_steps_pct": self._step_violation_pct(stc_any),
-            "DGPPO/safety/deterministic/rollouts_with_violation_pct": self._rollout_violation_pct(det_any),
-        }
-        for name, mask in stc_masks.items():
-            metrics[f"DGPPO/safety/{name}/rollouts_pct"] = self._rollout_violation_pct(mask)
-            metrics[f"DGPPO/safety/{name}/steps_pct"] = self._step_violation_pct(mask)
-        self._track_scalars(metrics)
-
     def _rollout_safety_masks(self, view: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Return boolean safety masks in ``[B, T, A]`` layout."""
         agent_state = view["bTa_agent_state"]
@@ -1059,46 +899,6 @@ class DGPPOAgent(Agent):
         inside_radius = torch.any(dxy <= radius, dim=-1)
         inside_height = (pos[..., 2] >= min_z) & (pos[..., 2] <= top_z)
         return inside_radius & inside_height
-
-    @staticmethod
-    def _combine_safety_masks(masks: Mapping[str, torch.Tensor]) -> torch.Tensor:
-        combined: torch.Tensor | None = None
-        for mask in masks.values():
-            combined = mask if combined is None else (combined | mask)
-        if combined is None:
-            raise ValueError("Cannot combine an empty safety mask mapping")
-        return combined
-
-    @staticmethod
-    def _rollout_violation_pct(mask: torch.Tensor) -> torch.Tensor:
-        return 100.0 * mask.any(dim=tuple(range(1, mask.ndim))).float().mean()
-
-    @staticmethod
-    def _step_violation_pct(mask: torch.Tensor) -> torch.Tensor:
-        return 100.0 * mask.float().mean()
-
-    def _track_rnn_metrics(self, *, view: dict[str, torch.Tensor]) -> None:
-        """Track compact RNN health metrics for recurrent DG-PPO runs."""
-        metrics: dict[str, torch.Tensor] = {
-            "DGPPO/rnn/done_reset_steps_pct": 100.0 * view["bT_done"].float().mean(),
-        }
-        policy_states = view.get("bTa_rnn_states")
-        if policy_states is not None:
-            metrics.update(self._rnn_state_metrics("policy_state", policy_states))
-        if self._vl_rnn_state is not None:
-            metrics.update(self._rnn_state_metrics("vl_state", self._vl_rnn_state))
-        self._track_scalars(metrics)
-
-    @staticmethod
-    def _rnn_state_metrics(prefix: str, states: torch.Tensor) -> dict[str, torch.Tensor]:
-        finite = torch.isfinite(states)
-        safe_states = torch.where(finite, states, torch.zeros_like(states))
-        norms = torch.linalg.vector_norm(safe_states.reshape(-1, safe_states.shape[-1]), dim=-1)
-        return {
-            f"DGPPO/rnn/{prefix}_norm_mean": norms.mean(),
-            f"DGPPO/rnn/{prefix}_norm_max": norms.max(),
-            f"DGPPO/rnn/{prefix}_nonfinite_pct": 100.0 * (~finite).float().mean(),
-        }
 
     def _maybe_log_debug_rollout(self, *, view: dict[str, torch.Tensor], timestep: int) -> None:
         """Save a compact visual summary of one stochastic rollout."""
@@ -1442,7 +1242,11 @@ class DGPPOAgent(Agent):
         base_env = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
         reward_fn = getattr(base_env, "compute_dgppo_reward_from_observation_action", None)
         if callable(reward_fn):
-            rewards = reward_fn(observations=observations, actions=actions)
+            reward_aux_fn = getattr(base_env, "get_dgppo_reward_auxiliary_data", None)
+            if callable(reward_aux_fn):
+                rewards = reward_fn(observations=observations, actions=actions, reward_aux=reward_aux_fn())
+            else:
+                rewards = reward_fn(observations=observations, actions=actions)
         return torch.as_tensor(rewards, device=self.device, dtype=torch.float32).reshape(n_envs)
 
     def _reset_rnn_states_for_done(self, done: torch.Tensor) -> None:
