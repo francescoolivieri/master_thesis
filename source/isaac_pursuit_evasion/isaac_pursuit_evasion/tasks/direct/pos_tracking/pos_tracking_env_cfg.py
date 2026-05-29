@@ -124,6 +124,9 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     save_camera_images: bool = False
     camera_image_dir: str = "logs/pos_tracking/camera"
     camera_overlay_text: bool = False
+    camera_view_eye: tuple[float, float, float] | None = None
+    camera_view_target: tuple[float, float, float] | None = None
+    camera_view_extent_scale: float = 1.35
 
     # Debug visualization
     debug_vis: bool = True

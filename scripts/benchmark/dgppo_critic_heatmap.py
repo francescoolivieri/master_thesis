@@ -63,6 +63,12 @@ parser.add_argument(
     default=None,
     help="Agent YAML used to train the checkpoint. Defaults to params/agent.yaml next to the checkpoint.",
 )
+parser.add_argument(
+    "--trained-env-cfg",
+    type=Path,
+    default=None,
+    help="Env YAML used to train the checkpoint. Defaults to params/env.yaml next to the checkpoint.",
+)
 parser.add_argument("--num-envs", type=int, default=1, help="Number of IsaacLab envs to instantiate for metadata.")
 parser.add_argument("--grid-size", type=int, default=121, help="Number of grid samples per XY axis.")
 parser.add_argument("--batch-size", type=int, default=4096, help="Number of grid states evaluated per critic batch.")
@@ -158,12 +164,30 @@ from source.isaac_pursuit_evasion.dgppo.utils import (
 # Ensure tasks are registered with Gym.
 import source.isaac_pursuit_evasion.isaac_pursuit_evasion.tasks.direct.pos_tracking  # noqa: F401
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
+def _path_candidates(path: Path) -> list[Path]:
+    if path.is_absolute():
+        return [path]
+    roots = (Path.cwd(), _PROJECT_ROOT, _PROJECT_ROOT.parent)
+    candidates: list[Path] = []
+    for root in roots:
+        candidate = root / path
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
 def _resolve_path(path: str | Path) -> Path:
-    return Path(path).expanduser().resolve()
+    candidate = Path(path).expanduser()
+    for item in _path_candidates(candidate):
+        if item.exists():
+            return item.resolve()
+    return candidate.resolve()
 
 
 def _as_int_tuple(values: Any, default: tuple[int, ...]) -> tuple[int, ...]:
@@ -210,19 +234,86 @@ def _color_percentiles() -> tuple[float, float]:
     return float(low), float(high)
 
 
+def _as_plain_container(value: Any) -> Any:
+    try:
+        from omegaconf import DictConfig, ListConfig, OmegaConf  # type: ignore
+    except Exception:
+        return value
+    if isinstance(value, (DictConfig, ListConfig)):
+        return OmegaConf.to_container(value, resolve=True)
+    return value
+
+
 def _apply_env_overrides_from_agent_cfg(env_cfg: Any, agent_cfg: Any) -> None:
+    agent_cfg = _as_plain_container(agent_cfg)
     if not isinstance(agent_cfg, Mapping):
         return
     env_overrides = agent_cfg.get("env", agent_cfg.get("environment", None))
+    env_overrides = _as_plain_container(env_overrides)
     if not isinstance(env_overrides, Mapping):
         return
     for key, value in env_overrides.items():
-        if str(key).startswith("_"):
+        key_str = str(key)
+        if key_str.startswith("_"):
             continue
-        if not hasattr(env_cfg, key):
+        if not hasattr(env_cfg, key_str):
             print(f"[WARN] Ignoring agent env override '{key}': env config has no such attribute.")
             continue
-        setattr(env_cfg, key, value)
+        setattr(env_cfg, key_str, _as_plain_container(value))
+
+
+_TRAINING_ENV_COMPAT_KEYS = (
+    "arena_min",
+    "arena_max",
+    "arena_margin",
+    "altitude_outer_margin",
+    "enable_walls",
+    "wall_thickness",
+    "wall_extra_margin",
+    "enable_pillars",
+    "pillar_positions_xy",
+    "pillar_radius",
+    "pillar_height",
+    "drone_collision_radius",
+    "drone_name",
+    "control_mode",
+    "vel_scale",
+    "yaw_rate_scale",
+    "thrust_to_weight",
+    "flag_yaw_tracking",
+    "include_yaw_in_observations",
+    "include_yaw_with_ray_caster",
+    "enable_obstacle_observations",
+    "obstacle_observation_mode",
+    "enable_ray_caster",
+    "ray_caster_observation_mode",
+    "ray_caster_top_k_hits",
+    "ray_caster_num_rays",
+    "ray_caster_max_distance",
+    "ray_caster_horizontal_fov_range",
+    "ray_caster_offset",
+    "reference_obstacle_clearance",
+    "pos_tolerance",
+    "yaw_tolerance",
+    "success_hold_time_s",
+    "terminate_on_success",
+    "enable_clip_states",
+)
+
+
+def _apply_env_overrides_from_training_env_cfg(env_cfg: Any, env_cfg_data: Mapping[str, Any] | None) -> None:
+    env_cfg_data = _as_plain_container(env_cfg_data)
+    if not isinstance(env_cfg_data, Mapping):
+        return
+
+    applied: list[str] = []
+    for key in _TRAINING_ENV_COMPAT_KEYS:
+        if key not in env_cfg_data or not hasattr(env_cfg, key):
+            continue
+        setattr(env_cfg, key, _as_plain_container(env_cfg_data[key]))
+        applied.append(key)
+    if applied:
+        print(f"[INFO] Applied training env params: {', '.join(sorted(applied))}")
 
 
 def _apply_cli_env_overrides(env_cfg: Any) -> None:
@@ -240,8 +331,28 @@ def _load_yaml_mapping(path: Path) -> dict[str, Any]:
         import yaml  # type: ignore
     except Exception as exc:
         raise ImportError("PyYAML is required to parse agent YAML configs.") from exc
-    with path.expanduser().open("r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
+
+    class IsaacYamlLoader(yaml.SafeLoader):
+        pass
+
+    def _construct_python_tuple(loader, node):
+        return tuple(loader.construct_sequence(node))
+
+    def _construct_python_tag(loader, tag_suffix, node):
+        if isinstance(node, yaml.ScalarNode):
+            return loader.construct_scalar(node)
+        if isinstance(node, yaml.SequenceNode):
+            return loader.construct_sequence(node)
+        if isinstance(node, yaml.MappingNode):
+            return loader.construct_mapping(node)
+        return None
+
+    IsaacYamlLoader.add_constructor("tag:yaml.org,2002:python/tuple", _construct_python_tuple)
+    IsaacYamlLoader.add_multi_constructor("tag:yaml.org,2002:python/", _construct_python_tag)
+
+    path = _resolve_path(path)
+    with path.open("r", encoding="utf-8") as f:
+        data = yaml.load(f, Loader=IsaacYamlLoader) or {}
     if not isinstance(data, dict):
         raise TypeError(f"Expected mapping in {path}, got {type(data).__name__}")
     return data
@@ -268,7 +379,7 @@ def _latest_agent_checkpoint(checkpoints_dir: Path) -> Path | None:
 def _resolve_checkpoint_path(path: str | Path | None) -> Path | None:
     if path is None:
         return None
-    candidate = Path(path).expanduser()
+    candidate = _resolve_path(path)
     if not candidate.exists():
         return candidate
     if candidate.is_file():
@@ -287,26 +398,53 @@ def _resolve_checkpoint_path(path: str | Path | None) -> Path | None:
     return checkpoint
 
 
-def _checkpoint_agent_yaml(checkpoint: str | Path | None) -> Path | None:
+def _checkpoint_run_dir(checkpoint: str | Path | None) -> Path | None:
     checkpoint_path = _resolve_checkpoint_path(checkpoint)
-    if checkpoint_path is None:
+    if checkpoint_path is None or not checkpoint_path.exists():
         return None
-    candidate = checkpoint_path.parent.parent / "params" / "agent.yaml"
+    if checkpoint_path.is_dir():
+        return checkpoint_path.parent if checkpoint_path.name == "checkpoints" else checkpoint_path
+    if checkpoint_path.parent.name == "checkpoints":
+        return checkpoint_path.parent.parent
+    if checkpoint_path.parent.name == "params":
+        return checkpoint_path.parent.parent
+    return checkpoint_path.parent
+
+
+def _checkpoint_params_yaml(checkpoint: str | Path | None, filename: str) -> Path | None:
+    run_dir = _checkpoint_run_dir(checkpoint)
+    if run_dir is None:
+        return None
+    candidate = run_dir / "params" / filename
     return candidate if candidate.exists() else None
 
 
 def _agent_cfg_for_checkpoint(default_cfg: Mapping[str, Any], checkpoint: str | Path | None) -> dict[str, Any]:
     if args_cli.trained_agent_cfg is not None:
-        cfg_path = args_cli.trained_agent_cfg.expanduser()
+        cfg_path = _resolve_path(args_cli.trained_agent_cfg)
         print(f"[INFO] Loading trained agent config: {cfg_path}")
         return _load_yaml_mapping(cfg_path)
 
-    cfg_path = _checkpoint_agent_yaml(checkpoint)
+    cfg_path = _checkpoint_params_yaml(checkpoint, "agent.yaml")
     if cfg_path is not None:
         print(f"[INFO] Loading trained agent config next to checkpoint: {cfg_path}")
         return _load_yaml_mapping(cfg_path)
 
     return dict(default_cfg)
+
+
+def _env_cfg_for_checkpoint(checkpoint: str | Path | None) -> dict[str, Any]:
+    if args_cli.trained_env_cfg is not None:
+        cfg_path = _resolve_path(args_cli.trained_env_cfg)
+        print(f"[INFO] Loading trained env config: {cfg_path}")
+        return _load_yaml_mapping(cfg_path)
+
+    cfg_path = _checkpoint_params_yaml(checkpoint, "env.yaml")
+    if cfg_path is not None:
+        print(f"[INFO] Loading trained env config next to checkpoint: {cfg_path}")
+        return _load_yaml_mapping(cfg_path)
+
+    return {}
 
 
 def _download_wandb_artifact(artifact: str, artifact_file: str | None = None) -> str:
@@ -384,13 +522,24 @@ def _extract_dgppo_value_state_dict(payload: Any, name: str) -> Mapping[str, Any
     return None
 
 
-def _make_critics(agent_cfg: DGPPOAgentCfg, base_env: Any, device: str | torch.device) -> tuple[DGPPOValueNet, DGPPOValueNet]:
-    layout = base_env.graph_obs_layout
-    graph_state_dim = int(layout["state_dim"])
+def _infer_dgppo_state_dim(state_dict: Mapping[str, Any]) -> int:
+    query_weight = state_dict.get("gnn.gnn_layers.0.query.weight")
+    if not isinstance(query_weight, torch.Tensor):
+        raise ValueError("Could not infer DG-PPO graph state dim from checkpoint weights.")
+    return int(query_weight.shape[1]) - NUM_TYPE_INDICATORS
+
+
+def _make_critics(
+    agent_cfg: DGPPOAgentCfg,
+    base_env: Any,
+    device: str | torch.device,
+    *,
+    model_state_dim: int,
+) -> tuple[DGPPOValueNet, DGPPOValueNet]:
     n_agents = int(getattr(base_env, "num_agents", 1))
     n_constraints = int(getattr(base_env, "n_constraints", 1))
-    node_dim = graph_state_dim + NUM_TYPE_INDICATORS
-    edge_dim = graph_state_dim
+    node_dim = int(model_state_dim) + NUM_TYPE_INDICATORS
+    edge_dim = int(model_state_dim)
 
     gnn_cfg = agent_cfg.gnn
     rnn_cfg = agent_cfg.rnn
@@ -429,17 +578,25 @@ def _load_critics(
     agent_cfg: DGPPOAgentCfg,
     base_env: Any,
     device: str | torch.device,
-) -> tuple[DGPPOValueNet, DGPPOValueNet]:
+) -> tuple[DGPPOValueNet, DGPPOValueNet, int]:
     payload = torch.load(str(_resolve_path(checkpoint)), map_location="cpu")
-    vl, vh = _make_critics(agent_cfg, base_env, device)
+    vl_state = _extract_dgppo_value_state_dict(payload, "Vl")
+    vh_state = _extract_dgppo_value_state_dict(payload, "Vh")
+    if vl_state is None:
+        raise ValueError(f"Unable to locate DG-PPO Vl weights in checkpoint: {checkpoint}")
+    if vh_state is None:
+        raise ValueError(f"Unable to locate DG-PPO Vh weights in checkpoint: {checkpoint}")
+    model_state_dim = _infer_dgppo_state_dim(vl_state)
+    vh_state_dim = _infer_dgppo_state_dim(vh_state)
+    if vh_state_dim != model_state_dim:
+        raise ValueError(f"Vl graph state dim ({model_state_dim}) does not match Vh graph state dim ({vh_state_dim}).")
+    vl, vh = _make_critics(agent_cfg, base_env, device, model_state_dim=model_state_dim)
     for name, model in (("Vl", vl), ("Vh", vh)):
-        state_dict = _extract_dgppo_value_state_dict(payload, name)
-        if state_dict is None:
-            raise ValueError(f"Unable to locate DG-PPO {name} weights in checkpoint: {checkpoint}")
+        state_dict = vl_state if name == "Vl" else vh_state
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if missing or unexpected:
             print(f"[WARN] {name} checkpoint load mismatch (missing={missing}, unexpected={unexpected}).")
-    return vl, vh
+    return vl, vh, model_state_dim
 
 
 @dataclass(frozen=True)
@@ -621,9 +778,11 @@ def _build_model_input(
     positions_xy: np.ndarray,
     grid: GridSpec,
     device: torch.device,
+    *,
+    model_state_dim: int,
 ) -> Any:
     layout = base_env.graph_obs_layout
-    state_dim = int(layout["state_dim"])
+    state_dim = int(model_state_dim)
     n_agents = int(getattr(base_env, "num_agents", 1))
     if n_agents != 1:
         raise ValueError(f"Heatmap state synthesis currently supports one agent, got n_agents={n_agents}.")
@@ -633,9 +792,18 @@ def _build_model_input(
     agent_state[:, 0, 0:2] = torch.as_tensor(positions_xy, device=device, dtype=torch.float32)
     agent_state[:, 0, 2] = float(grid.z)
     agent_state[:, 0, 3:6] = torch.tensor(grid.velocity, device=device, dtype=torch.float32)
-    if state_dim >= 8:
+    if state_dim == 8:
         agent_state[:, 0, 6] = float(np.sin(grid.yaw))
         agent_state[:, 0, 7] = float(np.cos(grid.yaw))
+    elif state_dim >= 15:
+        yaw_sin = float(np.sin(grid.yaw))
+        yaw_cos = float(np.cos(grid.yaw))
+        rot = torch.tensor(
+            [yaw_cos, -yaw_sin, 0.0, yaw_sin, yaw_cos, 0.0, 0.0, 0.0, 1.0],
+            device=device,
+            dtype=torch.float32,
+        )
+        agent_state[:, 0, 6:15] = rot
 
     goal_state = torch.zeros_like(agent_state)
     goal_state[:, 0, 0:3] = torch.tensor(grid.goal, device=device, dtype=torch.float32)
@@ -659,6 +827,8 @@ def _evaluate_critics(
     agent_cfg: DGPPOAgentCfg,
     grid: GridSpec,
     device: torch.device,
+    *,
+    model_state_dim: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     points_xy = grid.points_xy
     n_points = int(points_xy.shape[0])
@@ -675,6 +845,7 @@ def _evaluate_critics(
                 points_xy[start:stop],
                 grid,
                 device,
+                model_state_dim=model_state_dim,
             )
             vl_state = vl.rnn.initialize_carry(stop - start, device=device) if vl.rnn is not None else None
             vh_state = (
@@ -822,6 +993,7 @@ def _write_outputs(
     checkpoint: str,
     dgppo_cfg: DGPPOAgentCfg,
     trained_agent_cfg: Mapping[str, Any] | None,
+    model_state_dim: int,
 ) -> dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
     vl_path = _plot_heatmap(output_dir, base_env, grid, vl_grid, filename="critic_vl_heatmap.png", title="DG-PPO Vl")
@@ -896,6 +1068,7 @@ def _write_outputs(
             "cmap": str(args_cli.cmap),
         },
         "dgppo": {
+            "model_graph_state_dim": int(model_state_dim),
             "obs_radius": float(dgppo_cfg.obs_radius),
             "use_rnn": bool(dgppo_cfg.use_rnn),
             "rnn": dict(dgppo_cfg.rnn),
@@ -941,9 +1114,11 @@ def main(env_cfg, agent_cfg: dict):
     checkpoint = str(checkpoint_path)
 
     trained_agent_cfg = _agent_cfg_for_checkpoint(agent_cfg, checkpoint)
+    trained_env_cfg = _env_cfg_for_checkpoint(checkpoint)
     env_cfg.scene.num_envs = int(args_cli.num_envs or env_cfg.scene.num_envs)
     env_cfg.sim.device = args_cli.device if args_cli.device else env_cfg.sim.device
     _apply_env_overrides_from_agent_cfg(env_cfg, trained_agent_cfg)
+    _apply_env_overrides_from_training_env_cfg(env_cfg, trained_env_cfg)
     _apply_cli_env_overrides(env_cfg)
     env_cfg.domain_randomization.enable = False
     env_cfg.debug_vis = False
@@ -963,9 +1138,17 @@ def main(env_cfg, agent_cfg: dict):
     try:
         cfg_data = trained_agent_cfg.get("agent", trained_agent_cfg) if isinstance(trained_agent_cfg, Mapping) else {}
         dgppo_cfg = DGPPOAgentCfg.from_dict(cfg_data)
-        vl, vh = _load_critics(checkpoint, dgppo_cfg, base_env, device)
+        vl, vh, model_state_dim = _load_critics(checkpoint, dgppo_cfg, base_env, device)
         grid = _make_grid_spec(env_cfg)
-        vl_grid, vh_grid, vh_heads = _evaluate_critics(vl, vh, base_env, dgppo_cfg, grid, device)
+        vl_grid, vh_grid, vh_heads = _evaluate_critics(
+            vl,
+            vh,
+            base_env,
+            dgppo_cfg,
+            grid,
+            device,
+            model_state_dim=model_state_dim,
+        )
         paths = _write_outputs(
             output_dir,
             base_env,
@@ -976,6 +1159,7 @@ def main(env_cfg, agent_cfg: dict):
             checkpoint,
             dgppo_cfg,
             trained_agent_cfg if isinstance(trained_agent_cfg, Mapping) else None,
+            model_state_dim,
         )
     finally:
         env.close()

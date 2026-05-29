@@ -334,12 +334,9 @@ class PosTrackingEnv(DirectRLEnv):
         }
 
         # Body rates penalties
-        if self.cfg.control_mode == "RL_rates":
-            raise RuntimeError( "Body rates rewards has to be implemented." )
-        else:
-            ang_vel_b = self._robot.data.root_ang_vel_b
-            roll_pitch = torch.sum(ang_vel_b[:, :2] ** 2, dim=-1)
-            yaw = ang_vel_b[:, 2] ** 2
+        ang_vel_b = self._robot.data.root_ang_vel_b
+        roll_pitch = torch.sum(ang_vel_b[:, :2] ** 2, dim=-1)
+        yaw = ang_vel_b[:, 2] ** 2
 
         body_roll_pitch_penalty = -self.cfg.reward_body_rates_roll_pitch * roll_pitch
         body_yaw_penalty = -self.cfg.reward_body_rates_yaw * yaw
@@ -1204,6 +1201,14 @@ class PosTrackingEnv(DirectRLEnv):
         if env_origins is None or env_origins.numel() == 0:
             return
 
+        cfg_eye = getattr(self.cfg, "camera_view_eye", None)
+        cfg_target = getattr(self.cfg, "camera_view_target", None)
+        if cfg_eye is not None and cfg_target is not None:
+            eye = tuple(float(v) for v in cfg_eye)
+            target = tuple(float(v) for v in cfg_target)
+            set_camera_view(eye=eye, target=target, camera_prim_path="/OmniverseKit_Persp")
+            return
+
         env_min, _ = torch.min(env_origins, dim=0)
         env_max, _ = torch.max(env_origins, dim=0)
         arena_min = torch.tensor(self.cfg.arena_min, device=self.device, dtype=torch.float32)
@@ -1213,7 +1218,8 @@ class PosTrackingEnv(DirectRLEnv):
 
         center = 0.5 * (world_min + world_max)
         extent = world_max - world_min
-        top_height = max(float(extent[0]), float(extent[1])) * 2.2 + float(extent[2])
+        extent_scale = float(getattr(self.cfg, "camera_view_extent_scale", 1.35))
+        top_height = max(float(extent[0]), float(extent[1])) * extent_scale + float(extent[2])
 
         eye = (float(center[0]), float(center[1]), float(center[2]) + top_height)
         target = (float(center[0]), float(center[1]), float(center[2]))
