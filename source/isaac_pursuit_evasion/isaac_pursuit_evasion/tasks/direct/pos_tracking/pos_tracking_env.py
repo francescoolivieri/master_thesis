@@ -202,6 +202,10 @@ class PosTrackingEnv(DirectRLEnv):
         self._last_rewards = torch.zeros(self.num_envs, device=self.device)
         self._last_reward_components: dict[str, torch.Tensor] = {}
         self._last_body_rates = torch.zeros(self.num_envs, 3, device=self.device)
+        self._dgppo_reward_aux = {
+            "body_rates": torch.zeros_like(self._last_body_rates),
+            "action_diff": torch.zeros_like(self._actions),
+        }
         self._last_episode_status = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
         self._last_step_snapshot: dict[str, torch.Tensor] = {}
 
@@ -269,6 +273,12 @@ class PosTrackingEnv(DirectRLEnv):
                 device=self.device,
             )
             self._commands = self._action_wrapper.command(td)
+
+        self._last_body_rates = self._robot.data.root_ang_vel_b.detach().clone()
+        self._dgppo_reward_aux = {
+            "body_rates": self._last_body_rates,
+            "action_diff": self._action_diff.detach().clone(),
+        }
 
         self._update_visualizers()
 
@@ -353,7 +363,7 @@ class PosTrackingEnv(DirectRLEnv):
         body_yaw_penalty = -self.cfg.reward_body_rates_yaw * yaw
 
         rewards += body_roll_pitch_penalty + body_yaw_penalty
-        components["body_rates"] = body_roll_pitch_penalty -body_yaw_penalty
+        components["body_rates"] = body_roll_pitch_penalty + body_yaw_penalty
 
         # SIMPLER VERSION:
         # body_rates = self._robot.data.root_ang_vel_b
@@ -380,7 +390,6 @@ class PosTrackingEnv(DirectRLEnv):
         if self.cfg.flag_action_smoothness_penalty:
             action_delta_sq = self._action_diff**2
             action_delta_rpy = torch.sum(action_delta_sq[:, :3], dim=-1)
-            action_delta_norm_sq = torch.sum(action_delta_sq, dim=-1)
             action_delta_thrust = action_delta_sq[:, 3]
             smooth_weight_default = float(getattr(self.cfg, "reward_action_smoothness", 0.0))
             smooth_weight_rpy_cfg = getattr(self.cfg, "reward_action_smoothness_rpy", None)
@@ -389,9 +398,10 @@ class PosTrackingEnv(DirectRLEnv):
             smooth_weight_thrust = (
                 smooth_weight_default if smooth_weight_thrust_cfg is None else float(smooth_weight_thrust_cfg)
             )
-            action_smoothness_rpy_penalty = -smooth_weight_rpy * action_delta_rpy
-            action_smoothness_thrust_penalty = -smooth_weight_thrust * action_delta_thrust
-            action_smoothness_penalty = action_smoothness_rpy_penalty + action_smoothness_thrust_penalty
+            action_smoothness_penalty = (
+                smooth_weight_rpy * action_delta_rpy
+                + smooth_weight_thrust * action_delta_thrust
+            )
 
             rewards -= action_smoothness_penalty
             components["action_smoothness"] = -action_smoothness_penalty
@@ -561,15 +571,12 @@ class PosTrackingEnv(DirectRLEnv):
         if action.shape[0] != n_envs:
             raise ValueError(f"DG-PPO reward got {action.shape[0]} action rows for {n_envs} observations.")
 
-
-        """
-        I would like to pursue the second proposed approach. I think though the best all-round decision may be to do some buffer in [pos_tracking_env.py](source/isaac_pursuit_evasion/isaac_pursuit_evasion/tasks/direct/pos_tracking/pos_tracking_env.py) . Also because if I want to include action smoothness, I need to have some info about the past actions and may be tricky without, but if you can think of an alternative good solution do propose it.
-        """
-
         pos_local = agent_state[:, 0, :3]
         goal_pos = goal_state[:, 0, :3]
         pos_error = torch.linalg.vector_norm(goal_pos - pos_local, dim=-1)
-        rewards = float(self.cfg.reward_pos) * torch.exp(-float(self.cfg.reward_pos_scale) * pos_error)
+        pos_error_squared = pos_error**2
+        pos_reward = self.cfg.reward_pos * torch.exp(-self.cfg.reward_pos_scale * pos_error_squared)
+        rewards = pos_reward
 
         if self.cfg.flag_yaw_tracking:
             if agent_state.shape[-1] < 15:
@@ -584,16 +591,33 @@ class PosTrackingEnv(DirectRLEnv):
             lin_vel = agent_state[:, 0, 3:6]
             rewards = rewards - float(self.cfg.reward_lin_vel) * torch.linalg.vector_norm(lin_vel, dim=-1)
 
-        body_rate_weight = float(self.cfg.reward_body_rates)
-        if body_rate_weight != 0.0:
+        body_rate_roll_pitch_weight = float(self.cfg.reward_body_rates_roll_pitch)
+        body_rate_yaw_weight = float(self.cfg.reward_body_rates_yaw)
+        if body_rate_roll_pitch_weight != 0.0 or body_rate_yaw_weight != 0.0:
+            if reward_aux is None or "body_rates" not in reward_aux:
+                raise RuntimeError("DG-PPO reward recompute requires pre-step 'body_rates' auxiliary data.")
             body_rates = reward_aux["body_rates"].to(device=self.device, dtype=agent_state.dtype).reshape(n_envs, 3)
-            rewards = rewards - body_rate_weight * torch.linalg.vector_norm(body_rates, dim=-1)
+            roll_pitch = torch.sum(body_rates[:, :2] ** 2, dim=-1)
+            yaw = body_rates[:, 2] ** 2
+            rewards = rewards - body_rate_roll_pitch_weight * roll_pitch - body_rate_yaw_weight * yaw
 
         if self.cfg.flag_action_smoothness_penalty:
-            raise RuntimeError(
-                "DG-PPO observation-aligned reward cannot reproduce action smoothness because previous actions "
-                "are not part of the stored graph observation."
+            if reward_aux is None or "action_diff" not in reward_aux:
+                raise RuntimeError("DG-PPO reward recompute requires pre-step 'action_diff' auxiliary data.")
+            action_diff = reward_aux["action_diff"].to(device=self.device, dtype=agent_state.dtype).reshape(n_envs, -1)
+            if action_diff.shape[1] < 4:
+                raise ValueError(f"DG-PPO action_diff needs at least 4 action components, got {action_diff.shape[1]}.")
+            action_delta_sq = action_diff**2
+            action_delta_rpy = torch.sum(action_delta_sq[:, :3], dim=-1)
+            action_delta_thrust = action_delta_sq[:, 3]
+            smooth_weight_default = float(getattr(self.cfg, "reward_action_smoothness", 0.0))
+            smooth_weight_rpy_cfg = getattr(self.cfg, "reward_action_smoothness_rpy", None)
+            smooth_weight_thrust_cfg = getattr(self.cfg, "reward_action_smoothness_thrust", None)
+            smooth_weight_rpy = smooth_weight_default if smooth_weight_rpy_cfg is None else float(smooth_weight_rpy_cfg)
+            smooth_weight_thrust = (
+                smooth_weight_default if smooth_weight_thrust_cfg is None else float(smooth_weight_thrust_cfg)
             )
+            rewards = rewards - smooth_weight_rpy * action_delta_rpy - smooth_weight_thrust * action_delta_thrust
 
         return rewards
 
@@ -1419,7 +1443,7 @@ class PosTrackingEnv(DirectRLEnv):
         return self._last_reward_components
 
     def get_dgppo_reward_auxiliary_data(self) -> dict[str, torch.Tensor]:
-        return {"body_rates": self._last_body_rates}
+        return {key: value.detach().clone() for key, value in self._dgppo_reward_aux.items()}
 
     def get_last_episode_status(self) -> torch.Tensor:
         return self._last_episode_status
