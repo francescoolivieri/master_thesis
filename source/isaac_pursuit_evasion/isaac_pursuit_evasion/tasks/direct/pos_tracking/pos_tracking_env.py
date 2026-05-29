@@ -77,6 +77,12 @@ class PosTrackingEnv(DirectRLEnv):
                 f"Unsupported ray_caster_observation_mode '{cfg.ray_caster_observation_mode}'. "
                 f"Expected one of {sorted(valid_ray_modes)}."
             )
+        valid_ray_data = {"xy", "distances"}
+        if cfg.ray_caster_observation_data not in valid_ray_data:
+            raise ValueError(
+                f"Unsupported ray_caster_observation_data '{cfg.ray_caster_observation_data}'. "
+                f"Expected one of {sorted(valid_ray_data)}."
+            )
         cfg.enable_ray_caster = True
         cfg.observation_space = self._compute_obs_dim(cfg)
         cfg.state_space = cfg.observation_space
@@ -178,6 +184,7 @@ class PosTrackingEnv(DirectRLEnv):
         self._reference_pillar_clearance = float(self._pillar_collision_radius + self.cfg.reference_obstacle_clearance)
         self._graph_state_dim = self._compute_graph_state_dim(self.cfg)
         self._num_obstacle_obs = self._compute_obstacle_obs_count(self.cfg)
+        self._obstacle_obs_dim = self._compute_obstacle_obs_dim(self.cfg)
 
         self._ref_pos_min = torch.tensor(self.cfg.ref_pos_min, device=self.device, dtype=torch.float32)
         self._ref_pos_max = torch.tensor(self.cfg.ref_pos_max, device=self.device, dtype=torch.float32)
@@ -303,21 +310,24 @@ class PosTrackingEnv(DirectRLEnv):
         # Goal state: pos only (3) — vel is always zero for now, omitted
         goal_pos = self._reference_pos                          # (E, 3)
 
-        # Obstacle state: xy only, flattened — vel/z always zero, omitted.
+        # Obstacle state, flattened.
         if self.cfg.obstacle_observation_mode == "none":
-            obstacle_xy_flat = agent_pos.new_empty(self.num_envs, 0)
+            obstacle_flat = agent_pos.new_empty(self.num_envs, 0)
         elif self.cfg.obstacle_observation_mode == "ray_caster":
-            obstacle_xy_flat = self._get_ray_obstacle_points_xy(env_origins, agent_pos).reshape(self.num_envs, -1)
+            if self.cfg.ray_caster_observation_data == "distances":
+                obstacle_flat = self._get_ray_obstacle_distances(env_origins, agent_pos).reshape(self.num_envs, -1)
+            else:
+                obstacle_flat = self._get_ray_obstacle_points_xy(env_origins, agent_pos).reshape(self.num_envs, -1)
         elif self._num_pillars > 0:
-            obstacle_xy_flat = (
+            obstacle_flat = (
                 self._pillar_positions_xy.unsqueeze(0).expand(self.num_envs, -1, -1)
                 .reshape(self.num_envs, -1)
             )  # (E, O*2)
         else:
-            obstacle_xy_flat = agent_pos.new_empty(self.num_envs, 0)
+            obstacle_flat = agent_pos.new_empty(self.num_envs, 0)
 
-        # Layout: [agent_state(S), goal_pos(3), obstacle_xy(O*2)]
-        obs = torch.cat([agent_state_flat, goal_pos, obstacle_xy_flat], dim=-1)
+        # Layout: [agent_state(S), goal_pos(3), obstacle_data]
+        obs = torch.cat([agent_state_flat, goal_pos, obstacle_flat], dim=-1)
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
@@ -496,6 +506,11 @@ class PosTrackingEnv(DirectRLEnv):
     @property
     def graph_obs_layout(self) -> dict:
         """Return the layout of the flat policy-obs vector for graph construction."""
+        if self._num_obstacle_obs > 0 and self._obstacle_obs_dim != 2:
+            raise RuntimeError(
+                "Graph observations need obstacle xy positions. "
+                "Use ray_caster_observation_data='xy' for DG-PPO graph runs."
+            )
         agent_end = self._graph_state_dim * self.num_agents
         goal_end = agent_end + 3 * self.num_agents
         obstacles_end = goal_end + self._num_obstacle_obs * 2
@@ -585,8 +600,12 @@ class PosTrackingEnv(DirectRLEnv):
 
     @staticmethod
     def _compute_obs_dim(cfg: PosTrackingEnvCfg) -> int:
-        # agent state + goal pos (3) + obstacle xy flat (O * 2)
-        return PosTrackingEnv._compute_graph_state_dim(cfg) + 3 + PosTrackingEnv._compute_obstacle_obs_count(cfg) * 2
+        # agent state + goal pos (3) + obstacle data
+        return (
+            PosTrackingEnv._compute_graph_state_dim(cfg)
+            + 3
+            + PosTrackingEnv._compute_obstacle_obs_count(cfg) * PosTrackingEnv._compute_obstacle_obs_dim(cfg)
+        )
 
     @staticmethod
     def _compute_graph_state_dim(cfg: PosTrackingEnvCfg) -> int:
@@ -603,6 +622,14 @@ class PosTrackingEnv(DirectRLEnv):
         if cfg.obstacle_observation_mode == "pillars" and cfg.enable_pillars:
             return len(cfg.pillar_positions_xy)
         return 0
+
+    @staticmethod
+    def _compute_obstacle_obs_dim(cfg: PosTrackingEnvCfg) -> int:
+        if cfg.obstacle_observation_mode == "none":
+            return 0
+        if cfg.obstacle_observation_mode == "ray_caster":
+            return 1 if cfg.ray_caster_observation_data == "distances" else 2
+        return 2
 
     @staticmethod
     def _make_ray_caster_cfg(cfg: PosTrackingEnvCfg) -> MultiMeshRayCasterCfg:
@@ -659,6 +686,26 @@ class PosTrackingEnv(DirectRLEnv):
         *,
         mode: str | None = None,
     ) -> torch.Tensor:
+        xy, _dist = self._get_ray_obstacle_hits(env_origins, agent_pos, mode=mode)
+        return xy
+
+    def _get_ray_obstacle_distances(
+        self,
+        env_origins: torch.Tensor,
+        agent_pos: torch.Tensor,
+        *,
+        mode: str | None = None,
+    ) -> torch.Tensor:
+        _xy, dist = self._get_ray_obstacle_hits(env_origins, agent_pos, mode=mode)
+        return dist
+
+    def _get_ray_obstacle_hits(
+        self,
+        env_origins: torch.Tensor,
+        agent_pos: torch.Tensor,
+        *,
+        mode: str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if self._ray_caster is None:
             raise RuntimeError(
                 "Ray-caster obstacle observations requested, but the ray-caster sensor is not available."
@@ -680,11 +727,10 @@ class PosTrackingEnv(DirectRLEnv):
             )
 
         sensor_w = self._ray_caster.data.pos_w
-        miss_dist = float(self.cfg.ray_caster_max_distance) + 1e3
+        max_dist = float(self.cfg.ray_caster_max_distance)
+        miss_dist = max_dist + 1e3
 
         inside_obstacle = self._agent_center_inside_ray_obstacle_mask(agent_pos)
-        pad_xy = agent_pos[:, :2] + agent_pos.new_tensor([miss_dist, 0.0])
-        pad_xy = torch.where(inside_obstacle.unsqueeze(-1), agent_pos[:, :2], pad_xy)
 
         ray_dirs_w = getattr(self._ray_caster, "_ray_directions_w", None)
         if ray_dirs_w is None or ray_dirs_w.shape[1] != rays:
@@ -700,24 +746,28 @@ class PosTrackingEnv(DirectRLEnv):
 
         xy = hits_w[..., :2] - env_origins[:, None, :2]
         dist = torch.norm(hits_w - sensor_w.unsqueeze(1), dim=-1)
-        ok = torch.isfinite(hits_w).all(dim=-1) & (dist <= float(self.cfg.ray_caster_max_distance))
+        ok = torch.isfinite(hits_w).all(dim=-1) & (dist <= max_dist)
+        obs_dist = torch.where(ok, dist, torch.full_like(dist, max_dist))
         xy = torch.where(ok.unsqueeze(-1), xy, miss_xy)
         if inside_obstacle.any():
             current_xy = agent_pos[:, None, :2].expand(-1, rays, -1)
             xy = torch.where(inside_obstacle[:, None, None], current_xy, xy)
             ok = ok | inside_obstacle[:, None]
             dist = torch.where(inside_obstacle[:, None], torch.zeros_like(dist), dist)
+            obs_dist = torch.where(inside_obstacle[:, None], torch.zeros_like(obs_dist), obs_dist)
 
         if mode == "top_k_hits":
             dist = torch.where(ok, dist, torch.full_like(dist, float("inf")))
             k = min(want, rays)
             _, order = torch.topk(dist, k=k, dim=1, largest=False)
             xy = torch.gather(xy, 1, order.unsqueeze(-1).expand(-1, -1, 2))
+            obs_dist = torch.gather(obs_dist, 1, order)
         else:
             k = min(want, rays)
             xy = xy[:, :k]
+            obs_dist = obs_dist[:, :k]
 
-        return xy
+        return xy, obs_dist
 
     def _agent_center_inside_ray_obstacle_mask(self, agent_pos: torch.Tensor) -> torch.Tensor:
         # Two types of obstacles: pillars and walls of the arena.

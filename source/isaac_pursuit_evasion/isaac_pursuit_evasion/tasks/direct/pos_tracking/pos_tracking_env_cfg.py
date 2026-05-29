@@ -111,6 +111,7 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     # to feed the nearest ray hits to the policy and DG-PPO graph builder.
     enable_ray_caster: bool = False
     ray_caster_observation_mode: Literal["ray_ordered_hits", "top_k_hits"] = "ray_ordered_hits"
+    ray_caster_observation_data: Literal["xy", "distances"] = "xy"
     ray_caster_top_k_hits: int = 8
     ray_caster_num_rays: int = 32
     ray_caster_max_distance: float = 8.0

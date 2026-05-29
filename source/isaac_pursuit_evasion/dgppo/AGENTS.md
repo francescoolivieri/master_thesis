@@ -1,6 +1,6 @@
 # DG-PPO Port Instructions
 
-Scope: the PyTorch/skrl DG-PPO port in this directory along with the parity suite.
+Scope: the PyTorch/skrl DG-PPO port in this directory.
 
 ## Source Of Truth
 
@@ -13,15 +13,16 @@ Use these JAX reference files when changing behavior:
 - `dgppo-main/dgppo/nn/gnn.py`, `dgppo-main/dgppo/nn/mlp.py`, `dgppo-main/dgppo/nn/rnn.py`: neural network building blocks.
 - `dgppo-main/dgppo/algo/utils.py`: Dec-EFOCP GAE and kernel utilities.
 - `dgppo-main/dgppo/env/lidar_env/base.py`: simulation environment of reference.
-- `dgppo-main/dgppo/parity/` and `dgppo-main/parity_artifacts`: fixture and tolerance tooling.
+- `dgppo-main/dgppo/parity/` and `dgppo-main/parity_artifacts`: optional reference fixtures and reports, useful only when they clarify the behavior being ported.
 
 ## Porting Priorities
 
 - Keep tensor shape names explicit in comments.
 - Match the reference update structure: stochastic rollout for policy/Vl, deterministic rollout for Vh targets, CBF-derived advantages for policy updates.
 - Keep the deterministic/stochastic environment split clear. Current code requires an even `num_envs >= 2`.
-- Keep modularity support for the actor/critics newtorks, independently of current default config. 
+- Keep modularity support for the actor/critics networks, independently of current default config.
 - Keep graph construction compatible with the IsaacLab observation layout in `pos_tracking_env.py`.
+- Prefer antirez-style simplicity: small readable functions, plain data flow, and clear intuition. Avoid clever machinery unless it removes real complexity.
 
 ## Implementation Notes
 
@@ -30,10 +31,12 @@ Use these JAX reference files when changing behavior:
 - `dgppo_memory.py` stores stochastic and deterministic rollout splits.
 - `dgppo_models.py` owns policy/value modules and the squashed Gaussian distribution.
 - `utils.py` owns graph data structures, GNN layers, GAE, CBF advantage, and PPO surrogate helpers.
-- Do not sacrifice code readability and cleanliness for parity support.
+- Do not sacrifice code readability and cleanliness for exact fixture matching.
 
 ## Validation
 
-- For parity-sensitive changes, run `source/isaac_pursuit_evasion/dgppo/parity_suite` first; these tests must call production DG-PPO code.
-- For runtime integration changes, run the shortest practical DG-PPO headless smoke test through `scripts/skrl/train.py` after parity checks pass.
+- For algorithm changes, compare with the JAX reference when useful, then write the smallest focused check that can catch the likely mistake. Prefer varied hand-built cases over a fixed parity gate.
+- Good checks include tensor-shape assertions, finite-value checks, kernel/math probes, update-step smoke tests, and short synthetic rollouts with intentionally different graph sizes or masks.
+- For runtime integration changes, run the shortest practical DG-PPO headless smoke test through `scripts/skrl/train.py`.
+- Temporary validation scripts are fine when they make the check clearer; delete them before finishing and report what they tested.
 - If a full IsaacLab or JAX dependency stack is unavailable, document exactly which validation could not run.

@@ -7,9 +7,11 @@ This directory is primarily a source reference for the PyTorch/skrl port in `sou
 ## Rules
 
 - Do not modify reference algorithm files unless the user explicitly asks for changes in `dgppo-main`.
-- Prefer reading these files to understand intended behavior, tensor shapes, schedules, and parity checkpoints.
-- Keep parity artifacts and logs as generated/reference data. Do not delete or rewrite them without an explicit cleanup request.
-- If exporting new fixtures, keep outputs under `dgppo-main/parity_artifacts/` and record the command used.
+- Prefer reading these files to understand intended behavior, tensor shapes, schedules, and algorithm structure.
+- Keep existing artifacts and logs as generated/reference data. Do not delete or rewrite them without an explicit cleanup request.
+- Treat parity fixtures as optional reference material, not as the default validation strategy for the PyTorch port.
+- If exporting new fixtures or reports, keep outputs under `dgppo-main/parity_artifacts/` and record the command used.
+- Keep notes and helper code simple, direct, and easy to read.
 
 ## Useful Entry Points
 
@@ -18,5 +20,5 @@ This directory is primarily a source reference for the PyTorch/skrl port in `sou
 - `dgppo/algo/module/`: policy and value network modules.
 - `dgppo/nn/`: GNN, MLP, and RNN modules.
 - `dgppo/trainer/`: rollout and trainer abstractions.
-- `dgppo/parity/`: deterministic fixtures, comparison reports, and checkpoint manifest.
-- `parity_checks.py`: CLI for exporting and comparing parity fixtures.
+- `dgppo/parity/`: optional deterministic fixtures, comparison reports, and checkpoint manifest.
+- `parity_checks.py`: optional CLI for exporting and comparing parity fixtures.

@@ -6,6 +6,7 @@ env:
   obstacle_observation_mode: ray_caster
   enable_ray_caster: true
   ray_caster_observation_mode: ray_ordered_hits
+  ray_caster_observation_data: distances
   terminate_on_safety_violation: true
 
 models:

@@ -9,13 +9,15 @@ This repository is an Isaac Sim / IsaacLab project for Crazyflie Brushless reinf
 - `scripts/analyze*.py`: run-output analysis helpers.
 - `docs/`: human-facing project notes and task guides.
 - `source/isaac_pursuit_evasion/`: local IsaacLab extension package.
-- `source/isaac_pursuit_evasion/dgppo/`: in-progress PyTorch/skrl DG-PPO port and parity suite.
+- `source/isaac_pursuit_evasion/dgppo/`: in-progress PyTorch/skrl DG-PPO port.
 - `source/isaac_pursuit_evasion/isaac_pursuit_evasion/tasks/direct/pos_tracking/`: Crazyflie position-tracking task and agent configs.
-- `dgppo-main/`: JAX DG-PPO reference implementation and parity fixture tooling.
+- `dgppo-main/`: JAX DG-PPO reference implementation.
 
 ## Working Rules
 
 - Keep changes narrow. Do not remove small comments present to help user readability of the code.
+- Prefer short, simple, clean code in the spirit of antirez/Redis style: readable control flow, good names, and straightforward intuition over clever abstractions.
+- Avoid over-complicated helpers, frameworky indirection, and speculative generality. Add abstractions only when they make the code easier to read now.
 - Do not edit generated run output, W&B output, checkpoints, `__pycache__`, or large `.npz`/`.pkl` artifacts unless the user explicitly asks.
 - Treat existing uncommitted changes as user work. Do not restore deleted or modified files unless asked.
 
@@ -37,7 +39,8 @@ If IsaacLab imports fail, first report that the IsaacLab environment appears ina
 - For documentation-only changes, no simulator validation is required.
 - For Python changes outside Isaac-dependent runtime paths, prefer a targeted import or unit-style smoke test when possible.
 - For IsaacLab environment or training changes, run the smallest practical headless smoke test and state if the local environment prevents it.
-- For important DG-PPO algorithm changes, check logic by comparing it with the reference code and if thought highly needed, perform a parity checks or focused tensor-shape/kernel check. Do not force parity checks sacrificing code readability/correctness.
+- For important DG-PPO algorithm changes, compare with the JAX reference where it helps, then design focused checks around the behavior at risk: tensor shapes, kernels, rollout/update math, numerical sanity, and short varied scenarios.
+- Do not rely on a standing parity suite as the default gate. Prefer stronger, situation-specific tests or temporary improvised scripts for the question being checked.
 - To verify behaviour of the agent in isaaclab in certain settings, do testing scripts and runs in headless with few agents. Important is to delete the manufactured scripts afterwards and report the tests/findings to the user.
 
 ## DG-PPO Port Goal
