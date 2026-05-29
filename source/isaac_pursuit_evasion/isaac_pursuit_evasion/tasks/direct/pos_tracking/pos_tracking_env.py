@@ -697,7 +697,7 @@ class PosTrackingEnv(DirectRLEnv):
         mode: str | None = None,
     ) -> torch.Tensor:
         _xy, dist = self._get_ray_obstacle_hits(env_origins, agent_pos, mode=mode)
-        return dist
+        return dist / float(self.cfg.ray_caster_max_distance)
 
     def _get_ray_obstacle_hits(
         self,

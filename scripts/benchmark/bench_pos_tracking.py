@@ -239,6 +239,7 @@ _TRAINING_ENV_COMPAT_KEYS = (
     "obstacle_observation_mode",
     "enable_ray_caster",
     "ray_caster_observation_mode",
+    "ray_caster_observation_data",
     "ray_caster_top_k_hits",
     "ray_caster_num_rays",
     "ray_caster_max_distance",
@@ -1851,6 +1852,7 @@ def main(env_cfg, agent_cfg: dict):
         f"obstacle_observation_mode={getattr(env_cfg, 'obstacle_observation_mode', None)}, "
         f"enable_ray_caster={getattr(env_cfg, 'enable_ray_caster', None)}, "
         f"ray_caster_observation_mode={getattr(env_cfg, 'ray_caster_observation_mode', None)}, "
+        f"ray_caster_observation_data={getattr(env_cfg, 'ray_caster_observation_data', None)}, "
         f"ray_caster_top_k_hits={getattr(env_cfg, 'ray_caster_top_k_hits', None)}, "
         f"ray_caster_num_rays={getattr(env_cfg, 'ray_caster_num_rays', None)}",
         flush=True,
@@ -2053,6 +2055,7 @@ def main(env_cfg, agent_cfg: dict):
         "fixed_goals": [list(goal) for goal in fixed_goals],
         "obstacle_observation_mode": str(getattr(base_env.cfg, "obstacle_observation_mode", "")),
         "ray_caster_observation_mode": str(getattr(base_env.cfg, "ray_caster_observation_mode", "")),
+        "ray_caster_observation_data": str(getattr(base_env.cfg, "ray_caster_observation_data", "")),
         "ray_caster_top_k_hits": int(getattr(base_env.cfg, "ray_caster_top_k_hits", 0)),
         "ray_caster_num_rays": int(getattr(base_env.cfg, "ray_caster_num_rays", 0)),
         "terminate_on_safety_violation": bool(base_env.cfg.terminate_on_safety_violation),

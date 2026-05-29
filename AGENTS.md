@@ -39,6 +39,7 @@ If IsaacLab imports fail, first report that the IsaacLab environment appears ina
 - For documentation-only changes, no simulator validation is required.
 - For Python changes outside Isaac-dependent runtime paths, prefer a targeted import or unit-style smoke test when possible.
 - For IsaacLab environment or training changes, run the smallest practical headless smoke test and state if the local environment prevents it.
+- When modifying env observation/config contracts, check downstream consumers too: agent YAML overrides, `scripts/skrl/train.py`, `scripts/skrl/play.py`, and especially `scripts/benchmark/bench_pos_tracking.py`. Preserve checkpoint/run config compatibility keys, printed layout summaries, and metrics output; run a tiny headless benchmark smoke when practical.
 - For important DG-PPO algorithm changes, compare with the JAX reference where it helps, then design focused checks around the behavior at risk: tensor shapes, kernels, rollout/update math, numerical sanity, and short varied scenarios.
 - Do not rely on a standing parity suite as the default gate. Prefer stronger, situation-specific tests or temporary improvised scripts for the question being checked.
 - To verify behaviour of the agent in isaaclab in certain settings, do testing scripts and runs in headless with few agents. Important is to delete the manufactured scripts afterwards and report the tests/findings to the user.
