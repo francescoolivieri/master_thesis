@@ -203,6 +203,7 @@ class PosTrackingEnv(DirectRLEnv):
         self._last_reward_components: dict[str, torch.Tensor] = {}
         self._last_body_rates = torch.zeros(self.num_envs, 3, device=self.device)
         self._last_episode_status = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+        self._last_step_snapshot: dict[str, torch.Tensor] = {}
 
         self._body_x_axis = torch.tensor([1.0, 0.0, 0.0], device=self.device)
 
@@ -448,6 +449,17 @@ class PosTrackingEnv(DirectRLEnv):
         episode_status[truncated] = REASON_TIMEOUT
         episode_status[terminated & invalid] = REASON_INVALID
         self._last_episode_status = episode_status
+        self._last_step_snapshot = {
+            "pos_local": pos_local.detach().clone(),
+            "vel_world": self._robot.data.root_lin_vel_w.detach().clone(),
+            "quat": self._robot.data.root_quat_w.detach().clone(),
+            "ang_vel": self._robot.data.root_ang_vel_b.detach().clone(),
+            "ref_pos": self._reference_pos.detach().clone(),
+            "ref_yaw": self._reference_yaw.detach().clone(),
+            "altitude_limit": altitude_limit.detach().clone(),
+            "xy_limit": xy_limit.detach().clone(),
+            "pillar_collision": pillar_collision.detach().clone(),
+        }
 
         return terminated, truncated
 
@@ -1414,6 +1426,9 @@ class PosTrackingEnv(DirectRLEnv):
 
     def get_last_done_reasons(self) -> torch.Tensor:
         return self.get_last_episode_status()
+
+    def get_last_step_snapshot(self) -> dict[str, torch.Tensor]:
+        return self._last_step_snapshot
 
     def get_reference_pose(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self._reference_pos.clone(), self._reference_yaw.clone()
