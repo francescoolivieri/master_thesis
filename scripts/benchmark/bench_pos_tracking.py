@@ -1197,7 +1197,7 @@ class GoalScenario:
 
 
 DIFFICULTY_ORDER = ("Easy", "Medium", "Hard")
-DIFFICULTY_PHASE = {"Easy": 1, "Medium": 3, "Hard": 5}
+DIFFICULTY_PHASE = {"Easy": 2, "Medium": 3, "Hard": 4}
 PATH_TYPE_CODES = {
     "straight": 0,
     "circle": 1,
@@ -1490,8 +1490,9 @@ class ScenarioManager:
         env._scenario_phase[env_id] = int(data["phase"])
         env._scenario_fallback[env_id] = bool(data.get("fallback", False))
         env._evader_path_type[env_id] = int(data["path_type"])
-        env._evader_pos_path[env_id] = data["evader_pos"].to(device=device)
-        env._evader_vel_path[env_id] = data["evader_vel"].to(device=device)
+        env._evader_waypoints[env_id] = env._dense_path_to_waypoints(
+            data["evader_pos"].to(device=device)
+        )
         env._pursuer_start_pos[env_id] = data["pursuer_start"].to(device=device)
         env._reference_pos[env_id] = data["evader_pos"][0].to(device=device)
         env._reference_yaw[env_id, 0] = float(data["evader_yaw"])
@@ -1501,8 +1502,9 @@ class ScenarioManager:
 
         env._static_obstacle_positions_xy[env_id] = data["static_xy"].to(device=device)
         env._static_obstacle_active[env_id] = data["static_active"].to(device=device)
-        env._dynamic_obstacle_pos_path[env_id] = data["dynamic_pos"].to(device=device)
-        env._dynamic_obstacle_vel_path[env_id] = data["dynamic_vel"].to(device=device)
+        env._dynamic_obstacle_waypoints[env_id] = env._dense_dynamic_path_to_waypoints(
+            data["dynamic_pos"].to(device=device)
+        )
         env._dynamic_obstacle_active[env_id] = data["dynamic_active"].to(device=device)
         env._dynamic_obstacle_positions[env_id] = data["dynamic_pos"][0].to(device=device)
 
@@ -1553,7 +1555,7 @@ class ScenarioManager:
         return self._pack_candidate(path_kind, xy, pursuer_xy, desired_static=2, desired_dynamic=0, variant=variant)
 
     def _candidate_medium(self, scenario_idx: int, variant: int) -> dict[str, Any] | None:
-        desired_static = 5 + scenario_idx % 4
+        desired_static = 3 + scenario_idx % 3
         if scenario_idx % 2 == 0:
             points = [(-1.55, 0.85), (-0.75, 0.75), (-0.25, 0.05), (0.55, -0.2), (1.45, -0.75)]
             pursuer_xy = (1.65, 0.95)
@@ -1571,8 +1573,8 @@ class ScenarioManager:
         )
 
     def _candidate_hard(self, scenario_idx: int, variant: int) -> dict[str, Any] | None:
-        desired_static = 6 + scenario_idx % 3
-        desired_dynamic = 2 + scenario_idx % 2
+        mixed_counts = ((3, 1), (4, 1), (3, 2), (5, 1), (4, 2), (3, 3))
+        desired_static, desired_dynamic = mixed_counts[scenario_idx % len(mixed_counts)]
         if scenario_idx % 2 == 0:
             points = [(-1.55, -0.85), (-0.75, -0.65), (-0.2, -0.1), (0.55, 0.15), (1.45, 0.85)]
             pursuer_xy = (1.65, -1.0)
@@ -1671,7 +1673,7 @@ class ScenarioManager:
     def _difficulty_for_counts(self, static_active: torch.Tensor, dynamic_active: torch.Tensor) -> str:
         if int(dynamic_active.to(torch.int32).sum().item()) > 0:
             return "Hard"
-        if int(static_active.to(torch.int32).sum().item()) >= 5:
+        if int(static_active.to(torch.int32).sum().item()) >= 3:
             return "Medium"
         return "Easy"
 
@@ -1683,11 +1685,38 @@ class ScenarioManager:
             if sampled is not None:
                 sampled["fallback"] = True
                 sampled["path_kind"] = f"env_phase_{phase}"
-                return sampled
+                return self._dense_env_sample(sampled)
         sampled = self.base_env._fallback_pursuit_scenario(phase)
         sampled["fallback"] = True
         sampled["path_kind"] = f"env_fallback_phase_{phase}"
-        return sampled
+        return self._dense_env_sample(sampled)
+
+    def _dense_env_sample(self, data: dict[str, Any]) -> dict[str, Any]:
+        if "evader_pos" in data:
+            return data
+
+        env = self.base_env
+        out = dict(data)
+        evader_pos = env._resample_path(data["evader_waypoints"], env._path_steps)
+        evader_vel = env._path_velocity(evader_pos)
+        dynamic_wp = data["dynamic_waypoints"]
+        if dynamic_wp.shape[1] > 0:
+            dynamic_pos = torch.stack(
+                [env._resample_path(dynamic_wp[:, slot], env._path_steps) for slot in range(dynamic_wp.shape[1])],
+                dim=1,
+            )
+            dynamic_vel = torch.stack(
+                [env._path_velocity(dynamic_pos[:, slot]) for slot in range(dynamic_pos.shape[1])],
+                dim=1,
+            )
+        else:
+            dynamic_pos = dynamic_wp.new_zeros(env._path_steps, 0, 3)
+            dynamic_vel = torch.zeros_like(dynamic_pos)
+        out["evader_pos"] = evader_pos
+        out["evader_vel"] = evader_vel
+        out["dynamic_pos"] = dynamic_pos
+        out["dynamic_vel"] = dynamic_vel
+        return out
 
     def _valid_pursuit_scenario(self, data: dict[str, Any], difficulty: str) -> bool:
         env = self.base_env
@@ -1704,7 +1733,8 @@ class ScenarioManager:
         if not bool(torch.all((evader_pos >= lo) & (evader_pos <= hi)).item()):
             return False
         speed = torch.linalg.vector_norm(evader_vel, dim=-1)
-        if bool(torch.any(speed > float(env.cfg.pursuit_evader_max_speed) * 1.05).item()):
+        evader_speed_hi = float(getattr(env.cfg, "pursuit_evader_speed_range", (0.0, 0.0))[1])
+        if bool(torch.any(speed > evader_speed_hi * 1.05).item()):
             return False
 
         start_dist = torch.linalg.vector_norm(pursuer_start[:2] - evader_pos[0, :2])
@@ -1712,25 +1742,15 @@ class ScenarioManager:
             return False
         if not env._point_free(pursuer_start, static_xy, static_active, dynamic_pos, dynamic_active):
             return False
-        if env._boxed_in(pursuer_start, static_xy, static_active, dynamic_pos, dynamic_active):
-            return False
-        if not env._has_approx_connection(
-            pursuer_start[:2],
-            evader_pos[0, :2],
-            static_xy,
-            static_active,
-            dynamic_pos[0],
-            dynamic_active,
-        ):
-            return False
 
         static_count = int(static_active.to(torch.int32).sum().item())
         dynamic_count = int(dynamic_active.to(torch.int32).sum().item())
-        if difficulty == "Easy" and static_count != 2:
+        if difficulty == "Easy" and (static_count < 1 or static_count > 2 or dynamic_count != 0):
             return False
-        if difficulty == "Medium" and (static_count < 5 or static_count > 8 or dynamic_count != 0):
+        if difficulty == "Medium" and (static_count < 2 or static_count > 5 or dynamic_count != 0):
             return False
-        if difficulty == "Hard" and (static_count < 5 or dynamic_count < 2):
+        total_count = static_count + dynamic_count
+        if difficulty == "Hard" and (total_count < 4 or total_count > 6 or dynamic_count < 1 or dynamic_count > 3):
             return False
         return True
 
@@ -1782,8 +1802,8 @@ class ScenarioManager:
             + float(env.cfg.pursuit_evader_radius)
             + float(env.cfg.pursuit_evader_tube_margin)
         )
-        d_evader = torch.linalg.vector_norm(evader_pos[:, :2] - candidate, dim=-1)
-        if float(torch.min(d_evader).item()) <= safe_evader:
+        d_evader = env._point_path_distance_xy(candidate, evader_pos[:, :2])
+        if float(d_evader[0].item()) <= safe_evader:
             return False
         safe_start = (
             float(env.cfg.pillar_radius)
@@ -2632,19 +2652,20 @@ def main(env_cfg, agent_cfg: dict):
         env_cfg.enable_pursuit_evasion_curriculum = True
         env_cfg.enable_walls = True
         env_cfg.enable_pillars = True
-        env_cfg.pursuit_max_static_obstacles = max(8, int(getattr(env_cfg, "pursuit_max_static_obstacles", 8)))
+        env_cfg.pursuit_max_static_obstacles = max(5, int(getattr(env_cfg, "pursuit_max_static_obstacles", 5)))
         env_cfg.pursuit_max_dynamic_obstacles = max(3, int(getattr(env_cfg, "pursuit_max_dynamic_obstacles", 3)))
         env_cfg.pursuit_scenario_attempts = max(300, int(getattr(env_cfg, "pursuit_scenario_attempts", 300)))
         env_cfg.ref_update_interval_s = 0.0
+        evader_speed_range = tuple(getattr(env_cfg, "pursuit_evader_speed_range", (0.6, 1.0)))
+        evader_speed_lo = max(0.0, float(evader_speed_range[0]))
+        evader_speed_hi = max(evader_speed_lo, float(evader_speed_range[1]))
         if getattr(env_cfg, "control_mode", "") == "RL_velocity":
             xy_speed = min(abs(float(env_cfg.vel_scale[0])), abs(float(env_cfg.vel_scale[1])))
             desired_evader_cap = min(1.35, max(0.9, 0.6 * xy_speed))
-            env_cfg.pursuit_evader_max_speed = max(
-                float(getattr(env_cfg, "pursuit_evader_max_speed", 1.25)),
-                desired_evader_cap,
-            )
+            evader_speed_hi = max(evader_speed_hi, desired_evader_cap)
         else:
-            env_cfg.pursuit_evader_max_speed = max(float(getattr(env_cfg, "pursuit_evader_max_speed", 1.25)), 1.1)
+            evader_speed_hi = max(evader_speed_hi, 1.1)
+        env_cfg.pursuit_evader_speed_range = (evader_speed_lo, evader_speed_hi)
         env_cfg.pursuit_dynamic_max_speed = max(float(getattr(env_cfg, "pursuit_dynamic_max_speed", 0.85)), 0.85)
     env_cfg.use_position_controller = args_cli.policy_mode == "baseline"
     if args_cli.policy_mode == "rl":
@@ -2893,7 +2914,7 @@ def main(env_cfg, agent_cfg: dict):
         "num_steps": total_steps,
         "target_episodes": target_episodes,
         "fixed_goals": [list(goal) for goal in fixed_goals],
-        "pursuit_evader_max_speed": float(getattr(base_env.cfg, "pursuit_evader_max_speed", 0.0)),
+        "pursuit_evader_speed_range": list(getattr(base_env.cfg, "pursuit_evader_speed_range", (0.0, 0.0))),
         "pursuit_dynamic_max_speed": float(getattr(base_env.cfg, "pursuit_dynamic_max_speed", 0.0)),
         "obstacle_observation_mode": str(getattr(base_env.cfg, "obstacle_observation_mode", "")),
         "ray_caster_observation_mode": str(getattr(base_env.cfg, "ray_caster_observation_mode", "")),

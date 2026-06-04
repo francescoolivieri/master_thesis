@@ -148,47 +148,45 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     enable_pursuit_evasion_curriculum: bool = False
     # Filled by train.py from the resolved skrl trainer budget.
     pursuit_curriculum_total_steps: int = 0
-    # Fractions for phases 1..5: easy, static-light, static-heavy, one dynamic, many dynamic.
-    pursuit_curriculum_phase_fractions: tuple[float, ...] = (0.20, 0.15, 0.15, 0.25, 0.25)
+    # Fractions for phases 1..4: static evader, moving light, moving static-heavy, moving mixed.
+    pursuit_curriculum_phase_fractions: tuple[float, ...] = (0.25, 0.25, 0.25, 0.25)
     # Width of the soft handoff between adjacent phases, as a fraction of training.
     pursuit_curriculum_blend_fraction: float = 0.05
-    # Fraction of phase 1 where the evader is fixed in place.
-    pursuit_phase1_fixed_evader_fraction: float = 0.5
+    # Kept for old run configs; phase 1 is fully static in the grid curriculum.
+    pursuit_phase1_fixed_evader_fraction: float = 1.0
+    # Spawn only the obstacle prim slots needed by reached curriculum phases.
+    pursuit_lazy_obstacle_spawning: bool = True
+    pursuit_spawn_static_obstacles: int = 0
+    pursuit_spawn_dynamic_obstacles: int = 0
 
-    # Evader motion families sampled per episode.
-    pursuit_evader_path_types: tuple[str, ...] = (
-        "spline",
-        "zigzag",
-        "sinusoidal",
-        "loop",
-        "figure_eight",
-    )
-    # Path validity: keep the evader away from walls and reject violent motion.
+    # Grid curriculum. Each episode samples a side pursuer spawn, grid obstacles, then A* evader paths.
+    pursuit_grid_cell_size: float = 0.15
+    pursuit_grid_wall_margin: float = 0.25
+    pursuit_pursuer_occupied_side: float = 0.5
+    pursuit_evader_goal_min_distance: float = 1.5
+    pursuit_dynamic_rail_length_range: tuple[float, float] = (0.8, 1.5)
+
+    # Sparse path timing. Each moving episode samples one evader speed and keeps it fixed.
+    pursuit_path_waypoint_dt: float = 0.2
+    pursuit_evader_speed_range: tuple[float, float] = (0.6, 1.0)
+    # Kept for old run configs; the grid curriculum no longer samples macro waypoints.
+    pursuit_evader_macro_waypoints: int = 8
     pursuit_evader_wall_clearance: float = 0.28
     pursuit_evader_radius: float = 0.12
     pursuit_evader_tube_margin: float = 0.14
-    pursuit_evader_max_speed: float = 1.25
-    pursuit_evader_max_accel: float = 8.0
-    pursuit_evader_max_turn_rate: float = 24.0
 
     # Fixed observation/scene slots; inactive obstacles are moved outside the arena.
-    pursuit_max_static_obstacles: int = 8
+    pursuit_max_static_obstacles: int = 5
     pursuit_max_dynamic_obstacles: int = 3
     # Dynamic obstacle geometry and motion cap.
     pursuit_dynamic_obstacle_radius: float = 0.16
     pursuit_dynamic_obstacle_height: float = 1.8
     pursuit_obstacle_clearance: float = 0.08
-    # Some static obstacles are deliberately near, but outside, the evader tube.
-    pursuit_static_interaction_prob: float = 0.45
-    pursuit_static_interaction_distance: float = 0.85
-    pursuit_dynamic_max_speed: float = 0.85
+    pursuit_dynamic_max_speed: float = 0.5
 
-    # Pursuer spawn constraints: not too close, not impossible, and not boxed in.
+    # Pursuer spawn constraints.
     pursuit_pursuer_wall_clearance: float = 0.22
-    pursuit_pursuer_min_evader_distance: float = 0.65
-    pursuit_pursuer_medium_distance: float = 1.8
-    pursuit_pursuer_far_distance: float = 3.1
-    pursuit_pursuer_future_safe_steps: int = 8
+    pursuit_pursuer_min_evader_distance: float = 1.2
     # Whole-scenario retries before declaring the sampled episode infeasible.
     pursuit_scenario_attempts: int = 300
 
