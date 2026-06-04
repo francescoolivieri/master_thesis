@@ -5,6 +5,9 @@ seed: 42
 env:
   obstacle_observation_mode: ray_caster
   enable_ray_caster: true
+  enable_walls: true
+  enable_pillars: true
+  enable_pursuit_evasion_curriculum: true
   ray_caster_observation_mode: ray_ordered_hits
   ray_caster_observation_data: distances
   terminate_on_safety_violation: true
@@ -45,7 +48,7 @@ agent:
   learning_epochs: 5
   mini_batches: 8
 
-  discount_factor: 0.99
+  discount_factor: 0.995
   gae_lambda: 0.95
 
   learning_rate: 1.0e-04

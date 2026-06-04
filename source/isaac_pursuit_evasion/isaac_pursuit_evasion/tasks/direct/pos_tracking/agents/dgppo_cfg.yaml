@@ -4,9 +4,12 @@ seed: 42
 env:
   obstacle_observation_mode: ray_caster
   enable_ray_caster: true
+  enable_walls: true
+  enable_pillars: true
+  enable_pursuit_evasion_curriculum: true
   ray_caster_observation_mode: top_k_hits
   terminate_on_safety_violation: false
-  enable_clip_states: true
+  enable_clip_states: false
   terminate_on_out_of_boundaries: true
 
 # - DG-PPO hyper-parameters, consumed by DGPPOAgentCfg / DGPPOAgent / DGPPORunner
@@ -22,7 +25,7 @@ agent:
   obs_radius: 8.0
 
   # PPO / GAE
-  rollouts:         416       # steps collected per update (per env), max 416 (episode 8.32 sec)
+  rollouts:         64       # steps collected per update (per env), max 416 (episode 8.32 sec)
   learning_epochs:  2
   mini_batches:     4
 
@@ -31,7 +34,7 @@ agent:
   bootstrap_on_truncated: false
 
   # Learning rates
-  lr_policy: 2.0e-4
+  lr_policy: 3.0e-4
   lr_vl:     1.0e-3
   lr_vh:     1.0e-3
 

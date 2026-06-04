@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -26,7 +27,7 @@ parser.add_argument(
     help="Checkpoint family to evaluate.",
 )
 parser.add_argument("--num-envs", type=int, default=4, help="Number of parallel benchmark environments.")
-parser.add_argument("--num-steps", type=int, default=2500, help="Simulation steps to run.")
+parser.add_argument("--num-steps", type=int, default=12000, help="Simulation steps to run.")
 parser.add_argument(
     "--num-episodes",
     type=int,
@@ -71,9 +72,15 @@ parser.add_argument("--no-yaw-tracking", action="store_true", help="Disable yaw 
 parser.add_argument("--ref-update-interval", type=float, default=None, help="Reference update interval (seconds).")
 parser.add_argument(
     "--benchmark-profile",
-    choices=["pillar_random", "fixed", "random"],
-    default="pillar_random",
+    choices=["pursuit", "pillar_random", "fixed", "random"],
+    default="pursuit",
     help="Goal schedule to evaluate.",
+)
+parser.add_argument(
+    "--tests-per-difficulty",
+    type=int,
+    default=30,
+    help="Number of pursuit benchmark scenarios to run for Easy, Medium, and Hard.",
 )
 parser.add_argument(
     "--fixed-goals",
@@ -1181,6 +1188,23 @@ class GoalScenario:
     kind: str
     label: str
     goal: tuple[float, float, float]
+    path_kind: str = ""
+    static_obstacles: int = 0
+    dynamic_obstacles: int = 0
+    evader_start: tuple[float, float, float] | None = None
+    evader_end: tuple[float, float, float] | None = None
+    scenario_data: dict[str, Any] | None = field(default=None, repr=False)
+
+
+DIFFICULTY_ORDER = ("Easy", "Medium", "Hard")
+DIFFICULTY_PHASE = {"Easy": 1, "Medium": 3, "Hard": 5}
+PATH_TYPE_CODES = {
+    "straight": 0,
+    "circle": 1,
+    "waypoint": 2,
+    "corridor": 3,
+    "bottleneck": 4,
+}
 
 
 @dataclass
@@ -1198,6 +1222,7 @@ class ActiveRollout:
     pillar_collisions: int = 0
     min_pillar_clearance: float | None = None
     min_ray_clearance: float | None = None
+    min_safety_margin: float | None = None
 
     def append(
         self,
@@ -1213,6 +1238,7 @@ class ActiveRollout:
         pillar_collision: bool,
         pillar_clearance: float | None,
         ray_clearance: float | None,
+        safety_margin: float | None,
     ) -> None:
         self.positions.append(position_xy)
         self.goals.append(goal_xy)
@@ -1236,6 +1262,12 @@ class ActiveRollout:
                 if self.min_ray_clearance is None
                 else min(self.min_ray_clearance, float(ray_clearance))
             )
+        if safety_margin is not None:
+            self.min_safety_margin = (
+                float(safety_margin)
+                if self.min_safety_margin is None
+                else min(self.min_safety_margin, float(safety_margin))
+            )
 
 
 @dataclass
@@ -1244,7 +1276,12 @@ class EpisodeResult:
     env_id: int
     scenario_kind: str
     scenario_label: str
+    path_kind: str
+    static_obstacles: int
+    dynamic_obstacles: int
     target: tuple[float, float, float]
+    evader_start: tuple[float, float, float] | None
+    evader_end: tuple[float, float, float] | None
     done_reason: int
     done_label: str
     length_steps: int
@@ -1260,7 +1297,9 @@ class EpisodeResult:
     pillar_collisions: int
     min_pillar_clearance: float | None
     min_ray_clearance: float | None
+    min_safety_margin: float | None
     path_xy: list[tuple[float, float]]
+    reference_xy: list[tuple[float, float]]
     errors: list[float]
 
     @property
@@ -1275,15 +1314,28 @@ class EpisodeResult:
     def safety_terminated(self) -> bool:
         return self.done_reason in {2, 3, 6}
 
+    @property
+    def collided(self) -> bool:
+        return self.safety_terminated or self.safety_violation_steps > 0
+
     def to_csv_row(self) -> dict[str, Any]:
         return {
             "episode_id": self.episode_id,
             "env_id": self.env_id,
             "scenario_kind": self.scenario_kind,
             "scenario_label": self.scenario_label,
+            "path_kind": self.path_kind,
+            "static_obstacles": self.static_obstacles,
+            "dynamic_obstacles": self.dynamic_obstacles,
             "target_x": self.target[0],
             "target_y": self.target[1],
             "target_z": self.target[2],
+            "evader_start_x": None if self.evader_start is None else self.evader_start[0],
+            "evader_start_y": None if self.evader_start is None else self.evader_start[1],
+            "evader_start_z": None if self.evader_start is None else self.evader_start[2],
+            "evader_end_x": None if self.evader_end is None else self.evader_end[0],
+            "evader_end_y": None if self.evader_end is None else self.evader_end[1],
+            "evader_end_z": None if self.evader_end is None else self.evader_end[2],
             "done_reason": self.done_reason,
             "done_label": self.done_label,
             "length_steps": self.length_steps,
@@ -1299,23 +1351,56 @@ class EpisodeResult:
             "pillar_collisions": self.pillar_collisions,
             "min_pillar_clearance": self.min_pillar_clearance,
             "min_ray_clearance": self.min_ray_clearance,
+            "min_safety_margin": self.min_safety_margin,
             "safety_terminated": self.safety_terminated,
+            "collided": self.collided,
             "success": self.success,
         }
 
 
 class ScenarioManager:
-    def __init__(self, base_env: Any, fixed_goals: Sequence[tuple[float, float, float]]):
+    def __init__(
+        self,
+        base_env: Any,
+        fixed_goals: Sequence[tuple[float, float, float]],
+        *,
+        pursuit: bool,
+        tests_per_difficulty: int,
+    ):
         self.base_env = base_env
+        self.pursuit = bool(pursuit)
         self._fixed_queue = [
             GoalScenario(kind="fixed", label=f"fixed_{idx:02d}", goal=goal)
             for idx, goal in enumerate(fixed_goals)
         ]
         self._next_fixed = 0
+        self._pursuit_queue: list[tuple[str, int]] = []
+        if self.pursuit:
+            count = max(0, int(tests_per_difficulty))
+            self._pursuit_queue = [(difficulty, idx) for difficulty in DIFFICULTY_ORDER for idx in range(count)]
+        self._next_pursuit = 0
         self.active: list[GoalScenario | None] = [None for _ in range(int(base_env.num_envs))]
 
-    def assign(self, env_ids: Sequence[int]) -> None:
+    @property
+    def pursuit_target_episodes(self) -> int:
+        return len(self._pursuit_queue)
+
+    def assign(self, env_ids: Sequence[int]) -> list[int]:
+        assigned: list[int] = []
         for env_id in env_ids:
+            env_id = int(env_id)
+            if self.pursuit:
+                if self._next_pursuit >= len(self._pursuit_queue):
+                    self.active[env_id] = None
+                    continue
+                difficulty, scenario_idx = self._pursuit_queue[self._next_pursuit]
+                self._next_pursuit += 1
+                scenario = self._build_pursuit_scenario(difficulty, scenario_idx, env_id)
+                self._apply_pursuit_scenario(env_id, scenario)
+                self.active[env_id] = scenario
+                assigned.append(env_id)
+                continue
+
             if self._next_fixed < len(self._fixed_queue):
                 scenario = self._fixed_queue[self._next_fixed]
                 self._next_fixed += 1
@@ -1327,7 +1412,9 @@ class ScenarioManager:
                     label="random",
                     goal=(float(ref[0]), float(ref[1]), float(ref[2])),
                 )
-            self.active[int(env_id)] = scenario
+            self.active[env_id] = scenario
+            assigned.append(env_id)
+        return assigned
 
     def get(self, env_id: int) -> GoalScenario:
         scenario = self.active[int(env_id)]
@@ -1347,6 +1434,523 @@ class ScenarioManager:
             self.base_env._success_counter[env_id] = 0
         if hasattr(self.base_env, "_last_success"):
             self.base_env._last_success[env_id] = False
+
+    def _build_pursuit_scenario(self, difficulty: str, scenario_idx: int, env_id: int) -> GoalScenario:
+        for attempt in range(64):
+            variant = scenario_idx + 37 * attempt
+            if difficulty == "Easy":
+                data = self._candidate_easy(scenario_idx, variant)
+            elif difficulty == "Medium":
+                data = self._candidate_medium(scenario_idx, variant)
+            else:
+                data = self._candidate_hard(scenario_idx, variant)
+            if data is None:
+                continue
+            if self._valid_pursuit_scenario(data, difficulty):
+                return self._scenario_from_data(difficulty, scenario_idx, data)
+
+        data = self._fallback_env_sample(difficulty)
+        return self._scenario_from_data(difficulty, scenario_idx, data)
+
+    def _scenario_from_data(self, difficulty: str, scenario_idx: int, data: dict[str, Any]) -> GoalScenario:
+        evader_pos = data["evader_pos"]
+        static_active = data["static_active"]
+        dynamic_active = data["dynamic_active"]
+        start = evader_pos[0].detach().cpu().tolist()
+        end = evader_pos[-1].detach().cpu().tolist()
+        path_kind = str(data.get("path_kind", "pursuit"))
+        return GoalScenario(
+            kind=difficulty,
+            label=f"{difficulty}_{scenario_idx:02d}",
+            goal=(float(start[0]), float(start[1]), float(start[2])),
+            path_kind=path_kind,
+            static_obstacles=int(static_active.to(torch.int32).sum().item()),
+            dynamic_obstacles=int(dynamic_active.to(torch.int32).sum().item()),
+            evader_start=(float(start[0]), float(start[1]), float(start[2])),
+            evader_end=(float(end[0]), float(end[1]), float(end[2])),
+            scenario_data=data,
+        )
+
+    def _apply_pursuit_scenario(self, env_id: int, scenario: GoalScenario) -> None:
+        data = scenario.scenario_data
+        if data is None:
+            raise RuntimeError(f"Pursuit scenario {scenario.label} has no tensor payload.")
+
+        env = self.base_env
+        device = env.device
+        env_ids = torch.tensor([int(env_id)], device=device, dtype=torch.long)
+        env.episode_length_buf[env_ids] = 0
+        if hasattr(env, "reset_buf"):
+            env.reset_buf[env_ids] = False
+        if hasattr(env, "reset_terminated"):
+            env.reset_terminated[env_ids] = False
+        if hasattr(env, "reset_time_outs"):
+            env.reset_time_outs[env_ids] = False
+
+        env._scenario_phase[env_id] = int(data["phase"])
+        env._scenario_fallback[env_id] = bool(data.get("fallback", False))
+        env._evader_path_type[env_id] = int(data["path_type"])
+        env._evader_pos_path[env_id] = data["evader_pos"].to(device=device)
+        env._evader_vel_path[env_id] = data["evader_vel"].to(device=device)
+        env._pursuer_start_pos[env_id] = data["pursuer_start"].to(device=device)
+        env._reference_pos[env_id] = data["evader_pos"][0].to(device=device)
+        env._reference_yaw[env_id, 0] = float(data["evader_yaw"])
+        env._reference_timer[env_id] = 0.0
+        env._success_counter[env_id] = 0
+        env._last_success[env_id] = False
+
+        env._static_obstacle_positions_xy[env_id] = data["static_xy"].to(device=device)
+        env._static_obstacle_active[env_id] = data["static_active"].to(device=device)
+        env._dynamic_obstacle_pos_path[env_id] = data["dynamic_pos"].to(device=device)
+        env._dynamic_obstacle_vel_path[env_id] = data["dynamic_vel"].to(device=device)
+        env._dynamic_obstacle_active[env_id] = data["dynamic_active"].to(device=device)
+        env._dynamic_obstacle_positions[env_id] = data["dynamic_pos"][0].to(device=device)
+
+        if hasattr(env, "_actions"):
+            env._actions[env_ids] = 0.0
+            env._prev_actions[env_ids] = 0.0
+            env._action_diff[env_ids] = 0.0
+        if getattr(env, "_action_wrapper", None) is not None:
+            env._action_wrapper.reset(env_ids)
+        if getattr(env, "_baseline_controller", None) is not None:
+            env._baseline_controller.reset(env_ids)
+
+        root_state = env._robot.data.default_root_state[env_ids].clone()
+        root_state[:, :3] = env._pursuer_start_pos[env_ids] + env._terrain.env_origins[env_ids]
+        root_state[:, 3:7] = env._spawn_yaw_quat(env_ids)
+        root_state[:, 7:] = 0.0
+        env._robot.write_root_pose_to_sim(root_state[:, :7], env_ids)
+        env._robot.write_root_velocity_to_sim(root_state[:, 7:], env_ids)
+
+        env._update_pursuit_episode_motion(env_ids)
+        env._move_static_obstacles(env_ids)
+        env._move_dynamic_obstacles(env_ids)
+        env._refresh_debug_pillars()
+        env._clip_agent_root_state_in_sim(env_ids)
+        if getattr(env, "_ray_caster", None) is not None:
+            try:
+                env._ray_caster.update(0.0, force_recompute=True)
+            except Exception:
+                pass
+
+    def _candidate_easy(self, scenario_idx: int, variant: int) -> dict[str, Any] | None:
+        mode = scenario_idx % 3
+        if mode == 0:
+            path_kind = "waypoint"
+            points = [(1.45, 0.75), (0.45, 0.55), (-1.25, 0.15), (-1.55, -0.35)]
+            pursuer_xy = (-1.55, -0.95)
+        elif mode == 1:
+            path_kind = "circle"
+            xy = self._circle_xy((0.35, 0.05), radius=0.62, cycles=0.85, phase=0.35 * scenario_idx)
+            pursuer_xy = (-1.45, -0.95)
+            return self._pack_candidate(path_kind, xy, pursuer_xy, desired_static=2, desired_dynamic=0, variant=variant)
+        else:
+            path_kind = "straight"
+            points = [(1.55, -0.65), (0.35, -0.25), (-1.35, 0.55)]
+            pursuer_xy = (-1.55, 0.95)
+
+        xy = self._polyline_xy(points)
+        return self._pack_candidate(path_kind, xy, pursuer_xy, desired_static=2, desired_dynamic=0, variant=variant)
+
+    def _candidate_medium(self, scenario_idx: int, variant: int) -> dict[str, Any] | None:
+        desired_static = 5 + scenario_idx % 4
+        if scenario_idx % 2 == 0:
+            points = [(-1.55, 0.85), (-0.75, 0.75), (-0.25, 0.05), (0.55, -0.2), (1.45, -0.75)]
+            pursuer_xy = (1.65, 0.95)
+        else:
+            points = [(1.55, -0.85), (0.75, -0.65), (0.15, 0.1), (-0.55, 0.25), (-1.45, 0.75)]
+            pursuer_xy = (-1.65, -0.95)
+        xy = self._polyline_xy(points)
+        return self._pack_candidate(
+            "corridor",
+            xy,
+            pursuer_xy,
+            desired_static=desired_static,
+            desired_dynamic=0,
+            variant=variant,
+        )
+
+    def _candidate_hard(self, scenario_idx: int, variant: int) -> dict[str, Any] | None:
+        desired_static = 6 + scenario_idx % 3
+        desired_dynamic = 2 + scenario_idx % 2
+        if scenario_idx % 2 == 0:
+            points = [(-1.55, -0.85), (-0.75, -0.65), (-0.2, -0.1), (0.55, 0.15), (1.45, 0.85)]
+            pursuer_xy = (1.65, -1.0)
+        else:
+            points = [(1.55, 0.85), (0.75, 0.65), (0.2, 0.05), (-0.55, -0.15), (-1.45, -0.85)]
+            pursuer_xy = (-1.65, 1.0)
+        xy = self._polyline_xy(points)
+        return self._pack_candidate(
+            "bottleneck",
+            xy,
+            pursuer_xy,
+            desired_static=desired_static,
+            desired_dynamic=desired_dynamic,
+            variant=variant,
+        )
+
+    def _pack_candidate(
+        self,
+        path_kind: str,
+        xy: torch.Tensor,
+        pursuer_xy: tuple[float, float],
+        *,
+        desired_static: int,
+        desired_dynamic: int,
+        variant: int,
+    ) -> dict[str, Any] | None:
+        evader_xy = self._transform_xy(xy, variant, margin=float(self.base_env.cfg.pursuit_evader_wall_clearance))
+        pursuer_xy_t = self._transform_xy(
+            self._tensor_xy([pursuer_xy]),
+            variant,
+            margin=float(self.base_env.cfg.pursuit_pursuer_wall_clearance),
+        )[0]
+        evader_pos = self._finish_evader_xy_path(evader_xy)
+        pursuer_start = self._finish_point(pursuer_xy_t)
+
+        static_seed = self._static_seed_points(path_kind, evader_xy, pursuer_xy_t)
+        static = self._make_static_slots(static_seed, evader_pos, pursuer_start, desired_static, variant)
+        if static is None:
+            return None
+        static_xy, static_active = static
+
+        dynamic_paths = self._dynamic_seed_paths(path_kind, variant)
+        dynamic = self._make_dynamic_slots(dynamic_paths, evader_pos, static_xy, static_active, desired_dynamic)
+        if dynamic is None:
+            return None
+        dynamic_pos, dynamic_vel, dynamic_active = dynamic
+
+        return self._pack_scenario_data(
+            path_kind=path_kind,
+            evader_pos=evader_pos,
+            pursuer_start=pursuer_start,
+            static_xy=static_xy,
+            static_active=static_active,
+            dynamic_pos=dynamic_pos,
+            dynamic_vel=dynamic_vel,
+            dynamic_active=dynamic_active,
+            fallback=False,
+        )
+
+    def _pack_scenario_data(
+        self,
+        *,
+        path_kind: str,
+        evader_pos: torch.Tensor,
+        pursuer_start: torch.Tensor,
+        static_xy: torch.Tensor,
+        static_active: torch.Tensor,
+        dynamic_pos: torch.Tensor,
+        dynamic_vel: torch.Tensor,
+        dynamic_active: torch.Tensor,
+        fallback: bool,
+    ) -> dict[str, Any]:
+        evader_vel = self.base_env._path_velocity(evader_pos)
+        speed = torch.linalg.vector_norm(evader_vel[:, :2], dim=-1)
+        moving = torch.nonzero(speed > 0.05).squeeze(-1)
+        first_idx = int(moving[0].item()) if moving.numel() > 0 else 0
+        first_vel = evader_vel[first_idx]
+        yaw = torch.atan2(first_vel[1], first_vel[0])
+        difficulty = self._difficulty_for_counts(static_active, dynamic_active)
+        return {
+            "phase": DIFFICULTY_PHASE[difficulty],
+            "path_type": PATH_TYPE_CODES.get(path_kind, 0),
+            "path_kind": path_kind,
+            "evader_pos": evader_pos,
+            "evader_vel": evader_vel,
+            "evader_yaw": float(yaw.item()),
+            "pursuer_start": pursuer_start,
+            "static_xy": static_xy,
+            "static_active": static_active,
+            "dynamic_pos": dynamic_pos,
+            "dynamic_vel": dynamic_vel,
+            "dynamic_active": dynamic_active,
+            "fallback": bool(fallback),
+        }
+
+    def _difficulty_for_counts(self, static_active: torch.Tensor, dynamic_active: torch.Tensor) -> str:
+        if int(dynamic_active.to(torch.int32).sum().item()) > 0:
+            return "Hard"
+        if int(static_active.to(torch.int32).sum().item()) >= 5:
+            return "Medium"
+        return "Easy"
+
+    def _fallback_env_sample(self, difficulty: str) -> dict[str, Any]:
+        phase = DIFFICULTY_PHASE[difficulty]
+        attempts = max(32, int(getattr(self.base_env.cfg, "pursuit_scenario_attempts", 300)) // 3)
+        for _ in range(attempts):
+            sampled = self.base_env._sample_pursuit_scenario(phase)
+            if sampled is not None:
+                sampled["fallback"] = True
+                sampled["path_kind"] = f"env_phase_{phase}"
+                return sampled
+        sampled = self.base_env._fallback_pursuit_scenario(phase)
+        sampled["fallback"] = True
+        sampled["path_kind"] = f"env_fallback_phase_{phase}"
+        return sampled
+
+    def _valid_pursuit_scenario(self, data: dict[str, Any], difficulty: str) -> bool:
+        env = self.base_env
+        evader_pos = data["evader_pos"]
+        evader_vel = data["evader_vel"]
+        pursuer_start = data["pursuer_start"]
+        static_xy = data["static_xy"]
+        static_active = data["static_active"]
+        dynamic_pos = data["dynamic_pos"]
+        dynamic_active = data["dynamic_active"]
+
+        lo = env._arena_min_safe + float(env.cfg.pursuit_evader_wall_clearance)
+        hi = env._arena_max_safe - float(env.cfg.pursuit_evader_wall_clearance)
+        if not bool(torch.all((evader_pos >= lo) & (evader_pos <= hi)).item()):
+            return False
+        speed = torch.linalg.vector_norm(evader_vel, dim=-1)
+        if bool(torch.any(speed > float(env.cfg.pursuit_evader_max_speed) * 1.05).item()):
+            return False
+
+        start_dist = torch.linalg.vector_norm(pursuer_start[:2] - evader_pos[0, :2])
+        if float(start_dist.item()) < float(env.cfg.pursuit_pursuer_min_evader_distance):
+            return False
+        if not env._point_free(pursuer_start, static_xy, static_active, dynamic_pos, dynamic_active):
+            return False
+        if env._boxed_in(pursuer_start, static_xy, static_active, dynamic_pos, dynamic_active):
+            return False
+        if not env._has_approx_connection(
+            pursuer_start[:2],
+            evader_pos[0, :2],
+            static_xy,
+            static_active,
+            dynamic_pos[0],
+            dynamic_active,
+        ):
+            return False
+
+        static_count = int(static_active.to(torch.int32).sum().item())
+        dynamic_count = int(dynamic_active.to(torch.int32).sum().item())
+        if difficulty == "Easy" and static_count != 2:
+            return False
+        if difficulty == "Medium" and (static_count < 5 or static_count > 8 or dynamic_count != 0):
+            return False
+        if difficulty == "Hard" and (static_count < 5 or dynamic_count < 2):
+            return False
+        return True
+
+    def _make_static_slots(
+        self,
+        candidates: torch.Tensor,
+        evader_pos: torch.Tensor,
+        pursuer_start: torch.Tensor,
+        desired_count: int,
+        variant: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        env = self.base_env
+        slots = int(getattr(env, "_max_static_obstacles", 0))
+        if desired_count > slots:
+            return None
+        xy = env._inactive_obstacle_xy(slots).clone()
+        active = torch.zeros(slots, dtype=torch.bool, device=env.device)
+        if desired_count <= 0:
+            return xy, active
+
+        ordered = [candidate for candidate in candidates]
+        ordered.extend(self._static_grid_candidates(variant))
+        placed = 0
+        for candidate in ordered:
+            if placed >= desired_count:
+                break
+            if not self._static_candidate_ok(candidate, xy[:placed], evader_pos, pursuer_start):
+                continue
+            xy[placed] = candidate
+            active[placed] = True
+            placed += 1
+        if placed < desired_count:
+            return None
+        return xy, active
+
+    def _static_candidate_ok(
+        self,
+        candidate: torch.Tensor,
+        placed: torch.Tensor,
+        evader_pos: torch.Tensor,
+        pursuer_start: torch.Tensor,
+    ) -> bool:
+        env = self.base_env
+        lo, hi = env._safe_xy_bounds(float(env.cfg.pillar_radius) + float(env.cfg.pursuit_obstacle_clearance))
+        if not bool(torch.all((candidate >= lo) & (candidate <= hi)).item()):
+            return False
+        safe_evader = (
+            float(env.cfg.pillar_radius)
+            + float(env.cfg.pursuit_evader_radius)
+            + float(env.cfg.pursuit_evader_tube_margin)
+        )
+        d_evader = torch.linalg.vector_norm(evader_pos[:, :2] - candidate, dim=-1)
+        if float(torch.min(d_evader).item()) <= safe_evader:
+            return False
+        safe_start = (
+            float(env.cfg.pillar_radius)
+            + float(env.cfg.drone_collision_radius)
+            + float(env.cfg.pursuit_obstacle_clearance)
+        )
+        d_start = torch.linalg.vector_norm(pursuer_start[:2] - candidate)
+        if float(d_start.item()) <= safe_start:
+            return False
+        if placed.numel() > 0:
+            d_static = torch.linalg.vector_norm(placed - candidate, dim=-1)
+            safe_static = 2.0 * float(env.cfg.pillar_radius) + float(env.cfg.pursuit_obstacle_clearance)
+            if bool(torch.any(d_static <= safe_static).item()):
+                return False
+        return True
+
+    def _make_dynamic_slots(
+        self,
+        candidates: Sequence[torch.Tensor],
+        evader_pos: torch.Tensor,
+        static_xy: torch.Tensor,
+        static_active: torch.Tensor,
+        desired_count: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        env = self.base_env
+        slots = int(getattr(env, "_max_dynamic_obstacles", 0))
+        if desired_count > slots:
+            return None
+        pos = env._inactive_dynamic_pos(slots).view(1, slots, 3).repeat(env._path_steps, 1, 1)
+        vel = torch.zeros_like(pos)
+        active = torch.zeros(slots, dtype=torch.bool, device=env.device)
+        if desired_count <= 0:
+            return pos, vel, active
+
+        placed = 0
+        for path in candidates:
+            if placed >= desired_count:
+                break
+            path_vel = env._path_velocity(path)
+            if not env._dynamic_path_valid(path, evader_pos, static_xy, static_active, pos[:, :placed], active[:placed]):
+                continue
+            pos[:, placed] = path
+            vel[:, placed] = path_vel
+            active[placed] = True
+            placed += 1
+        if placed < desired_count:
+            return None
+        return pos, vel, active
+
+    def _static_seed_points(self, path_kind: str, evader_xy: torch.Tensor, pursuer_xy: torch.Tensor) -> torch.Tensor:
+        midpoint = 0.52 * evader_xy[0] + 0.48 * pursuer_xy
+        line = evader_xy[0] - pursuer_xy
+        norm = torch.linalg.vector_norm(line).clamp_min(1e-6)
+        perp = torch.stack((-line[1], line[0])) / norm
+        if path_kind in {"straight", "waypoint", "circle"}:
+            points = torch.stack(
+                (
+                    midpoint + 0.10 * perp,
+                    evader_xy[min(evader_xy.shape[0] // 3, evader_xy.shape[0] - 1)] - 0.55 * perp,
+                    evader_xy[min(evader_xy.shape[0] // 2, evader_xy.shape[0] - 1)] + 0.65 * perp,
+                )
+            )
+            return points
+
+        base = self._tensor_xy(
+            [
+                (-1.15, -0.15),
+                (-0.75, 0.55),
+                (-0.25, -0.75),
+                (0.35, 0.65),
+                (0.85, -0.45),
+                (1.25, 0.25),
+                (-1.45, -0.85),
+                (1.45, 0.85),
+                (0.0, 1.15),
+                (0.0, -1.15),
+            ]
+        )
+        return base
+
+    def _static_grid_candidates(self, variant: int) -> list[torch.Tensor]:
+        env = self.base_env
+        lo, hi = env._safe_xy_bounds(float(env.cfg.pillar_radius) + float(env.cfg.pursuit_obstacle_clearance))
+        xs = torch.linspace(float(lo[0]), float(hi[0]), 6, device=env.device)
+        ys = torch.linspace(float(lo[1]), float(hi[1]), 5, device=env.device)
+        grid = [torch.stack((x, y)) for x in xs for y in ys]
+        if not grid:
+            return []
+        shift = variant % len(grid)
+        return grid[shift:] + grid[:shift]
+
+    def _dynamic_seed_paths(self, path_kind: str, variant: int) -> list[torch.Tensor]:
+        if path_kind != "bottleneck":
+            return []
+        phase = 0.45 * (variant % 7)
+        return [
+            self._dynamic_sine_path((0.05, 0.05), (0.0, 1.0), amp=1.00, phase=phase + math.pi / 2.0),
+            self._dynamic_sine_path((-0.55, -0.25), (1.0, 0.0), amp=0.95, phase=phase),
+            self._dynamic_sine_path((0.65, 0.35), (1.0, -0.35), amp=0.90, phase=phase + math.pi),
+            self._dynamic_sine_path((0.0, -0.75), (1.0, 0.0), amp=1.00, phase=phase + 0.5 * math.pi),
+        ]
+
+    def _dynamic_sine_path(
+        self,
+        center: tuple[float, float],
+        direction: tuple[float, float],
+        *,
+        amp: float,
+        phase: float,
+    ) -> torch.Tensor:
+        env = self.base_env
+        t = torch.linspace(0.0, 1.0, env._path_steps, device=env.device)
+        direction_t = self._tensor_xy([direction])[0]
+        direction_t = direction_t / torch.linalg.vector_norm(direction_t).clamp_min(1e-6)
+        center_t = self._tensor_xy([center])[0]
+        xy = center_t + torch.sin(2.0 * math.pi * t + phase).view(-1, 1) * float(amp) * direction_t
+        radius = float(env.cfg.pursuit_dynamic_obstacle_radius) + float(env.cfg.pursuit_obstacle_clearance)
+        lo, hi = env._safe_xy_bounds(radius)
+        xy = torch.clamp(xy, min=lo, max=hi)
+        z = torch.full((env._path_steps, 1), env._dynamic_center_z(), device=env.device)
+        return torch.cat((xy, z), dim=-1)
+
+    def _polyline_xy(self, points: Sequence[tuple[float, float]]) -> torch.Tensor:
+        return self.base_env._polyline_sample(self._tensor_xy(points), self.base_env._path_steps)
+
+    def _circle_xy(self, center: tuple[float, float], *, radius: float, cycles: float, phase: float) -> torch.Tensor:
+        env = self.base_env
+        t = torch.linspace(0.0, 1.0, env._path_steps, device=env.device)
+        theta = 2.0 * math.pi * float(cycles) * t + float(phase)
+        center_t = self._tensor_xy([center])[0]
+        xy = center_t + float(radius) * torch.stack((torch.cos(theta), torch.sin(theta)), dim=-1)
+        return xy
+
+    def _transform_xy(self, xy: torch.Tensor, variant: int, *, margin: float) -> torch.Tensor:
+        out = xy.clone()
+        if variant % 2:
+            out[..., 0] = -out[..., 0]
+        if (variant // 2) % 2:
+            out[..., 1] = -out[..., 1]
+        shift = torch.tensor(
+            [0.12 * math.sin(1.37 * variant), 0.10 * math.cos(1.91 * variant)],
+            device=self.base_env.device,
+            dtype=torch.float32,
+        )
+        out = out + shift
+        lo, hi = self.base_env._safe_xy_bounds(float(margin))
+        return torch.clamp(out, min=lo, max=hi)
+
+    def _finish_evader_xy_path(self, xy: torch.Tensor) -> torch.Tensor:
+        env = self.base_env
+        lo = env._arena_min_safe + float(env.cfg.pursuit_evader_wall_clearance)
+        hi = env._arena_max_safe - float(env.cfg.pursuit_evader_wall_clearance)
+        z = 0.5 * (float(lo[2]) + float(hi[2]))
+        pos = torch.zeros(env._path_steps, 3, device=env.device)
+        pos[:, :2] = xy
+        pos[:, 2] = z
+        return pos
+
+    def _finish_point(self, xy: torch.Tensor) -> torch.Tensor:
+        env = self.base_env
+        lo = env._arena_min_safe + float(env.cfg.pursuit_pursuer_wall_clearance)
+        hi = env._arena_max_safe - float(env.cfg.pursuit_pursuer_wall_clearance)
+        z = 0.5 * (float(lo[2]) + float(hi[2]))
+        return torch.tensor([float(xy[0]), float(xy[1]), z], device=env.device, dtype=torch.float32)
+
+    def _tensor_xy(self, values: Sequence[tuple[float, float]]) -> torch.Tensor:
+        return torch.tensor(values, device=self.base_env.device, dtype=torch.float32)
 
 
 class RolloutRecorder:
@@ -1383,6 +1987,7 @@ class RolloutRecorder:
 
         pillar_clearance = _pillar_clearance(env, pos_local)
         ray_clearance = _ray_clearance(env, pos_local)
+        safety_margin = _safety_margin(env, pos_local)
         action_norm = torch.linalg.vector_norm(actions, dim=-1)
 
         return {
@@ -1395,6 +2000,7 @@ class RolloutRecorder:
             "pillar_collision": pillar_collision.detach().clone(),
             "pillar_clearance": None if pillar_clearance is None else pillar_clearance.detach().clone(),
             "ray_clearance": None if ray_clearance is None else ray_clearance.detach().clone(),
+            "safety_margin": None if safety_margin is None else safety_margin.detach().clone(),
             "action_norm": action_norm.detach().clone(),
         }
 
@@ -1409,6 +2015,7 @@ class RolloutRecorder:
         pillar_collision = sample["pillar_collision"]
         pillar_clearance = sample["pillar_clearance"]
         ray_clearance = sample["ray_clearance"]
+        safety_margin = sample["safety_margin"]
         action_norm = sample["action_norm"]
         assert isinstance(pos_local, torch.Tensor)
         assert isinstance(ref_pos, torch.Tensor)
@@ -1438,6 +2045,7 @@ class RolloutRecorder:
                 pillar_collision=bool(pillar_collision[env_id].item()),
                 pillar_clearance=None if pillar_clearance is None else float(pillar_clearance[env_id].item()),
                 ray_clearance=None if ray_clearance is None else float(ray_clearance[env_id].item()),
+                safety_margin=None if safety_margin is None else float(safety_margin[env_id].item()),
             )
 
     def finish(self, env_id: int, done_reason: int) -> EpisodeResult | None:
@@ -1453,7 +2061,12 @@ class RolloutRecorder:
             env_id=int(env_id),
             scenario_kind=rollout.scenario.kind,
             scenario_label=rollout.scenario.label,
+            path_kind=rollout.scenario.path_kind,
+            static_obstacles=rollout.scenario.static_obstacles,
+            dynamic_obstacles=rollout.scenario.dynamic_obstacles,
             target=rollout.scenario.goal,
+            evader_start=rollout.scenario.evader_start,
+            evader_end=rollout.scenario.evader_end,
             done_reason=int(done_reason),
             done_label=done_label,
             length_steps=length,
@@ -1469,7 +2082,9 @@ class RolloutRecorder:
             pillar_collisions=rollout.pillar_collisions,
             min_pillar_clearance=rollout.min_pillar_clearance,
             min_ray_clearance=rollout.min_ray_clearance,
+            min_safety_margin=rollout.min_safety_margin,
             path_xy=rollout.positions.copy(),
+            reference_xy=rollout.goals.copy(),
             errors=rollout.pos_errors.copy(),
         )
         self.results.append(result)
@@ -1529,12 +2144,56 @@ def _distribution_stats(values: Sequence[float]) -> dict[str, float | int | None
     }
 
 
+def _ordered_result_groups(results: Sequence[EpisodeResult]) -> list[tuple[str, list[EpisodeResult]]]:
+    labels = list(DIFFICULTY_ORDER)
+    labels.extend(sorted({result.scenario_kind for result in results if result.scenario_kind not in labels}))
+    return [(label, [result for result in results if result.scenario_kind == label]) for label in labels]
+
+
+def _finite_values(values: Sequence[float | None]) -> list[float]:
+    out: list[float] = []
+    for value in values:
+        if value is None:
+            continue
+        value = float(value)
+        if math.isfinite(value):
+            out.append(value)
+    return out
+
+
+def _performance_summary_rows(results: Sequence[EpisodeResult]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for difficulty, group in _ordered_result_groups(results):
+        if not group:
+            continue
+        captures = sum(1 for result in group if result.success)
+        collisions = sum(1 for result in group if result.collided)
+        capture_times = [float(result.duration_s) for result in group if result.success]
+        margins = _finite_values([result.min_safety_margin for result in group])
+        rows.append(
+            {
+                "difficulty": difficulty,
+                "episodes": len(group),
+                "capture_rate_percent": 100.0 * captures / max(1, len(group)),
+                "collision_rate_percent": 100.0 * collisions / max(1, len(group)),
+                "time_to_capture_s": _safe_list_mean(capture_times),
+                "min_margin_m": _safe_list_mean(margins),
+            }
+        )
+    return rows
+
+
 def _pillar_clearance(base_env: Any, pos_local: torch.Tensor) -> torch.Tensor | None:
-    pillars = getattr(base_env, "_pillar_positions_xy", None)
-    if pillars is None or pillars.numel() == 0:
+    pillars = getattr(base_env, "_static_obstacle_positions_xy", None)
+    active = getattr(base_env, "_static_obstacle_active", None)
+    if pillars is None or active is None or pillars.numel() == 0:
         return None
-    dxy = torch.linalg.vector_norm(pos_local[:, None, :2] - pillars[None, :, :], dim=-1)
-    return dxy.min(dim=1).values - float(getattr(base_env, "_pillar_collision_radius", 0.0))
+    dxy = torch.linalg.vector_norm(pos_local[:, None, :2] - pillars, dim=-1)
+    clearance = dxy - float(getattr(base_env, "_pillar_collision_radius", 0.0))
+    clearance = torch.where(active, clearance, torch.full_like(clearance, float("inf")))
+    if not bool(torch.isfinite(clearance).any().item()):
+        return None
+    return clearance.min(dim=1).values
 
 
 def _ray_clearance(base_env: Any, pos_local: torch.Tensor) -> torch.Tensor | None:
@@ -1553,6 +2212,35 @@ def _ray_clearance(base_env: Any, pos_local: torch.Tensor) -> torch.Tensor | Non
     min_dxy = dxy.min(dim=1).values
     min_dxy = torch.where(torch.isfinite(min_dxy), min_dxy, torch.full_like(min_dxy, max_dist))
     return min_dxy - float(getattr(base_env.cfg, "drone_collision_radius", 0.0))
+
+
+def _safety_margin(base_env: Any, pos_local: torch.Tensor) -> torch.Tensor | None:
+    if not hasattr(base_env, "_arena_min_safe") or not hasattr(base_env, "_arena_max_safe"):
+        return None
+
+    lower = pos_local - base_env._arena_min_safe.view(1, 3)
+    upper = base_env._arena_max_safe.view(1, 3) - pos_local
+    margin = torch.cat((lower, upper), dim=-1).min(dim=1).values
+
+    static_xy = getattr(base_env, "_static_obstacle_positions_xy", None)
+    static_active = getattr(base_env, "_static_obstacle_active", None)
+    if static_xy is not None and static_active is not None and static_xy.numel() > 0:
+        dxy = torch.linalg.vector_norm(pos_local[:, None, :2] - static_xy, dim=-1)
+        static_margin = dxy - float(getattr(base_env, "_pillar_collision_radius", 0.0))
+        static_margin = torch.where(static_active, static_margin, torch.full_like(static_margin, float("inf")))
+        static_min = static_margin.min(dim=1).values
+        margin = torch.minimum(margin, static_min)
+
+    dynamic_pos = getattr(base_env, "_dynamic_obstacle_positions", None)
+    dynamic_active = getattr(base_env, "_dynamic_obstacle_active", None)
+    if dynamic_pos is not None and dynamic_active is not None and dynamic_pos.numel() > 0:
+        dxy = torch.linalg.vector_norm(pos_local[:, None, :2] - dynamic_pos[:, :, :2], dim=-1)
+        dynamic_margin = dxy - float(getattr(base_env, "_dynamic_collision_radius", 0.0))
+        dynamic_margin = torch.where(dynamic_active, dynamic_margin, torch.full_like(dynamic_margin, float("inf")))
+        dynamic_min = dynamic_margin.min(dim=1).values
+        margin = torch.minimum(margin, dynamic_min)
+
+    return margin
 
 
 def _refresh_observations_after_reference_write(base_env: Any, obs: Any) -> Any:
@@ -1579,6 +2267,8 @@ def _default_fixed_goals(env_cfg: Any) -> list[tuple[float, float, float]]:
 
 
 def _parse_fixed_goals(env_cfg: Any) -> list[tuple[float, float, float]]:
+    if args_cli.benchmark_profile in {"pursuit", "random"}:
+        return []
     if not args_cli.fixed_goals:
         goals = _default_fixed_goals(env_cfg)
     else:
@@ -1597,13 +2287,16 @@ def _parse_fixed_goals(env_cfg: Any) -> list[tuple[float, float, float]]:
                 )
             goals.append((parts[0], parts[1], parts[2]))
 
-    if args_cli.benchmark_profile == "random":
-        return []
     repeats = max(0, int(args_cli.fixed_goal_repeats))
     return [goal for goal in goals for _ in range(repeats)]
 
 
 def _target_episode_count(fixed_goals: Sequence[tuple[float, float, float]]) -> int | None:
+    if args_cli.benchmark_profile == "pursuit":
+        planned = max(0, int(args_cli.tests_per_difficulty)) * len(DIFFICULTY_ORDER)
+        if args_cli.num_episodes is not None:
+            return min(int(args_cli.num_episodes), planned)
+        return planned
     if args_cli.num_episodes is not None:
         return int(args_cli.num_episodes)
     if args_cli.benchmark_profile == "fixed":
@@ -1639,17 +2332,20 @@ def _summarize_results(results: Sequence[EpisodeResult], recorder: RolloutRecord
         return out
 
     final_errors = values("final_pos_error")
+    min_margins = _finite_values([result.min_safety_margin for result in results])
     time_to_target = [float(result.duration_s) for result in results if result.success]
     safety_terminated = sum(1 for result in results if result.safety_terminated)
     success = sum(1 for result in results if result.success)
-    collisions = sum(1 for result in results if result.done_reason == 6 or result.pillar_collisions > 0)
+    collisions = sum(1 for result in results if result.collided)
 
     by_scenario: dict[str, dict[str, Any]] = {}
-    for kind in sorted({result.scenario_kind for result in results}):
-        group = [result for result in results if result.scenario_kind == kind]
+    for kind, group in _ordered_result_groups(results):
+        if not group:
+            continue
         group_final = [float(result.final_pos_error) for result in group if result.final_pos_error is not None]
         group_time_to_target = [float(result.duration_s) for result in group if result.success]
-        group_collisions = sum(1 for result in group if result.done_reason == 6 or result.pillar_collisions > 0)
+        group_margins = _finite_values([result.min_safety_margin for result in group])
+        group_collisions = sum(1 for result in group if result.collided)
         by_scenario[kind] = {
             "episodes": len(group),
             "success_percent": 100.0 * sum(1 for result in group if result.success) / max(1, len(group)),
@@ -1659,6 +2355,7 @@ def _summarize_results(results: Sequence[EpisodeResult], recorder: RolloutRecord
             ),
             "time_to_target_s": _distribution_stats(group_time_to_target),
             "final_position_error_m": _distribution_stats(group_final),
+            "min_safety_margin_m": _distribution_stats(group_margins),
         }
 
     return {
@@ -1669,8 +2366,42 @@ def _summarize_results(results: Sequence[EpisodeResult], recorder: RolloutRecord
         "termination_counts": reason_counts,
         "time_to_target_s": _distribution_stats(time_to_target),
         "final_position_error_m": _distribution_stats(final_errors),
+        "min_safety_margin_m": _distribution_stats(min_margins),
+        "performance_table": _performance_summary_rows(results),
         "by_scenario": by_scenario,
     }
+
+
+def _format_optional_seconds(value: float | None) -> str:
+    return "n/a" if value is None else f"{float(value):.1f} s"
+
+
+def _format_optional_meters(value: float | None) -> str:
+    return "n/a" if value is None else f"{float(value):.2f} m"
+
+
+def _print_performance_table(summary: Mapping[str, Any]) -> None:
+    rows = summary.get("performance_table", [])
+    if not rows:
+        return
+    print("")
+    print(f"Algorithm: {args_cli.algorithm.upper()}")
+    print(f"Seed: {args_cli.seed}")
+    if args_cli.benchmark_profile == "pursuit":
+        print(f"Number of scenarios per difficulty: {int(args_cli.tests_per_difficulty)}")
+    print("")
+    print(f"{'Difficulty':<12} {'Capture Rate':<14} {'Collision Rate':<15} {'Time to Capture':<17} {'Min Margin':<10}")
+    for row in rows:
+        capture = f"{float(row['capture_rate_percent']):.1f}%"
+        collision = f"{float(row['collision_rate_percent']):.1f}%"
+        print(
+            f"{str(row['difficulty']):<12} "
+            f"{capture:<14} "
+            f"{collision:<15} "
+            f"{_format_optional_seconds(row.get('time_to_capture_s')):<17} "
+            f"{_format_optional_meters(row.get('min_margin_m')):<10}"
+        )
+    print("")
 
 
 def _plot_rollouts(output_dir: Path, env_cfg: Any, results: Sequence[EpisodeResult]) -> dict[str, str]:
@@ -1700,7 +2431,7 @@ def _plot_rollouts(output_dir: Path, env_cfg: Any, results: Sequence[EpisodeResu
             label="Arena bounds",
         )
     )
-    if getattr(env_cfg, "enable_pillars", False):
+    if getattr(env_cfg, "enable_pillars", False) and not getattr(env_cfg, "enable_pursuit_evasion_curriculum", False):
         for idx, (px, py) in enumerate(getattr(env_cfg, "pillar_positions_xy", ())):
             ax.add_patch(
                 Circle(
@@ -1714,7 +2445,7 @@ def _plot_rollouts(output_dir: Path, env_cfg: Any, results: Sequence[EpisodeResu
                 )
             )
 
-    cmap = plt.cm.get_cmap("tab20", max(1, len(results)))
+    cmap = plt.get_cmap("tab20", max(1, len(results)))
     for idx, result in enumerate(results):
         if len(result.path_xy) < 2:
             continue
@@ -1724,7 +2455,13 @@ def _plot_rollouts(output_dir: Path, env_cfg: Any, results: Sequence[EpisodeResu
         ax.plot(xs, ys, color=color, lw=1.5, alpha=0.9, label=result.scenario_label if idx < 12 else None)
         ax.scatter(xs[0], ys[0], color=color, marker="o", s=18)
         ax.scatter(xs[-1], ys[-1], color=color, marker="x", s=30)
-        ax.scatter(result.target[0], result.target[1], color=color, marker="*", s=150, edgecolors="black", zorder=30)
+        if len(result.reference_xy) >= 2:
+            ref_xs = [p[0] for p in result.reference_xy]
+            ref_ys = [p[1] for p in result.reference_xy]
+            ax.plot(ref_xs, ref_ys, color=color, lw=1.0, alpha=0.45, ls="--")
+            ax.scatter(ref_xs[0], ref_ys[0], color=color, marker="*", s=110, edgecolors="black", zorder=30)
+        else:
+            ax.scatter(result.target[0], result.target[1], color=color, marker="*", s=150, edgecolors="black", zorder=30)
 
     ax.set_title("Position-tracking benchmark trajectories")
     ax.set_xlabel("x [m]")
@@ -1738,9 +2475,10 @@ def _plot_rollouts(output_dir: Path, env_cfg: Any, results: Sequence[EpisodeResu
     plt.close(fig)
     paths["trajectory_xy"] = str(trajectory_path)
 
-    labels = sorted({result.scenario_kind for result in results})
+    grouped = [(label, group) for label, group in _ordered_result_groups(results) if group]
+    labels = [label for label, _group in grouped]
     if labels:
-        groups = [[result for result in results if result.scenario_kind == label] for label in labels]
+        groups = [group for _label, group in grouped]
         time_data = [[result.duration_s for result in group if result.success] for group in groups]
         final_error_data = [
             [float(result.final_pos_error) for result in group if result.final_pos_error is not None] for group in groups
@@ -1756,23 +2494,27 @@ def _plot_rollouts(output_dir: Path, env_cfg: Any, results: Sequence[EpisodeResu
             "capprops": {"color": "#243447", "linewidth": 1.0},
         }
 
-        axes[0].boxplot([data if data else [np.nan] for data in time_data], labels=labels, **box_style)
+        def draw_boxplot(ax, data):
+            try:
+                return ax.boxplot(data, tick_labels=labels, **box_style)
+            except TypeError:
+                return ax.boxplot(data, labels=labels, **box_style)
+
+        draw_boxplot(axes[0], [data if data else [np.nan] for data in time_data])
         axes[0].set_title("Time to target")
         axes[0].set_ylabel("seconds")
 
-        axes[1].boxplot([data if data else [np.nan] for data in final_error_data], labels=labels, **box_style)
+        draw_boxplot(axes[1], [data if data else [np.nan] for data in final_error_data])
         axes[1].set_title("Final position error")
         axes[1].set_ylabel("meters")
 
-        axes[2].boxplot(success_data, labels=labels, **box_style)
+        draw_boxplot(axes[2], success_data)
         axes[2].set_title("Success")
         axes[2].set_ylabel("0/1")
         axes[2].set_ylim(-0.05, 1.05)
 
         total = max(1, len(results))
-        collision_pct = 100.0 * sum(
-            1 for result in results if result.done_reason == 6 or result.pillar_collisions > 0
-        ) / total
+        collision_pct = 100.0 * sum(1 for result in results if result.collided) / total
         success_pct = 100.0 * sum(1 for result in results if result.success) / total
         fig.suptitle(f"Success {success_pct:.1f}% | Collisions {collision_pct:.1f}%")
         for ax in axes:
@@ -1783,6 +2525,68 @@ def _plot_rollouts(output_dir: Path, env_cfg: Any, results: Sequence[EpisodeResu
         fig.savefig(boxplot_path, dpi=180)
         plt.close(fig)
         paths["boxplots"] = str(boxplot_path)
+
+        rows = _performance_summary_rows(results)
+        if rows:
+            labels = [str(row["difficulty"]) for row in rows]
+            capture = [float(row["capture_rate_percent"]) for row in rows]
+            collision = [float(row["collision_rate_percent"]) for row in rows]
+            colors = ["#2c7fb8", "#fdae61", "#d7191c", "#7b3294", "#008837"][: len(labels)]
+
+            fig, ax = plt.subplots(figsize=(7.2, 4.2))
+            ax.bar(labels, capture, color=colors)
+            ax.set_title("Capture rate")
+            ax.set_ylabel("episodes captured [%]")
+            ax.set_ylim(0.0, 100.0)
+            ax.grid(True, axis="y", alpha=0.25)
+            fig.tight_layout()
+            capture_path = output_dir / "capture_rate_by_difficulty.png"
+            fig.savefig(capture_path, dpi=180)
+            plt.close(fig)
+            paths["capture_rate_bar"] = str(capture_path)
+
+            fig, ax = plt.subplots(figsize=(7.2, 4.2))
+            ax.bar(labels, collision, color=colors)
+            ax.set_title("Collision rate")
+            ax.set_ylabel("episodes with collision [%]")
+            ax.set_ylim(0.0, 100.0)
+            ax.grid(True, axis="y", alpha=0.25)
+            fig.tight_layout()
+            collision_path = output_dir / "collision_rate_by_difficulty.png"
+            fig.savefig(collision_path, dpi=180)
+            plt.close(fig)
+            paths["collision_rate_bar"] = str(collision_path)
+
+            fig, ax = plt.subplots(figsize=(5.4, 4.8))
+            for label, x, y, color in zip(labels, collision, capture, colors):
+                ax.scatter(x, y, s=90, color=color, edgecolors="black", linewidths=0.7)
+                ax.annotate(label, (x, y), textcoords="offset points", xytext=(7, 5), fontsize=9)
+            ax.set_title("Safety-performance")
+            ax.set_xlabel("collision rate [%]")
+            ax.set_ylabel("capture rate [%]")
+            ax.set_xlim(-2.0, 102.0)
+            ax.set_ylim(-2.0, 102.0)
+            ax.grid(True, alpha=0.25)
+            fig.tight_layout()
+            scatter_path = output_dir / "safety_performance_scatter.png"
+            fig.savefig(scatter_path, dpi=180)
+            plt.close(fig)
+            paths["safety_performance_scatter"] = str(scatter_path)
+
+            margin_data = [
+                _finite_values([result.min_safety_margin for result in group]) for _label, group in grouped
+            ]
+            fig, ax = plt.subplots(figsize=(7.2, 4.2))
+            draw_boxplot(ax, [data if data else [np.nan] for data in margin_data])
+            ax.axhline(0.0, color="#9e2a2b", lw=1.0, ls="--")
+            ax.set_title("Minimum safety margin")
+            ax.set_ylabel("meters")
+            ax.grid(True, axis="y", alpha=0.25)
+            fig.tight_layout()
+            margin_path = output_dir / "minimum_safety_margin_boxplot.png"
+            fig.savefig(margin_path, dpi=180)
+            plt.close(fig)
+            paths["minimum_safety_margin_boxplot"] = str(margin_path)
 
     return paths
 
@@ -1824,6 +2628,24 @@ def main(env_cfg, agent_cfg: dict):
     _apply_env_overrides_from_agent_cfg(env_cfg, trained_agent_cfg)
     _apply_env_overrides_from_training_env_cfg(env_cfg, trained_env_cfg)
     env_cfg.domain_randomization.enable = False
+    if args_cli.benchmark_profile == "pursuit":
+        env_cfg.enable_pursuit_evasion_curriculum = True
+        env_cfg.enable_walls = True
+        env_cfg.enable_pillars = True
+        env_cfg.pursuit_max_static_obstacles = max(8, int(getattr(env_cfg, "pursuit_max_static_obstacles", 8)))
+        env_cfg.pursuit_max_dynamic_obstacles = max(3, int(getattr(env_cfg, "pursuit_max_dynamic_obstacles", 3)))
+        env_cfg.pursuit_scenario_attempts = max(300, int(getattr(env_cfg, "pursuit_scenario_attempts", 300)))
+        env_cfg.ref_update_interval_s = 0.0
+        if getattr(env_cfg, "control_mode", "") == "RL_velocity":
+            xy_speed = min(abs(float(env_cfg.vel_scale[0])), abs(float(env_cfg.vel_scale[1])))
+            desired_evader_cap = min(1.35, max(0.9, 0.6 * xy_speed))
+            env_cfg.pursuit_evader_max_speed = max(
+                float(getattr(env_cfg, "pursuit_evader_max_speed", 1.25)),
+                desired_evader_cap,
+            )
+        else:
+            env_cfg.pursuit_evader_max_speed = max(float(getattr(env_cfg, "pursuit_evader_max_speed", 1.25)), 1.1)
+        env_cfg.pursuit_dynamic_max_speed = max(float(getattr(env_cfg, "pursuit_dynamic_max_speed", 0.85)), 0.85)
     env_cfg.use_position_controller = args_cli.policy_mode == "baseline"
     if args_cli.policy_mode == "rl":
         if getattr(env_cfg, "obstacle_observation_mode", None) == "ray_caster":
@@ -1952,19 +2774,33 @@ def main(env_cfg, agent_cfg: dict):
     print("[INFO] Environment reset complete.", flush=True)
     action_dim = _action_dim_from_env(base_env)
 
-    scenario_manager = ScenarioManager(base_env, fixed_goals=fixed_goals)
+    scenario_manager = ScenarioManager(
+        base_env,
+        fixed_goals=fixed_goals,
+        pursuit=args_cli.benchmark_profile == "pursuit",
+        tests_per_difficulty=int(args_cli.tests_per_difficulty),
+    )
     all_env_ids = list(range(int(base_env.num_envs)))
-    scenario_manager.assign(all_env_ids)
+    assigned_env_ids = scenario_manager.assign(all_env_ids)
     obs = _refresh_observations_after_reference_write(base_env, obs)
     recorder = RolloutRecorder(base_env, scenario_manager)
-    recorder.start(all_env_ids)
-    print(
-        "[INFO] Benchmark schedule: "
-        f"{len(fixed_goals)} fixed-goal episodes, "
-        f"profile={args_cli.benchmark_profile}, target_episodes={target_episodes}, "
-        f"terminate_on_safety_violation={base_env.cfg.terminate_on_safety_violation}, "
-        f"terminate_on_success={base_env.cfg.terminate_on_success}"
-    )
+    recorder.start(assigned_env_ids)
+    if args_cli.benchmark_profile == "pursuit":
+        print(
+            "[INFO] Benchmark schedule: "
+            f"{int(args_cli.tests_per_difficulty)} scenarios per difficulty, "
+            f"profile={args_cli.benchmark_profile}, target_episodes={target_episodes}, "
+            f"terminate_on_safety_violation={base_env.cfg.terminate_on_safety_violation}, "
+            f"terminate_on_success={base_env.cfg.terminate_on_success}"
+        )
+    else:
+        print(
+            "[INFO] Benchmark schedule: "
+            f"{len(fixed_goals)} fixed-goal episodes, "
+            f"profile={args_cli.benchmark_profile}, target_episodes={target_episodes}, "
+            f"terminate_on_safety_violation={base_env.cfg.terminate_on_safety_violation}, "
+            f"terminate_on_success={base_env.cfg.terminate_on_success}"
+        )
 
     episode_logger = (
         EpisodeLogger(
@@ -2022,9 +2858,9 @@ def main(env_cfg, agent_cfg: dict):
                             f"reason={result.done_label} final_err={result.final_pos_error}"
                         )
                 if target_episodes is None or len(recorder.results) < target_episodes:
-                    scenario_manager.assign([env_id])
+                    assigned_env_ids = scenario_manager.assign([env_id])
                     obs = _refresh_observations_after_reference_write(base_env, obs)
-                    recorder.start([env_id])
+                    recorder.start(assigned_env_ids)
             if isinstance(policy, DGPPOPolicyRunner):
                 policy.reset_done(done)
 
@@ -2042,6 +2878,7 @@ def main(env_cfg, agent_cfg: dict):
         _write_episode_csv(episode_csv_path, recorder.results)
     plot_paths = _plot_rollouts(log_dir, env_cfg, recorder.results)
     summary = _summarize_results(recorder.results, recorder)
+    _print_performance_table(summary)
 
     metrics = {
         "task": args_cli.task,
@@ -2050,9 +2887,14 @@ def main(env_cfg, agent_cfg: dict):
         "policy_mode": args_cli.policy_mode,
         "checkpoint": checkpoint,
         "benchmark_profile": args_cli.benchmark_profile,
+        "tests_per_difficulty": int(args_cli.tests_per_difficulty)
+        if args_cli.benchmark_profile == "pursuit"
+        else None,
         "num_steps": total_steps,
         "target_episodes": target_episodes,
         "fixed_goals": [list(goal) for goal in fixed_goals],
+        "pursuit_evader_max_speed": float(getattr(base_env.cfg, "pursuit_evader_max_speed", 0.0)),
+        "pursuit_dynamic_max_speed": float(getattr(base_env.cfg, "pursuit_dynamic_max_speed", 0.0)),
         "obstacle_observation_mode": str(getattr(base_env.cfg, "obstacle_observation_mode", "")),
         "ray_caster_observation_mode": str(getattr(base_env.cfg, "ray_caster_observation_mode", "")),
         "ray_caster_observation_data": str(getattr(base_env.cfg, "ray_caster_observation_data", "")),

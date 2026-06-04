@@ -925,11 +925,28 @@ class DGPPOAgent(Agent):
 
         pos = view["bTa_agent_state"][0, :, 0, :3].detach().to("cpu")
         goal = view["bTa_goal_state"][0, :, 0, :3].detach().to("cpu")
+        done = view.get("bT_done")
+        done = None if done is None else done[0].detach().to("cpu").bool()
         safety_masks = self._rollout_safety_masks({key: value[:1] for key, value in view.items()})
         masks = {name: mask[0, :, 0].detach().to("cpu").bool() for name, mask in safety_masks.items()}
         unsafe = torch.stack(tuple(masks.values()), dim=0).any(dim=0) if masks else None
         t = torch.arange(pos.shape[0])
-        goal_distance = torch.linalg.vector_norm(goal[:, :3] - pos[:, :3], dim=-1)
+        goal_delta = goal[:, :3] - pos[:, :3]
+        goal_distance = torch.linalg.vector_norm(goal_delta, dim=-1)
+        goal_xy_distance = torch.linalg.vector_norm(goal_delta[:, :2], dim=-1)
+        goal_z_distance = torch.abs(goal_delta[:, 2])
+        goal_changed = torch.zeros(max(pos.shape[0] - 1, 0), dtype=torch.bool)
+        if goal.shape[0] > 1:
+            goal_changed = torch.linalg.vector_norm(goal[1:, :3] - goal[:-1, :3], dim=-1) > 1.0e-4
+        split_after = torch.zeros(pos.shape[0], dtype=torch.bool)
+        if split_after.shape[0] > 1:
+            split_after[:-1] |= goal_changed
+            if done is not None:
+                split_after[:-1] |= done[:-1]
+        segment_ids = torch.cumsum(
+            torch.cat((torch.zeros(1, dtype=torch.long), split_after[:-1].to(torch.long))),
+            dim=0,
+        )
 
         fig, axes = plt.subplots(
             2,
@@ -942,10 +959,22 @@ class DGPPOAgent(Agent):
         fig.suptitle(f"DG-PPO stochastic rollout summary at step {step}", fontsize=13)
 
         self._draw_debug_xy_context(ax_xy)
-        ax_xy.plot(pos[:, 0], pos[:, 1], color="black", linewidth=1.8, label="trajectory")
+        for segment_id in torch.unique(segment_ids):
+            segment = segment_ids == segment_id
+            ax_xy.plot(
+                pos[segment, 0],
+                pos[segment, 1],
+                color="black",
+                linewidth=1.8,
+                label="trajectory" if int(segment_id.item()) == 0 else None,
+            )
         ax_xy.scatter(pos[:1, 0], pos[:1, 1], marker="o", facecolor="white", edgecolor="black", s=55, label="start")
         ax_xy.scatter(pos[-1:, 0], pos[-1:, 1], marker="s", color="black", s=42, label="last")
-        ax_xy.scatter(goal[-1:, 0], goal[-1:, 1], marker="*", color="#cc7a00", s=115, label="goal")
+        if bool(goal_changed.any().item()):
+            ax_xy.scatter(goal[:, 0], goal[:, 1], marker="*", color="#cc7a00", s=36, alpha=0.35, label="goal samples")
+            ax_xy.scatter(goal[-1:, 0], goal[-1:, 1], marker="*", color="#cc7a00", s=125, label="final goal")
+        else:
+            ax_xy.scatter(goal[-1:, 0], goal[-1:, 1], marker="*", color="#cc7a00", s=115, label="goal")
         if unsafe is not None and bool(unsafe.any().item()):
             bad = pos[unsafe]
             ax_xy.scatter(bad[:, 0], bad[:, 1], marker="x", color="black", s=42, linewidths=1.3, label="violation")
@@ -958,6 +987,7 @@ class DGPPOAgent(Agent):
         ax_xy.legend(loc="best", fontsize=8)
 
         ax_z.plot(t, pos[:, 2], color="black", linewidth=1.8, label="z trajectory")
+        ax_z.plot(t, goal[:, 2], color="#cc7a00", linestyle="--", linewidth=1.4, label="goal z")
         bounds = self._debug_arena_bounds()
         if bounds is not None:
             mn, mx = bounds
@@ -967,18 +997,33 @@ class DGPPOAgent(Agent):
         vertical = masks.get("vertical_bounds")
         if vertical is not None and bool(vertical.any().item()):
             ax_z.scatter(t[vertical], pos[vertical, 2], marker="x", color="black", s=35, label="vertical violation")
+        split_steps = torch.nonzero(split_after, as_tuple=False).flatten()
+        for split_step in split_steps.tolist():
+            ax_z.axvline(split_step + 0.5, color="0.55", linestyle="--", linewidth=0.7, alpha=0.65)
         ax_z.set_title("Altitude over rollout")
         ax_z.set_xlabel("rollout step")
         ax_z.set_ylabel("z")
         ax_z.grid(True, linewidth=0.4, alpha=0.35)
         ax_z.legend(loc="best", fontsize=8)
 
-        ax_dist.plot(t, goal_distance, color="black", linewidth=1.8)
+        ax_dist.plot(t, goal_distance, color="black", linewidth=1.8, label="3D")
+        ax_dist.plot(t, goal_xy_distance, color="#2868a8", linewidth=1.3, label="XY")
+        ax_dist.plot(t, goal_z_distance, color="#cc7a00", linewidth=1.3, label="abs z")
+        for idx, split_step in enumerate(split_steps.tolist()):
+            ax_dist.axvline(
+                split_step + 0.5,
+                color="0.55",
+                linestyle="--",
+                linewidth=0.7,
+                alpha=0.65,
+                label="episode/goal split" if idx == 0 else None,
+            )
         ax_dist.axhline(0.0, color="black", linestyle=":", linewidth=1.0)
         ax_dist.set_title("Distance to goal")
         ax_dist.set_xlabel("rollout step")
         ax_dist.set_ylabel("meters")
         ax_dist.grid(True, linewidth=0.4, alpha=0.35)
+        ax_dist.legend(loc="best", fontsize=8)
 
         names = list(masks)
         marker_cycle = ["x", "o", "s", "^"]

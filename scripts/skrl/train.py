@@ -1252,6 +1252,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if not derived_timesteps:
         derived_timesteps = getattr(env_cfg, "total_timesteps", 0)
     env_cfg.total_timesteps = int(derived_timesteps) if derived_timesteps else 0
+    if hasattr(env_cfg, "pursuit_curriculum_total_steps"):
+        env_cfg.pursuit_curriculum_total_steps = int(env_cfg.total_timesteps)
     if args_cli.total_frames is not None:
         target_frames = int(args_cli.total_frames)
         print(

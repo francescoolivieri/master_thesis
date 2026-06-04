@@ -143,9 +143,58 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     ref_update_interval_s: float = 0.0  # 0 means static target per episode
     reference_obstacle_clearance: float = 0.2  # so target is not at the boundary with obstacle
 
+    # Pursuit-evasion curriculum. Disabled by default so legacy position-tracking
+    # configs keep their old static-goal behavior unless training opts in.
+    enable_pursuit_evasion_curriculum: bool = False
+    # Filled by train.py from the resolved skrl trainer budget.
+    pursuit_curriculum_total_steps: int = 0
+    # Fractions for phases 1..5: easy, static-light, static-heavy, one dynamic, many dynamic.
+    pursuit_curriculum_phase_fractions: tuple[float, ...] = (0.20, 0.15, 0.15, 0.25, 0.25)
+    # Width of the soft handoff between adjacent phases, as a fraction of training.
+    pursuit_curriculum_blend_fraction: float = 0.05
+    # Fraction of phase 1 where the evader is fixed in place.
+    pursuit_phase1_fixed_evader_fraction: float = 0.5
+
+    # Evader motion families sampled per episode.
+    pursuit_evader_path_types: tuple[str, ...] = (
+        "spline",
+        "zigzag",
+        "sinusoidal",
+        "loop",
+        "figure_eight",
+    )
+    # Path validity: keep the evader away from walls and reject violent motion.
+    pursuit_evader_wall_clearance: float = 0.28
+    pursuit_evader_radius: float = 0.12
+    pursuit_evader_tube_margin: float = 0.14
+    pursuit_evader_max_speed: float = 1.25
+    pursuit_evader_max_accel: float = 8.0
+    pursuit_evader_max_turn_rate: float = 24.0
+
+    # Fixed observation/scene slots; inactive obstacles are moved outside the arena.
+    pursuit_max_static_obstacles: int = 8
+    pursuit_max_dynamic_obstacles: int = 3
+    # Dynamic obstacle geometry and motion cap.
+    pursuit_dynamic_obstacle_radius: float = 0.16
+    pursuit_dynamic_obstacle_height: float = 1.8
+    pursuit_obstacle_clearance: float = 0.08
+    # Some static obstacles are deliberately near, but outside, the evader tube.
+    pursuit_static_interaction_prob: float = 0.45
+    pursuit_static_interaction_distance: float = 0.85
+    pursuit_dynamic_max_speed: float = 0.85
+
+    # Pursuer spawn constraints: not too close, not impossible, and not boxed in.
+    pursuit_pursuer_wall_clearance: float = 0.22
+    pursuit_pursuer_min_evader_distance: float = 0.65
+    pursuit_pursuer_medium_distance: float = 1.8
+    pursuit_pursuer_far_distance: float = 3.1
+    pursuit_pursuer_future_safe_steps: int = 8
+    # Whole-scenario retries before declaring the sampled episode infeasible.
+    pursuit_scenario_attempts: int = 300
+
     # Reward and penalty weights (signs applied in env)
-    reward_pos: float = 0.5
-    reward_pos_scale: float = 2.0
+    reward_pos: float = 0.75
+    reward_pos_scale: float = 8.0
     reward_yaw: float = 0.3
     # reward_body_rates: float = 0.0015 , UNUSED -> basically sum of reward_body_rates_roll_pitch & yaw
     reward_body_rates_roll_pitch: float = 0.01
@@ -164,8 +213,8 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     # Success criteria
     pos_tolerance: float = 0.15
     yaw_tolerance: float = 0.25
-    success_hold_time_s: float = 1.0 # prev: 0.5
-    terminate_on_success: bool = False
+    success_hold_time_s: float = 0.3
+    terminate_on_success: bool = True
 
     # Episode reset policy. Safety violations are the inner constraints (floor,
     # ceiling, arena faces, pillars). Out-of-boundaries is the outer envelope,
