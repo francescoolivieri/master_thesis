@@ -149,9 +149,9 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     # Filled by train.py from the resolved skrl trainer budget.
     pursuit_curriculum_total_steps: int = 0
     # Fractions for phases 1..4: static evader, moving light, moving static-heavy, moving mixed.
-    pursuit_curriculum_phase_fractions: tuple[float, ...] = (0.25, 0.25, 0.25, 0.25)
+    pursuit_curriculum_phase_fractions: tuple[float, ...] = (0.35, 0.35, 0.30, 0.0)
     # Width of the soft handoff between adjacent phases, as a fraction of training.
-    pursuit_curriculum_blend_fraction: float = 0.05
+    pursuit_curriculum_blend_fraction: float = 0.2
     # Kept for old run configs; phase 1 is fully static in the grid curriculum.
     pursuit_phase1_fixed_evader_fraction: float = 1.0
     # Spawn only the obstacle prim slots needed by reached curriculum phases.
@@ -192,7 +192,8 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
 
     # Reward and penalty weights (signs applied in env)
     reward_pos: float = 0.75
-    reward_pos_scale: float = 8.0
+    reward_approach: float = 5.0
+    #reward_pos_scale: float = 8.0
     reward_yaw: float = 0.3
     # reward_body_rates: float = 0.0015 , UNUSED -> basically sum of reward_body_rates_roll_pitch & yaw
     reward_body_rates_roll_pitch: float = 0.01

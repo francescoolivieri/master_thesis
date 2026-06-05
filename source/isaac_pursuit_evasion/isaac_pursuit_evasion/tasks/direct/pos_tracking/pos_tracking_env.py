@@ -383,8 +383,11 @@ class PosTrackingEnv(DirectRLEnv):
 
         agent_state_flat = torch.cat([agent_pos, agent_vel, agent_rot_body_to_world], dim=-1)
 
-        # Goal state: pos only (3) — vel is always zero for now, omitted
+        # Goal state: pos (3) + scaled closing velocity (3)
         goal_pos = self._reference_pos                          # (E, 3)
+        goal_vel = self._current_evader_vel
+        velocity_scale = agent_vel.new_tensor((15.0, 15.0, 5.0))
+        closing_velocity = (goal_vel - agent_vel) / velocity_scale
 
         # Obstacle state, flattened.
         if self.cfg.obstacle_observation_mode == "none":
@@ -403,8 +406,8 @@ class PosTrackingEnv(DirectRLEnv):
         else:
             obstacle_flat = agent_pos.new_empty(self.num_envs, 0)
 
-        # Layout: [agent_state(S), goal_pos(3), obstacle_data]
-        obs = torch.cat([agent_state_flat, goal_pos, obstacle_flat], dim=-1)
+        # Layout: [agent_state(S), goal_pos(3), closing_vel(3), obstacle_data]
+        obs = torch.cat([agent_state_flat, goal_pos, closing_velocity, obstacle_flat], dim=-1)
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
@@ -412,12 +415,14 @@ class PosTrackingEnv(DirectRLEnv):
         pos_local = self._robot.data.root_pos_w - env_origins
 
         # Position rewards
-        pos_error = torch.norm(self._reference_pos - pos_local, dim=-1)
-        pos_error_squared = pos_error**2
-        pos_reward = self.cfg.reward_pos * torch.exp(-self.cfg.reward_pos_scale * pos_error_squared)
-        rewards = pos_reward.clone()
+        pos_error_now = torch.norm(self._reference_pos - pos_local, dim=-1)
+        pos_error_old = self._last_position_error
+        progress_reward = self.cfg.reward_pos * (pos_error_old - pos_error_now)
+        
+        approach_reward = self.cfg.reward_approach * (pos_error_now < 0.5).float()
+        rewards = progress_reward + approach_reward
         components: dict[str, torch.Tensor] = {
-            "pos": pos_reward,
+            "pos": progress_reward + approach_reward,
         }
 
         # Body rates penalties
@@ -487,6 +492,7 @@ class PosTrackingEnv(DirectRLEnv):
 
         self._last_rewards = rewards
         self._last_reward_components = components
+        self._last_position_error = pos_error_now.detach().clone()
         self._maybe_save_camera_images()
         return rewards
 
@@ -578,6 +584,13 @@ class PosTrackingEnv(DirectRLEnv):
         self._success_counter[env_ids] = 0
         self._last_success[env_ids] = False
         self._reference_timer[env_ids] = 0.0
+        
+        pos_local = self._robot.data.root_pos_w[env_ids] - self._terrain.env_origins[env_ids]
+        pos_error = torch.norm(
+            self._reference_pos[env_ids] - pos_local[env_ids],
+            dim=-1,
+        )
+        self._last_position_error[env_ids] = pos_error
 
         if self._pursuit_enabled:
             self._update_pursuit_episode_motion(env_ids)
@@ -612,11 +625,13 @@ class PosTrackingEnv(DirectRLEnv):
                 "Use ray_caster_observation_data='xy' for DG-PPO graph runs."
             )
         agent_end = self._graph_state_dim * self.num_agents
-        goal_end = agent_end + 3 * self.num_agents
+        goal_state_dim = self._compute_goal_state_dim(self.cfg)
+        goal_end = agent_end + goal_state_dim * self.num_agents
         obstacles_end = goal_end + self._num_obstacle_obs * 2
 
         return {
             "state_dim"   : self._graph_state_dim,
+            "goal_state_dim": goal_state_dim,
             "n_agents"    : self.num_agents,
             "n_obstacles" : self._num_obstacle_obs,
             "agent_end"   : agent_end,
@@ -714,16 +729,20 @@ class PosTrackingEnv(DirectRLEnv):
 
     @staticmethod
     def _compute_obs_dim(cfg: PosTrackingEnvCfg) -> int:
-        # agent state + goal pos (3) + obstacle data
+        # agent state + goal state + obstacle data
         return (
             PosTrackingEnv._compute_graph_state_dim(cfg)
-            + 3
+            + PosTrackingEnv._compute_goal_state_dim(cfg)
             + PosTrackingEnv._compute_obstacle_obs_count(cfg) * PosTrackingEnv._compute_obstacle_obs_dim(cfg)
         )
 
     @staticmethod
     def _compute_graph_state_dim(cfg: PosTrackingEnvCfg) -> int:
         return 15
+
+    @staticmethod
+    def _compute_goal_state_dim(cfg: PosTrackingEnvCfg) -> int:
+        return 6
 
     @staticmethod
     def _compute_obstacle_obs_count(cfg: PosTrackingEnvCfg) -> int:

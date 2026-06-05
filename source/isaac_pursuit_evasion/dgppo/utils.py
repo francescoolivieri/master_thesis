@@ -570,15 +570,18 @@ def extract_graph_states_from_flat_obs(
     S = int(layout["state_dim"])
     A = int(layout.get("n_agents", n_agents))
     n_obstacles = int(layout["n_obstacles"])
+    goal_state_dim = int(layout.get("goal_state_dim", 3))
     if observations.shape[1] != int(layout["obstacles_end"]):
         raise ValueError("graph observation layout does not match observation vector")
 
     agent_flat = observations[:, : layout["agent_end"]]
     agent_state = agent_flat.reshape(E, A, S)
 
-    goal_pos_flat = observations[:, layout["agent_end"] : layout["goal_end"]]
-    goal_pos = goal_pos_flat.reshape(E, A, 3)
-    goal_state = torch.cat([goal_pos, goal_pos.new_zeros(E, A, S - 3)], dim=-1)
+    goal_flat = observations[:, layout["agent_end"] : layout["goal_end"]]
+    goal_data = goal_flat.reshape(E, A, goal_state_dim)
+    goal_state = observations.new_zeros(E, A, S)
+    goal_copy_dim = min(goal_state_dim, S)
+    goal_state[..., :goal_copy_dim] = goal_data[..., :goal_copy_dim]
 
     if n_obstacles > 0:
         obstacle_xy = observations[:, layout["goal_end"] : layout["obstacles_end"]]

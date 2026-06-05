@@ -987,7 +987,8 @@ class DGPPOPolicyRunner:
                 ]
 
         adapted_goal = goal_state.new_zeros(n_envs, goal_state.shape[1], state_dim)
-        adapted_goal[..., : min(3, state_dim)] = goal_state[..., : min(3, state_dim)]
+        goal_copy_dim = min(6, goal_state.shape[-1], state_dim)
+        adapted_goal[..., :goal_copy_dim] = goal_state[..., :goal_copy_dim]
         adapted_obs = obs_state.new_zeros(n_envs, obs_state.shape[1], state_dim)
         adapted_obs[..., : min(2, state_dim)] = obs_state[..., : min(2, state_dim)]
         return adapted_agent, adapted_goal, adapted_obs
