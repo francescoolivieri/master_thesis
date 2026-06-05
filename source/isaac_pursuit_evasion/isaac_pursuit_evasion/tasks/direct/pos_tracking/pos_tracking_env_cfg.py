@@ -177,7 +177,7 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
 
     # Fixed observation/scene slots; inactive obstacles are moved outside the arena.
     pursuit_max_static_obstacles: int = 5
-    pursuit_max_dynamic_obstacles: int = 3
+    pursuit_max_dynamic_obstacles: int = 0
     # Dynamic obstacle geometry and motion cap.
     pursuit_dynamic_obstacle_radius: float = 0.16
     pursuit_dynamic_obstacle_height: float = 1.8

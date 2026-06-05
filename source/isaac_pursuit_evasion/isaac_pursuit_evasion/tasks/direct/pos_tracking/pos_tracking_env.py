@@ -272,6 +272,8 @@ class PosTrackingEnv(DirectRLEnv):
         self._last_episode_status = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
         self._last_step_snapshot: dict[str, torch.Tensor] = {}
 
+        self._last_position_error = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+
         self._body_x_axis = torch.tensor([1.0, 0.0, 0.0], device=self.device)
 
         self._ref_markers: VisualizationMarkers | None = None
@@ -587,7 +589,7 @@ class PosTrackingEnv(DirectRLEnv):
         
         pos_local = self._robot.data.root_pos_w[env_ids] - self._terrain.env_origins[env_ids]
         pos_error = torch.norm(
-            self._reference_pos[env_ids] - pos_local[env_ids],
+            self._reference_pos[env_ids] - pos_local,
             dim=-1,
         )
         self._last_position_error[env_ids] = pos_error
