@@ -169,11 +169,13 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     # Sparse path timing. Each moving episode samples one evader speed and keeps it fixed.
     pursuit_path_waypoint_dt: float = 0.2
     pursuit_evader_speed_range: tuple[float, float] = (0.6, 1.0)
+    pursuit_smooth_evader_path: bool = False
+    pursuit_smooth_evader_resolution: int = 4
+    pursuit_smooth_evader_validate: bool = True
     # Kept for old run configs; the grid curriculum no longer samples macro waypoints.
     pursuit_evader_macro_waypoints: int = 8
     pursuit_evader_wall_clearance: float = 0.28
     pursuit_evader_radius: float = 0.12
-    pursuit_evader_tube_margin: float = 0.14
 
     # Fixed observation/scene slots; inactive obstacles are moved outside the arena.
     pursuit_max_static_obstacles: int = 5
@@ -181,7 +183,7 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     # Dynamic obstacle geometry and motion cap.
     pursuit_dynamic_obstacle_radius: float = 0.16
     pursuit_dynamic_obstacle_height: float = 1.8
-    pursuit_obstacle_clearance: float = 0.08
+    pursuit_obstacle_clearance: float = 0.1
     pursuit_dynamic_max_speed: float = 0.5
 
     # Pursuer spawn constraints.
@@ -191,7 +193,7 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     pursuit_scenario_attempts: int = 300
 
     # Reward and penalty weights (signs applied in env)
-    reward_pos: float = 0.75
+    reward_pos: float = 2.0
     reward_approach: float = 5.0
     #reward_pos_scale: float = 8.0
     reward_yaw: float = 0.3
@@ -205,12 +207,12 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     reward_action_smoothness_rpy: float = 0.01
     reward_action_smoothness_thrust: float  = 0.1
     
-    penalty_altitude_limit: float = 5.0
-    penalty_xy_boundary: float = 5.0
-    penalty_pillar_collision: float = 5.0
+    penalty_altitude_limit: float = 10.0
+    penalty_xy_boundary: float = 10.0
+    penalty_pillar_collision: float = 10.0
 
     # Success criteria
-    pos_tolerance: float = 0.15
+    pos_tolerance: float = 0.22
     yaw_tolerance: float = 0.25
     success_hold_time_s: float = 0.3
     terminate_on_success: bool = True

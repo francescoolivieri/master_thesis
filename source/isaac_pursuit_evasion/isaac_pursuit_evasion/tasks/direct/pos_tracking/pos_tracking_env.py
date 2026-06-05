@@ -421,7 +421,7 @@ class PosTrackingEnv(DirectRLEnv):
         pos_error_old = self._last_position_error
         progress_reward = self.cfg.reward_pos * (pos_error_old - pos_error_now)
         
-        approach_reward = self.cfg.reward_approach * (pos_error_now < 0.5).float()
+        approach_reward = self.cfg.reward_approach * (pos_error_now < self.cfg.pos_tolerance).float()
         rewards = progress_reward + approach_reward
         components: dict[str, torch.Tensor] = {
             "pos": progress_reward + approach_reward,
@@ -1845,6 +1845,9 @@ class PosTrackingEnv(DirectRLEnv):
         if distance < needed * 0.8:
             return None
         polyline = self._grid_cells_to_xy(grid, cells)
+        polyline = self._maybe_smooth_grid_polyline(grid, polyline, float(torch.sum(step_dist).item()))
+        if polyline is None:
+            return None
         return self._grid_polyline_waypoints(polyline, step_dist, z)
 
     def _sample_grid_goal_path(
@@ -1889,6 +1892,84 @@ class PosTrackingEnv(DirectRLEnv):
         waypoints[:, :2] = xy[seg] * (1.0 - tau) + xy[seg + 1] * tau
         waypoints[:, 2] = float(z)
         return waypoints
+
+    def _maybe_smooth_grid_polyline(
+        self,
+        grid: dict[str, torch.Tensor | float],
+        xy: torch.Tensor,
+        min_length: float,
+    ) -> torch.Tensor | None:
+        if not bool(getattr(self.cfg, "pursuit_smooth_evader_path", False)):
+            return xy
+
+        smoothed = self._smooth_path_xy(xy, int(getattr(self.cfg, "pursuit_smooth_evader_resolution", 4)))
+        if smoothed.shape[0] <= 1:
+            return None
+        if self._polyline_length_xy(smoothed) < float(min_length):
+            return None
+        if bool(getattr(self.cfg, "pursuit_smooth_evader_validate", True)) and not self._grid_xy_path_free(
+            grid,
+            smoothed,
+        ):
+            return None
+        return smoothed
+
+    def _smooth_path_xy(self, xy: torch.Tensor, resolution: int) -> torch.Tensor:
+        resolution = max(2, int(resolution))
+        if xy.shape[0] <= 2:
+            return xy
+
+        path = xy
+        size = int(path.shape[0])
+        if size % 2 == 0:
+            midpoint = 0.5 * (path[-1:] + path[-2:-1])
+            path = torch.cat((path[:-1], midpoint, path[-1:]), dim=0)
+            size = int(path.shape[0])
+
+        idx = torch.arange(0, size - 2, 2, device=path.device)
+        if idx.numel() == 0:
+            return xy
+
+        t = torch.arange(1, resolution, device=path.device, dtype=path.dtype) / float(resolution)
+        t = t.view(1, -1, 1)
+        curves = self._quadratic_bezier_xy(path[idx], path[idx + 1], path[idx + 2], t)
+
+        bridges = None
+        if curves.shape[0] > 1:
+            bridges = self._quadratic_bezier_xy(
+                curves[:-1, -1],
+                path[idx[1:]],
+                curves[1:, 0],
+                t,
+            )
+
+        parts = [path[:1]]
+        for curve_id in range(curves.shape[0]):
+            if curve_id > 0 and bridges is not None:
+                parts.append(bridges[curve_id - 1])
+            parts.append(curves[curve_id])
+        parts.append(path[-1:])
+        return torch.cat(parts, dim=0)
+
+    @staticmethod
+    def _quadratic_bezier_xy(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        c: torch.Tensor,
+        t: torch.Tensor,
+    ) -> torch.Tensor:
+        while a.ndim < t.ndim:
+            a = a.unsqueeze(1)
+            b = b.unsqueeze(1)
+            c = c.unsqueeze(1)
+        u = 1.0 - t
+        return u * u * a + 2.0 * u * t * b + t * t * c
+
+    @staticmethod
+    def _polyline_length_xy(xy: torch.Tensor) -> float:
+        if xy.shape[0] <= 1:
+            return 0.0
+        return float(torch.sum(torch.linalg.vector_norm(xy[1:] - xy[:-1], dim=-1)).item())
 
     def _astar_grid_path(
         self,
@@ -2011,6 +2092,31 @@ class PosTrackingEnv(DirectRLEnv):
         closest = start_xy.view(1, 1, 2) + t.unsqueeze(-1) * ab.view(1, 1, 2)
         return torch.linalg.vector_norm(points - closest, dim=-1) <= float(radius)
 
+    def _grid_xy_path_free(self, grid: dict[str, torch.Tensor | float], xy: torch.Tensor) -> bool:
+        if xy.shape[0] == 0:
+            return True
+        if xy.shape[0] == 1:
+            points = xy
+        else:
+            cell = max(1e-6, float(grid["cell_size"]))
+            seg_len = torch.linalg.vector_norm(xy[1:] - xy[:-1], dim=-1)
+            max_samples = max(2, int(torch.ceil(torch.max(seg_len) / (0.5 * cell)).item()) + 1)
+            t = torch.linspace(0.0, 1.0, max_samples, device=xy.device, dtype=xy.dtype)
+            points = xy[:-1, None, :] * (1.0 - t.view(1, -1, 1)) + xy[1:, None, :] * t.view(1, -1, 1)
+            points = points.reshape(-1, 2)
+
+        cell = max(1e-6, float(grid["cell_size"]))
+        xs = grid["xs"]
+        ys = grid["ys"]
+        cols = torch.round((points[:, 0] - xs[0]) / cell).to(torch.long)
+        rows = torch.round((points[:, 1] - ys[0]) / cell).to(torch.long)
+        in_bounds = (rows >= 0) & (rows < ys.shape[0]) & (cols >= 0) & (cols < xs.shape[0])
+        if not bool(torch.all(in_bounds).item()):
+            return False
+
+        occupied = grid["occupied"]
+        return not bool(torch.any(occupied[rows, cols]).item())
+
     def _static_grid_radius(self) -> float:
         return float(self.cfg.pillar_radius + self.cfg.pursuit_evader_radius + self.cfg.pursuit_obstacle_clearance)
 
@@ -2094,58 +2200,6 @@ class PosTrackingEnv(DirectRLEnv):
             lo = self._arena_min_safe[2]
             hi = self._arena_max_safe[2]
         return lo + (hi - lo) * torch.rand((), device=self.device)
-
-    def _dynamic_path_valid(
-        self,
-        path: torch.Tensor,
-        evader_pos: torch.Tensor,
-        static_xy: torch.Tensor,
-        static_active: torch.Tensor,
-        other_pos: torch.Tensor,
-        other_active: torch.Tensor,
-    ) -> bool:
-        path_wp = self._dense_path_to_waypoints(path)
-        evader_wp = self._dense_path_to_waypoints(evader_pos)
-        other_wp = self._dense_dynamic_path_to_waypoints(other_pos)
-        return self._dynamic_waypoints_valid(path_wp, evader_wp, static_xy, static_active, other_wp, other_active)
-
-    def _dynamic_waypoints_valid(
-        self,
-        path: torch.Tensor,
-        evader_waypoints: torch.Tensor,
-        static_xy: torch.Tensor,
-        static_active: torch.Tensor,
-        other_waypoints: torch.Tensor,
-        other_active: torch.Tensor,
-    ) -> bool:
-        radius = float(self.cfg.pursuit_dynamic_obstacle_radius)
-        lo = self._arena_min_safe + radius + float(self.cfg.pursuit_obstacle_clearance)
-        hi = self._arena_max_safe - radius - float(self.cfg.pursuit_obstacle_clearance)
-        if not bool(torch.all((path >= lo) & (path <= hi)).item()):
-            return False
-
-        speed = torch.linalg.vector_norm(self._waypoint_velocities(path), dim=-1)
-        if bool(torch.any(speed > float(self.cfg.pursuit_dynamic_max_speed) * 1.05).item()):
-            return False
-
-        safe_evader = radius + float(self.cfg.pursuit_evader_radius) + float(self.cfg.pursuit_evader_tube_margin)
-        if self._moving_path_distance_xy(path[:, :2], evader_waypoints[:, :2]) <= safe_evader:
-            return False
-
-        if bool(static_active.any().item()):
-            safe_static = radius + float(self.cfg.pillar_radius) + float(self.cfg.pursuit_obstacle_clearance)
-            active_static = static_xy[static_active]
-            if active_static.numel() > 0:
-                d_static = self._point_path_distance_xy(active_static, path[:, :2])
-                if bool(torch.any(d_static <= safe_static).item()):
-                    return False
-
-        if other_waypoints.numel() > 0 and bool(other_active.any().item()):
-            safe_dyn = 2.0 * radius + float(self.cfg.pursuit_obstacle_clearance)
-            for slot in torch.nonzero(other_active, as_tuple=False).flatten().tolist():
-                if self._moving_path_distance_xy(path[:, :2], other_waypoints[:, slot, :2]) <= safe_dyn:
-                    return False
-        return True
 
     def _point_free(
         self,
@@ -2324,68 +2378,6 @@ class PosTrackingEnv(DirectRLEnv):
         pos = p0 * (1.0 - tau) + p1 * tau
         vel = (p1 - p0) / (duration * self._step_dt).clamp_min(self._step_dt)
         return pos.clone(), vel.clone()
-
-    def _dense_path_to_waypoints(self, path: torch.Tensor) -> torch.Tensor:
-        path = torch.as_tensor(path, device=self.device, dtype=torch.float32)
-        if path.shape[0] == self._path_waypoint_count:
-            return path.clone()
-        if path.shape[0] == self._path_steps:
-            return path[self._path_waypoint_steps.clamp(max=path.shape[0] - 1)]
-        return self._resample_path(path, self._path_waypoint_count)
-
-    def _dense_dynamic_path_to_waypoints(self, path: torch.Tensor) -> torch.Tensor:
-        path = torch.as_tensor(path, device=self.device, dtype=torch.float32)
-        if path.numel() == 0:
-            return path.reshape(self._path_waypoint_count, 0, 3)
-        if path.shape[0] == self._path_waypoint_count:
-            return path.clone()
-        if path.shape[0] == self._path_steps:
-            return path[self._path_waypoint_steps.clamp(max=path.shape[0] - 1)]
-        flat = path.permute(1, 0, 2).reshape(-1, path.shape[0], path.shape[-1])
-        out = torch.stack([self._resample_path(item, self._path_waypoint_count) for item in flat], dim=0)
-        return out.reshape(path.shape[1], self._path_waypoint_count, path.shape[-1]).permute(1, 0, 2)
-
-    def _resample_path(self, path: torch.Tensor, steps: int) -> torch.Tensor:
-        if path.shape[0] == steps:
-            return path.clone()
-        if path.shape[0] <= 1:
-            return path[:1].repeat(steps, *([1] * (path.ndim - 1)))
-        target = torch.linspace(0.0, float(path.shape[0] - 1), steps, device=path.device, dtype=path.dtype)
-        idx0 = torch.floor(target).to(torch.long).clamp(max=path.shape[0] - 1)
-        idx1 = torch.clamp(idx0 + 1, max=path.shape[0] - 1)
-        tau = (target - idx0.to(path.dtype)).view(-1, *([1] * (path.ndim - 1)))
-        return path[idx0] * (1.0 - tau) + path[idx1] * tau
-
-    def _point_path_distance_xy(self, points: torch.Tensor, path_xy: torch.Tensor) -> torch.Tensor:
-        points = torch.as_tensor(points, device=self.device, dtype=path_xy.dtype).reshape(-1, 2)
-        a = path_xy[:-1]
-        b = path_xy[1:]
-        ab = b - a
-        denom = torch.sum(ab * ab, dim=-1).clamp_min(1e-6)
-        rel = points[:, None, :] - a[None, :, :]
-        t = torch.clamp(torch.sum(rel * ab[None, :, :], dim=-1) / denom[None, :], 0.0, 1.0)
-        closest = a[None, :, :] + t[..., None] * ab[None, :, :]
-        dist = torch.linalg.vector_norm(points[:, None, :] - closest, dim=-1)
-        return torch.min(dist, dim=-1).values
-
-    def _moving_path_distance_xy(self, a_xy: torch.Tensor, b_xy: torch.Tensor) -> float:
-        a0 = a_xy[:-1]
-        a1 = a_xy[1:]
-        b0 = b_xy[:-1]
-        b1 = b_xy[1:]
-        r0 = a0 - b0
-        rv = (a1 - a0) - (b1 - b0)
-        denom = torch.sum(rv * rv, dim=-1).clamp_min(1e-6)
-        t = torch.clamp(-torch.sum(r0 * rv, dim=-1) / denom, 0.0, 1.0)
-        closest = r0 + t[:, None] * rv
-        return float(torch.min(torch.linalg.vector_norm(closest, dim=-1)).item())
-
-    def _path_velocity(self, pos: torch.Tensor) -> torch.Tensor:
-        vel = torch.zeros_like(pos)
-        if pos.shape[0] > 1:
-            vel[:-1] = (pos[1:] - pos[:-1]) / max(self._step_dt, 1e-6)
-            vel[-1] = vel[-2]
-        return vel
 
     def _safe_xy_bounds(self, margin: float) -> tuple[torch.Tensor, torch.Tensor]:
         margin = float(margin)
