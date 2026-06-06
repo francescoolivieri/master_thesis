@@ -259,6 +259,8 @@ _TRAINING_ENV_COMPAT_KEYS = (
     "reward_body_rates",
     "reward_lin_vel",
     "reward_action_smoothness",
+    "reward_success",
+    "penalty_timeout",
     "penalty_altitude_limit",
     "penalty_xy_boundary",
     "penalty_pillar_collision",

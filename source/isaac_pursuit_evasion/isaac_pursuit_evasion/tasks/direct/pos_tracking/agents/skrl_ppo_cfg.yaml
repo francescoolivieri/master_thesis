@@ -82,7 +82,7 @@ agent:
     write_interval: auto
     checkpoint_interval: auto
 
-    wandb: true
+    wandb: false
     wandb_kwargs:
       project: "drones_rpl"
       entity: ""

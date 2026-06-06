@@ -261,6 +261,7 @@ class PosTrackingEnv(DirectRLEnv):
         self._success_hold_steps = max(1, int(round(self.cfg.success_hold_time_s / self._step_dt)))
         self._success_counter = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
         self._last_success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._last_success_event = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         self._last_rewards = torch.zeros(self.num_envs, device=self.device)
         self._last_reward_components: dict[str, torch.Tensor] = {}
@@ -492,6 +493,12 @@ class PosTrackingEnv(DirectRLEnv):
         components["xy_boundary"] = -xy_boundary_pen
         components["pillar_collision"] = -pillar_collision_pen
 
+        success_reward = float(self.cfg.reward_success) * self._last_success_event.to(rewards.dtype)
+        timeout_penalty = float(self.cfg.penalty_timeout) * self.reset_time_outs.to(rewards.dtype)
+        rewards += success_reward - timeout_penalty
+        components["success"] = success_reward
+        components["timeout"] = -timeout_penalty
+
         self._last_rewards = rewards
         self._last_reward_components = components
         self._last_position_error = pos_error_now.detach().clone()
@@ -509,6 +516,7 @@ class PosTrackingEnv(DirectRLEnv):
 
         success = self._update_success_flags(pos_local)
         self._last_success = success
+        self._last_success_event = success & (self._success_counter == self._success_hold_steps)
 
         safety_violation = altitude_limit | xy_limit | pillar_collision
         terminated = invalid.clone()
@@ -520,6 +528,8 @@ class PosTrackingEnv(DirectRLEnv):
             terminated |= success
 
         truncated = timeout & (~terminated)
+        self._dgppo_reward_aux["success_event"] = self._last_success_event.detach().clone()
+        self._dgppo_reward_aux["timeout"] = truncated.detach().clone()
 
         episode_status = torch.full((self.num_envs,), REASON_RUNNING, dtype=torch.int32, device=self.device)
         if self.cfg.terminate_on_success:
@@ -585,6 +595,7 @@ class PosTrackingEnv(DirectRLEnv):
         self._action_diff[env_ids] = 0.0
         self._success_counter[env_ids] = 0
         self._last_success[env_ids] = False
+        self._last_success_event[env_ids] = False
         self._reference_timer[env_ids] = 0.0
         
         pos_local = self._robot.data.root_pos_w[env_ids] - self._terrain.env_origins[env_ids]
@@ -713,6 +724,17 @@ class PosTrackingEnv(DirectRLEnv):
                 smooth_weight_default if smooth_weight_thrust_cfg is None else float(smooth_weight_thrust_cfg)
             )
             rewards = rewards - smooth_weight_rpy * action_delta_rpy - smooth_weight_thrust * action_delta_thrust
+
+        if reward_aux is not None:
+            success_event = reward_aux.get("success_event")
+            if success_event is not None:
+                success_event = success_event.to(device=self.device, dtype=torch.bool).reshape(n_envs)
+                rewards = rewards + float(self.cfg.reward_success) * success_event.to(rewards.dtype)
+
+            timeout = reward_aux.get("timeout")
+            if timeout is not None:
+                timeout = timeout.to(device=self.device, dtype=torch.bool).reshape(n_envs)
+                rewards = rewards - float(self.cfg.penalty_timeout) * timeout.to(rewards.dtype)
 
         return rewards
 
@@ -1822,21 +1844,42 @@ class PosTrackingEnv(DirectRLEnv):
         if speed <= 0.0:
             return self._grid_static_evader_waypoints(grid, start_cell, z)
 
+        smooth = bool(getattr(self.cfg, "pursuit_smooth_evader_path", False))
         step_dist = self._evader_step_distances(speed)
-        needed = float(torch.sum(step_dist).item()) + float(grid["cell_size"])
+        required_distance = float(torch.sum(step_dist).item())
+        needed = required_distance + float(grid["cell_size"])
         occupied = grid["occupied"].clone()
         current = start_cell
-        cells = [current]
+        polyline = self._grid_cell_xy(grid, current).view(1, 2)
         distance = 0.0
 
         for path_id in range(24):
             if distance >= needed:
                 break
-            path = self._sample_grid_goal_path(grid, occupied, current)
-            if path is None:
+            next_polyline = None
+            goal_attempts = 1
+            if path_id > 0 and smooth:
+                goal_attempts = max(1, int(getattr(self.cfg, "pursuit_smooth_evader_goal_attempts", 6)))
+
+            for _ in range(goal_attempts):
+                incoming_direction = None
+                if path_id > 0 and polyline.shape[0] > 1 and smooth:
+                    incoming_direction = torch.nn.functional.normalize(polyline[-1] - polyline[-2], dim=0)
+                path = self._sample_grid_goal_path(grid, occupied, current, incoming_direction)
+                if path is None:
+                    continue
+                path_xy = self._grid_cells_to_xy(grid, path)
+                if path_id == 0 or not smooth:
+                    next_polyline = torch.cat((polyline, path_xy[1:]), dim=0)
+                else:
+                    next_polyline = self._blend_grid_goal_junction(grid, polyline, path_xy)
+                if next_polyline is not None:
+                    break
+
+            if next_polyline is None:
                 return None
-            distance += self._grid_path_length(grid, path)
-            cells.extend(path[1:])
+            polyline = next_polyline
+            distance = self._polyline_length_xy(polyline)
             current = path[-1]
             if path_id == 0:
                 occupied = occupied.clone()
@@ -1844,9 +1887,12 @@ class PosTrackingEnv(DirectRLEnv):
 
         if distance < needed * 0.8:
             return None
-        polyline = self._grid_cells_to_xy(grid, cells)
-        polyline = self._maybe_smooth_grid_polyline(grid, polyline, float(torch.sum(step_dist).item()))
-        if polyline is None:
+        if distance < required_distance:
+            return None
+        if bool(getattr(self.cfg, "pursuit_smooth_evader_validate", True)) and not self._grid_xy_path_free(
+            grid,
+            polyline,
+        ):
             return None
         return self._grid_polyline_waypoints(polyline, step_dist, z)
 
@@ -1855,6 +1901,7 @@ class PosTrackingEnv(DirectRLEnv):
         grid: dict[str, torch.Tensor | float],
         occupied: torch.Tensor,
         start_cell: tuple[int, int],
+        incoming_direction: torch.Tensor | None = None,
     ) -> list[tuple[int, int]] | None:
         free = torch.nonzero(~occupied, as_tuple=False)
         if free.numel() == 0:
@@ -1864,6 +1911,16 @@ class PosTrackingEnv(DirectRLEnv):
         goal_min = max(0.0, float(self.cfg.pursuit_evader_goal_min_distance))
         xy = self._grid_cells_xy(grid, free)
         valid = torch.linalg.vector_norm(xy - start_xy.view(1, 2), dim=-1) >= goal_min
+        if bool(getattr(self.cfg, "pursuit_smooth_evader_path", False)):
+            margin = max(0.0, float(getattr(self.cfg, "pursuit_smooth_evader_goal_blend_distance", 0.35)))
+            lo = torch.stack((grid["xs"][0], grid["ys"][0])) + margin
+            hi = torch.stack((grid["xs"][-1], grid["ys"][-1])) - margin
+            valid &= torch.all((xy >= lo.view(1, 2)) & (xy <= hi.view(1, 2)), dim=-1)
+        if incoming_direction is not None:
+            goal_direction = torch.nn.functional.normalize(xy - start_xy.view(1, 2), dim=-1)
+            min_alignment = float(getattr(self.cfg, "pursuit_smooth_evader_goal_sample_min_alignment", -0.8))
+            alignment = torch.sum(goal_direction * incoming_direction.view(1, 2), dim=-1)
+            valid &= alignment >= min_alignment
         candidates = free[valid]
         if candidates.numel() == 0:
             return None
@@ -1893,77 +1950,80 @@ class PosTrackingEnv(DirectRLEnv):
         waypoints[:, 2] = float(z)
         return waypoints
 
-    def _maybe_smooth_grid_polyline(
+    def _blend_grid_goal_junction(
         self,
         grid: dict[str, torch.Tensor | float],
-        xy: torch.Tensor,
-        min_length: float,
+        previous: torch.Tensor,
+        following: torch.Tensor,
     ) -> torch.Tensor | None:
-        if not bool(getattr(self.cfg, "pursuit_smooth_evader_path", False)):
-            return xy
-
-        smoothed = self._smooth_path_xy(xy, int(getattr(self.cfg, "pursuit_smooth_evader_resolution", 4)))
-        if smoothed.shape[0] <= 1:
+        if previous.shape[0] <= 1 or following.shape[0] <= 1:
             return None
-        if self._polyline_length_xy(smoothed) < float(min_length):
+
+        blend = max(0.0, float(getattr(self.cfg, "pursuit_smooth_evader_goal_blend_distance", 0.35)))
+        blend = min(blend, 0.45 * self._polyline_length_xy(previous), 0.45 * self._polyline_length_xy(following))
+        if blend <= 1e-6:
             return None
-        if bool(getattr(self.cfg, "pursuit_smooth_evader_validate", True)) and not self._grid_xy_path_free(
-            grid,
-            smoothed,
-        ):
+
+        before, entry = self._polyline_prefix_at_distance(previous, self._polyline_length_xy(previous) - blend)
+        exit, after = self._polyline_suffix_at_distance(following, blend)
+        incoming = torch.nn.functional.normalize(previous[-1] - entry, dim=0)
+        outgoing = torch.nn.functional.normalize(exit - following[0], dim=0)
+        alignment = float(torch.dot(incoming, outgoing).item())
+        min_alignment = float(getattr(self.cfg, "pursuit_smooth_evader_goal_min_alignment", -0.8))
+        if alignment < min_alignment:
             return None
-        return smoothed
 
-    def _smooth_path_xy(self, xy: torch.Tensor, resolution: int) -> torch.Tensor:
-        resolution = max(2, int(resolution))
-        if xy.shape[0] <= 2:
-            return xy
-
-        path = xy
-        size = int(path.shape[0])
-        if size % 2 == 0:
-            midpoint = 0.5 * (path[-1:] + path[-2:-1])
-            path = torch.cat((path[:-1], midpoint, path[-1:]), dim=0)
-            size = int(path.shape[0])
-
-        idx = torch.arange(0, size - 2, 2, device=path.device)
-        if idx.numel() == 0:
-            return xy
-
-        t = torch.arange(1, resolution, device=path.device, dtype=path.dtype) / float(resolution)
-        t = t.view(1, -1, 1)
-        curves = self._quadratic_bezier_xy(path[idx], path[idx + 1], path[idx + 2], t)
-
-        bridges = None
-        if curves.shape[0] > 1:
-            bridges = self._quadratic_bezier_xy(
-                curves[:-1, -1],
-                path[idx[1:]],
-                curves[1:, 0],
-                t,
-            )
-
-        parts = [path[:1]]
-        for curve_id in range(curves.shape[0]):
-            if curve_id > 0 and bridges is not None:
-                parts.append(bridges[curve_id - 1])
-            parts.append(curves[curve_id])
-        parts.append(path[-1:])
-        return torch.cat(parts, dim=0)
+        incoming_tangent = torch.nn.functional.normalize(before[-1] - before[-2], dim=0)
+        outgoing_tangent = torch.nn.functional.normalize(after[1] - after[0], dim=0)
+        control_distance = 0.5 * blend
+        control_in = entry + control_distance * incoming_tangent
+        control_out = exit - control_distance * outgoing_tangent
+        resolution = max(2, int(getattr(self.cfg, "pursuit_smooth_evader_resolution", 4)))
+        t = torch.linspace(0.0, 1.0, resolution + 1, device=previous.device, dtype=previous.dtype)
+        curve = self._cubic_bezier_xy(entry, control_in, control_out, exit, t.view(-1, 1))
+        if bool(getattr(self.cfg, "pursuit_smooth_evader_validate", True)) and not self._grid_xy_path_free(grid, curve):
+            return None
+        return torch.cat((before[:-1], curve, after[1:]), dim=0)
 
     @staticmethod
-    def _quadratic_bezier_xy(
+    def _polyline_prefix_at_distance(xy: torch.Tensor, distance: float) -> tuple[torch.Tensor, torch.Tensor]:
+        seg_len = torch.linalg.vector_norm(xy[1:] - xy[:-1], dim=-1).clamp_min(1e-6)
+        cumulative = torch.cat((torch.zeros(1, device=xy.device), torch.cumsum(seg_len, dim=0)))
+        target = torch.as_tensor(distance, device=xy.device, dtype=xy.dtype).clamp(0.0, cumulative[-1])
+        seg = int(torch.searchsorted(cumulative[1:], target).clamp(max=seg_len.shape[0] - 1).item())
+        tau = (target - cumulative[seg]) / seg_len[seg]
+        point = xy[seg] * (1.0 - tau) + xy[seg + 1] * tau
+        if float(tau.item()) <= 1e-6:
+            return xy[: seg + 1], point
+        return torch.cat((xy[: seg + 1], point.view(1, 2)), dim=0), point
+
+    @staticmethod
+    def _polyline_suffix_at_distance(xy: torch.Tensor, distance: float) -> tuple[torch.Tensor, torch.Tensor]:
+        seg_len = torch.linalg.vector_norm(xy[1:] - xy[:-1], dim=-1).clamp_min(1e-6)
+        cumulative = torch.cat((torch.zeros(1, device=xy.device), torch.cumsum(seg_len, dim=0)))
+        target = torch.as_tensor(distance, device=xy.device, dtype=xy.dtype).clamp(0.0, cumulative[-1])
+        seg = int(torch.searchsorted(cumulative[1:], target).clamp(max=seg_len.shape[0] - 1).item())
+        tau = (target - cumulative[seg]) / seg_len[seg]
+        point = xy[seg] * (1.0 - tau) + xy[seg + 1] * tau
+        if float(tau.item()) >= 1.0 - 1e-6:
+            return point, xy[seg + 1 :]
+        return point, torch.cat((point.view(1, 2), xy[seg + 1 :]), dim=0)
+
+    @staticmethod
+    def _cubic_bezier_xy(
         a: torch.Tensor,
         b: torch.Tensor,
         c: torch.Tensor,
+        d: torch.Tensor,
         t: torch.Tensor,
     ) -> torch.Tensor:
         while a.ndim < t.ndim:
-            a = a.unsqueeze(1)
-            b = b.unsqueeze(1)
-            c = c.unsqueeze(1)
+            a = a.unsqueeze(-2)
+            b = b.unsqueeze(-2)
+            c = c.unsqueeze(-2)
+            d = d.unsqueeze(-2)
         u = 1.0 - t
-        return u * u * a + 2.0 * u * t * b + t * t * c
+        return u * u * u * a + 3.0 * u * u * t * b + 3.0 * u * t * t * c + t * t * t * d
 
     @staticmethod
     def _polyline_length_xy(xy: torch.Tensor) -> float:
@@ -2051,12 +2111,6 @@ class PosTrackingEnv(DirectRLEnv):
         rows = torch.tensor([cell[0] for cell in cells], device=self.device, dtype=torch.long)
         cols = torch.tensor([cell[1] for cell in cells], device=self.device, dtype=torch.long)
         return torch.stack((grid["xs"][cols], grid["ys"][rows]), dim=-1)
-
-    def _grid_path_length(self, grid: dict[str, torch.Tensor | float], path: list[tuple[int, int]]) -> float:
-        if len(path) <= 1:
-            return 0.0
-        xy = self._grid_cells_to_xy(grid, path)
-        return float(torch.sum(torch.linalg.vector_norm(xy[1:] - xy[:-1], dim=-1)).item())
 
     def _mark_grid_square(
         self,

@@ -50,7 +50,7 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     """Configuration for the position tracking environment."""
 
     # Simulation settings
-    episode_length_s = 8.32
+    episode_length_s = 10.0
     sim_frequency = 500
     policy_rate_hz = 50
     pid_loop_rate_hz = 500
@@ -169,9 +169,14 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     # Sparse path timing. Each moving episode samples one evader speed and keeps it fixed.
     pursuit_path_waypoint_dt: float = 0.2
     pursuit_evader_speed_range: tuple[float, float] = (0.6, 1.0)
-    pursuit_smooth_evader_path: bool = False
+    pursuit_smooth_evader_path: bool = True
     pursuit_smooth_evader_resolution: int = 4
     pursuit_smooth_evader_validate: bool = True
+    # Round only chained A* goal junctions; internal A* corners stay polygonal.
+    pursuit_smooth_evader_goal_blend_distance: float = 0.3
+    pursuit_smooth_evader_goal_sample_min_alignment: float = -0.8 # 143 degrees
+    pursuit_smooth_evader_goal_min_alignment: float = -0.8
+    pursuit_smooth_evader_goal_attempts: int = 6
     # Kept for old run configs; the grid curriculum no longer samples macro waypoints.
     pursuit_evader_macro_waypoints: int = 8
     pursuit_evader_wall_clearance: float = 0.28
@@ -206,10 +211,12 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     # If None, the corresponding weight falls back to reward_action_smoothness.
     reward_action_smoothness_rpy: float = 0.01
     reward_action_smoothness_thrust: float  = 0.1
+    reward_success: float = 10.0
     
     penalty_altitude_limit: float = 10.0
     penalty_xy_boundary: float = 10.0
     penalty_pillar_collision: float = 10.0
+    penalty_timeout: float = 10.0
 
     # Success criteria
     pos_tolerance: float = 0.22
