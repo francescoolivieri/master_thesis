@@ -729,6 +729,43 @@ def _termination_rates_to_metrics(base_env: Any) -> dict[str, float]:
     return metrics
 
 
+def _episode_outcome_rates_to_metrics(base_env: Any) -> dict[str, float]:
+    if not hasattr(base_env, "get_episode_status_counts"):
+        return {}
+    try:
+        counts = base_env.get_episode_status_counts().view(-1).to(device="cpu", dtype=torch.int64)
+    except Exception:
+        return {}
+
+    previous = getattr(base_env, "_train_last_episode_status_counts", torch.zeros_like(counts))
+    base_env._train_last_episode_status_counts = counts.clone()
+    if previous.shape != counts.shape:
+        previous = torch.zeros_like(counts)
+    delta = torch.clamp(counts - previous, min=0)
+    total = int(delta.sum().item())
+    if total <= 0:
+        return {}
+
+    metrics = {"Env/episode_outcomes/count": float(total)}
+    mapping = getattr(base_env, "DONE_REASON_MAP", None) or getattr(base_env, "DONE_REASON_LABELS", None) or {}
+    for idx, label in mapping.items():
+        idx_int = int(idx)
+        if idx_int == 0 or idx_int >= delta.numel():
+            continue
+        metrics[f"Env/episode_outcomes/{label}"] = float(delta[idx_int].item() / total)
+    return metrics
+
+
+def _curriculum_to_metrics(base_env: Any) -> dict[str, float]:
+    if not hasattr(base_env, "get_curriculum_metrics"):
+        return {}
+    try:
+        metrics = base_env.get_curriculum_metrics()
+    except Exception:
+        return {}
+    return {f"Env/curriculum/{name}": float(value) for name, value in metrics.items()}
+
+
 def _tracking_error_metrics(base_env: Any) -> dict[str, float]:
     if not hasattr(base_env, "get_reference_pose") or not hasattr(base_env, "_robot"):
         return {}
@@ -1179,7 +1216,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.domain_randomization.enable = bool(args_cli.domain_randomization)
     _apply_env_overrides_from_agent_cfg(env_cfg, agent_cfg)
     _enforce_algorithm_env_contracts(env_cfg, algorithm)
-            
+    frames_per_step = max(1, num_envs_cfg)
+    derived_timesteps = (
+        train_timesteps if train_timesteps is not None else agent_cfg.get("trainer", {}).get("timesteps", 0)
+    )
+    if not derived_timesteps:
+        derived_timesteps = getattr(env_cfg, "total_timesteps", 0)
+    env_cfg.total_timesteps = int(derived_timesteps) if derived_timesteps else 0
+    if hasattr(env_cfg, "pursuit_curriculum_total_steps"):
+        env_cfg.pursuit_curriculum_total_steps = int(env_cfg.total_timesteps)
+
     # randomly sample a seed if seed = -1
     if args_cli.seed == -1:
         args_cli.seed = random.randint(0, 10000)
@@ -1241,19 +1287,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
 
-    frames_per_step = max(1, num_envs_cfg)
     video_interval_steps = _frames_to_timesteps(args_cli.video_interval_frames, frames_per_step)
     if video_interval_steps is None:
         video_interval_steps = 8000  # fallback to previous default in steps
     video_interval_steps = max(1, int(video_interval_steps))
 
     # create isaac environment
-    derived_timesteps = train_timesteps if train_timesteps is not None else agent_cfg.get("trainer", {}).get("timesteps", 0)
-    if not derived_timesteps:
-        derived_timesteps = getattr(env_cfg, "total_timesteps", 0)
-    env_cfg.total_timesteps = int(derived_timesteps) if derived_timesteps else 0
-    if hasattr(env_cfg, "pursuit_curriculum_total_steps"):
-        env_cfg.pursuit_curriculum_total_steps = int(env_cfg.total_timesteps)
     if args_cli.total_frames is not None:
         target_frames = int(args_cli.total_frames)
         print(
@@ -1395,6 +1434,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     pass
                 try:
                     env_metrics.update(_termination_rates_to_metrics(base_env))
+                except Exception:
+                    pass
+                try:
+                    env_metrics.update(_episode_outcome_rates_to_metrics(base_env))
+                except Exception:
+                    pass
+                try:
+                    env_metrics.update(_curriculum_to_metrics(base_env))
                 except Exception:
                     pass
                 if env_metrics:

@@ -150,7 +150,7 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     pursuit_curriculum_total_steps: int = 0
     # Fractions for phases 1..4: static evader, moving light, moving static-heavy, moving mixed.
     pursuit_curriculum_phase_fractions: tuple[float, ...] = (0.35, 0.35, 0.30, 0.0)
-    # Width of the soft handoff between adjacent phases, as a fraction of training.
+    # Fraction of each phase used for the soft handoff to the next enabled phase.
     pursuit_curriculum_blend_fraction: float = 0.2
     # Kept for old run configs; phase 1 is fully static in the grid curriculum.
     pursuit_phase1_fixed_evader_fraction: float = 1.0

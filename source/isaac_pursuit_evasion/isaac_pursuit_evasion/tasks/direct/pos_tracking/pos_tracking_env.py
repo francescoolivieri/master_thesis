@@ -271,6 +271,7 @@ class PosTrackingEnv(DirectRLEnv):
             "action_diff": torch.zeros_like(self._actions),
         }
         self._last_episode_status = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+        self._episode_status_counts = torch.zeros(len(EPISODE_STATUS_LABELS), dtype=torch.int64, device=self.device)
         self._last_step_snapshot: dict[str, torch.Tensor] = {}
 
         self._last_position_error = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
@@ -543,6 +544,12 @@ class PosTrackingEnv(DirectRLEnv):
         episode_status[truncated] = REASON_TIMEOUT
         episode_status[terminated & invalid] = REASON_INVALID
         self._last_episode_status = episode_status
+        done_status = episode_status[episode_status != REASON_RUNNING].to(torch.int64)
+        if done_status.numel() > 0:
+            self._episode_status_counts += torch.bincount(
+                done_status,
+                minlength=self._episode_status_counts.numel(),
+            )
         self._last_step_snapshot = {
             "pos_local": pos_local.detach().clone(),
             "vel_world": self._robot.data.root_lin_vel_w.detach().clone(),
@@ -2195,15 +2202,28 @@ class PosTrackingEnv(DirectRLEnv):
 
         end = 0.0
         for phase, fraction in enumerate(fractions, start=1):
-            end += float(fraction)
+            fraction = max(0.0, float(fraction))
+            end += fraction
+            if fraction == 0.0:
+                continue
             if progress <= end:
-                blend = max(0.0, float(self.cfg.pursuit_curriculum_blend_fraction))
-                if blend > 0.0 and phase < len(fractions):
-                    prob_next = max(0.0, min(1.0, (progress - (end - blend)) / blend))
+                blend_ratio = max(0.0, min(1.0, float(self.cfg.pursuit_curriculum_blend_fraction)))
+                blend_width = fraction * blend_ratio
+                next_phase = next(
+                    (
+                        idx
+                        for idx in range(phase + 1, len(fractions) + 1)
+                        if float(fractions[idx - 1]) > 0.0
+                    ),
+                    None,
+                )
+                if blend_width > 0.0 and next_phase is not None:
+                    prob_next = max(0.0, min(1.0, (progress - (end - blend_width)) / blend_width))
                     if float(torch.rand((), device=self.device)) < prob_next:
-                        return phase + 1
+                        return next_phase
                 return phase
-        return len(fractions)
+        enabled = [phase for phase, fraction in enumerate(fractions, start=1) if float(fraction) > 0.0]
+        return enabled[-1] if enabled else 1
 
     def _phase_obstacle_counts(self, phase: int) -> tuple[int, int]:
         phase = int(phase)
@@ -2888,8 +2908,22 @@ class PosTrackingEnv(DirectRLEnv):
     def get_last_done_reasons(self) -> torch.Tensor:
         return self.get_last_episode_status()
 
+    def get_episode_status_counts(self) -> torch.Tensor:
+        return self._episode_status_counts.clone()
+
     def get_last_step_snapshot(self) -> dict[str, torch.Tensor]:
         return self._last_step_snapshot
+
+    def get_curriculum_metrics(self) -> dict[str, float]:
+        if not self._pursuit_enabled:
+            return {}
+        metrics = {
+            "progress": self._curriculum_progress(),
+            "fallback_fraction": float(self._scenario_fallback.float().mean().item()),
+        }
+        for phase in range(1, len(self.cfg.pursuit_curriculum_phase_fractions) + 1):
+            metrics[f"phase_{phase}_fraction"] = float((self._scenario_phase == phase).float().mean().item())
+        return metrics
 
     def get_reference_pose(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self._reference_pos.clone(), self._reference_yaw.clone()
