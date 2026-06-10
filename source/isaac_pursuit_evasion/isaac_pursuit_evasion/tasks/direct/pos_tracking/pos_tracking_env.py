@@ -231,6 +231,8 @@ class PosTrackingEnv(DirectRLEnv):
         self._scenario_phase = torch.ones(self.num_envs, dtype=torch.int64, device=self.device)
         self._scenario_fallback = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._scenario_fallback_count = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
+        # Tracks whether a full scenario has been generated for each env at least once.
+        self._scenario_initialized = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         self._dynamic_obstacle_waypoints = torch.zeros(
             self.num_envs, self._path_waypoint_count, self._max_dynamic_obstacles, 3, device=self.device
@@ -1492,32 +1494,135 @@ class PosTrackingEnv(DirectRLEnv):
         self._move_dynamic_obstacles(all_envs)
         self._refresh_ray_caster_meshes()
 
-    def _resample_pursuit_scenarios(self, env_ids: torch.Tensor) -> None:
-        attempts = max(1, int(self.cfg.pursuit_scenario_attempts))
+    def _is_in_curriculum_blend(self) -> bool:
+        """Return True if the curriculum is currently in a blend section between phases."""
+        fractions = self.cfg.pursuit_curriculum_phase_fractions
+        if not fractions:
+            return False
+        progress = self._curriculum_progress()
+        blend_ratio = max(0.0, min(1.0, float(self.cfg.pursuit_curriculum_blend_fraction)))
+        if blend_ratio <= 0.0:
+            return False
+        end = 0.0
+        for phase, fraction in enumerate(fractions, start=1):
+            fraction = max(0.0, float(fraction))
+            end += fraction
+            if fraction == 0.0:
+                continue
+            if progress <= end:
+                blend_width = fraction * blend_ratio
+                next_phase = next(
+                    (idx for idx in range(phase + 1, len(fractions) + 1) if float(fractions[idx - 1]) > 0.0),
+                    None,
+                )
+                if blend_width > 0.0 and next_phase is not None:
+                    blend_start = end - blend_width
+                    if progress >= blend_start:
+                        return True
+                return False
+        return False
+
+    def _resample_pursuit_scenarios_fast(self, env_ids: torch.Tensor) -> None:
+        """Cheap reset: reuse existing obstacle layout, only resample speed and pursuer start.
+
+        For each env we rescale the existing evader waypoints to a newly sampled speed,
+        then re-draw the pursuer start from the arena edge. The obstacle positions and
+        evader path topology are kept identical to the previous episode.
+        """
         for env_id in env_ids.tolist():
-            phase = self._sample_curriculum_phase()
-            self._ensure_obstacle_slots_for_phase(phase)
-            scenario = self._sample_pursuit_scenario_with_fallback(phase, attempts)
+            # --- resample evader speed and rescale waypoints ------------------
+            new_speed = self._sample_evader_episode_speed()
+            old_waypoints = self._evader_waypoints[env_id]  # (W, 3)
 
-            self._scenario_phase[env_id] = scenario["phase"]
-            self._scenario_fallback[env_id] = bool(scenario["fallback"])
-            if bool(scenario["fallback"]):
-                self._scenario_fallback_count[env_id] += 1
-            self._evader_path_type[env_id] = scenario["path_type"]
-            self._evader_waypoints[env_id] = scenario["evader_waypoints"]
-            self._pursuer_start_pos[env_id] = scenario["pursuer_start"]
-            self._reference_pos[env_id] = scenario["evader_waypoints"][0]
-            self._reference_yaw[env_id, 0] = scenario["evader_yaw"]
+            if new_speed > 0.0:
+                # Recompute step distances for the new speed and re-parameterise the
+                # existing XY polyline at those distances.
+                step_dist = self._evader_step_distances(new_speed)
+                xy_poly = old_waypoints[:, :2]  # (W, 2)
+                z_val = float(old_waypoints[0, 2].item())
+                new_waypoints = self._grid_polyline_waypoints(xy_poly, step_dist, z_val)
+            else:
+                new_waypoints = old_waypoints.clone()
 
-            self._static_obstacle_positions_xy[env_id] = scenario["static_xy"]
-            self._static_obstacle_active[env_id] = scenario["static_active"]
-            self._dynamic_obstacle_waypoints[env_id] = scenario["dynamic_waypoints"]
-            self._dynamic_obstacle_active[env_id] = scenario["dynamic_active"]
-            self._dynamic_obstacle_positions[env_id] = scenario["dynamic_waypoints"][0]
+            self._evader_waypoints[env_id] = new_waypoints
 
-        self._move_static_obstacles(env_ids)
-        self._move_dynamic_obstacles(env_ids)
-        self._refresh_debug_pillars()
+            first_vel = self._first_waypoint_velocity(new_waypoints)
+            yaw = torch.atan2(first_vel[1], first_vel[0])
+            self._reference_pos[env_id] = new_waypoints[0]
+            self._reference_yaw[env_id, 0] = float(yaw.item())
+
+            # --- resample pursuer start position ------------------------------
+            grid = self._make_pursuit_grid()
+            new_start: torch.Tensor | None = None
+            if grid is not None:
+                new_start = self._sample_grid_pursuer_start(grid)
+            if new_start is None:
+                # fallback: keep the existing start position
+                new_start = self._pursuer_start_pos[env_id].clone()
+            new_start[2] = float(new_waypoints[0, 2].item())
+            self._pursuer_start_pos[env_id] = new_start
+
+        # No obstacle moves needed — static/dynamic layouts are unchanged.
+
+    def _resample_pursuit_scenarios(self, env_ids: torch.Tensor) -> None:
+        """Resample pursuit scenarios for the given envs.
+
+        Fast path: if a scenario has already been generated for an env and we are
+        not currently in a curriculum blend section, only resample evader speed and
+        pursuer start position, keeping the existing obstacle/path topology.
+
+        Full path: run the expensive grid + A* scenario generation for envs that are
+        uninitialized or for which a curriculum blend is active (new phase being
+        introduced).
+        """
+        in_blend = self._is_in_curriculum_blend()
+
+        # Split env_ids into fast-resample vs full-generation sets.
+        initialized = self._scenario_initialized[env_ids]
+        if in_blend or not initialized.any():
+            # All envs need full generation.
+            fast_ids = env_ids.new_empty(0)
+            full_ids = env_ids
+        elif initialized.all():
+            # All envs can use the fast path.
+            fast_ids = env_ids
+            full_ids = env_ids.new_empty(0)
+        else:
+            fast_ids = env_ids[initialized]
+            full_ids = env_ids[~initialized]
+
+        # ---- fast path -------------------------------------------------------
+        if fast_ids.numel() > 0:
+            self._resample_pursuit_scenarios_fast(fast_ids)
+
+        # ---- full generation path --------------------------------------------
+        if full_ids.numel() > 0:
+            attempts = max(1, int(self.cfg.pursuit_scenario_attempts))
+            for env_id in full_ids.tolist():
+                phase = self._sample_curriculum_phase()
+                self._ensure_obstacle_slots_for_phase(phase)
+                scenario = self._sample_pursuit_scenario_with_fallback(phase, attempts)
+
+                self._scenario_phase[env_id] = scenario["phase"]
+                self._scenario_fallback[env_id] = bool(scenario["fallback"])
+                if bool(scenario["fallback"]):
+                    self._scenario_fallback_count[env_id] += 1
+                self._evader_path_type[env_id] = scenario["path_type"]
+                self._evader_waypoints[env_id] = scenario["evader_waypoints"]
+                self._pursuer_start_pos[env_id] = scenario["pursuer_start"]
+                self._reference_pos[env_id] = scenario["evader_waypoints"][0]
+                self._reference_yaw[env_id, 0] = scenario["evader_yaw"]
+
+                self._static_obstacle_positions_xy[env_id] = scenario["static_xy"]
+                self._static_obstacle_active[env_id] = scenario["static_active"]
+                self._dynamic_obstacle_waypoints[env_id] = scenario["dynamic_waypoints"]
+                self._dynamic_obstacle_active[env_id] = scenario["dynamic_active"]
+                self._dynamic_obstacle_positions[env_id] = scenario["dynamic_waypoints"][0]
+
+            self._scenario_initialized[full_ids] = True
+            self._move_static_obstacles(full_ids)
+            self._move_dynamic_obstacles(full_ids)
+            self._refresh_debug_pillars()
 
     def _sample_pursuit_scenario_with_fallback(
         self,

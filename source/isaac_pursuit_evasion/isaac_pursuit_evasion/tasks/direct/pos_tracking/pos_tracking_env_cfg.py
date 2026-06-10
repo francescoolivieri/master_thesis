@@ -168,7 +168,7 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
 
     # Sparse path timing. Each moving episode samples one evader speed and keeps it fixed.
     pursuit_path_waypoint_dt: float = 0.2
-    pursuit_evader_speed_range: tuple[float, float] = (0.6, 1.0)
+    pursuit_evader_speed_range: tuple[float, float] = (0.6, 1.8)
     pursuit_smooth_evader_path: bool = True
     pursuit_smooth_evader_resolution: int = 4
     pursuit_smooth_evader_validate: bool = True
