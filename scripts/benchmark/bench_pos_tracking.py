@@ -194,6 +194,10 @@ from source.isaac_pursuit_evasion.dgppo.utils import (
     extract_graph_states_from_flat_obs,
     zero_policy_rnn_states_for_done,
 )
+from source.isaac_pursuit_evasion.isaac_pursuit_evasion.tasks.direct.pos_tracking.scenario_pool import (
+    ScenarioPoolBuilder,
+    point_free,
+)
 
 # Ensure tasks are registered with Gym.
 import source.isaac_pursuit_evasion.isaac_pursuit_evasion.tasks.direct.pos_tracking  # noqa: F401
@@ -1304,6 +1308,8 @@ class EpisodeResult:
     path_xy: list[tuple[float, float]]
     reference_xy: list[tuple[float, float]]
     errors: list[float]
+    static_obstacle_xy: list[tuple[float, float]]
+    dynamic_obstacle_paths_xy: list[list[tuple[float, float]]]
 
     @property
     def safety_violation_steps(self) -> int:
@@ -1383,6 +1389,7 @@ class ScenarioManager:
             self._pursuit_queue = [(difficulty, idx) for difficulty in DIFFICULTY_ORDER for idx in range(count)]
         self._next_pursuit = 0
         self.active: list[GoalScenario | None] = [None for _ in range(int(base_env.num_envs))]
+        self._scenario_builder = ScenarioPoolBuilder(base_env.cfg, base_env.device) if self.pursuit else None
 
     @property
     def pursuit_target_episodes(self) -> int:
@@ -1493,9 +1500,7 @@ class ScenarioManager:
         env._scenario_phase[env_id] = int(data["phase"])
         env._scenario_fallback[env_id] = bool(data.get("fallback", False))
         env._evader_path_type[env_id] = int(data["path_type"])
-        env._evader_waypoints[env_id] = env._dense_path_to_waypoints(
-            data["evader_pos"].to(device=device)
-        )
+        env._evader_waypoints[env_id] = self._dense_path_to_waypoints(data["evader_pos"].to(device=device))
         env._pursuer_start_pos[env_id] = data["pursuer_start"].to(device=device)
         env._reference_pos[env_id] = data["evader_pos"][0].to(device=device)
         env._reference_yaw[env_id, 0] = float(data["evader_yaw"])
@@ -1505,7 +1510,7 @@ class ScenarioManager:
 
         env._static_obstacle_positions_xy[env_id] = data["static_xy"].to(device=device)
         env._static_obstacle_active[env_id] = data["static_active"].to(device=device)
-        env._dynamic_obstacle_waypoints[env_id] = env._dense_dynamic_path_to_waypoints(
+        env._dynamic_obstacle_waypoints[env_id] = self._dense_dynamic_path_to_waypoints(
             data["dynamic_pos"].to(device=device)
         )
         env._dynamic_obstacle_active[env_id] = data["dynamic_active"].to(device=device)
@@ -1650,7 +1655,7 @@ class ScenarioManager:
         dynamic_active: torch.Tensor,
         fallback: bool,
     ) -> dict[str, Any]:
-        evader_vel = self.base_env._path_velocity(evader_pos)
+        evader_vel = self._path_velocity(evader_pos)
         speed = torch.linalg.vector_norm(evader_vel[:, :2], dim=-1)
         moving = torch.nonzero(speed > 0.05).squeeze(-1)
         first_idx = int(moving[0].item()) if moving.numel() > 0 else 0
@@ -1683,13 +1688,14 @@ class ScenarioManager:
     def _fallback_env_sample(self, difficulty: str) -> dict[str, Any]:
         phase = DIFFICULTY_PHASE[difficulty]
         attempts = max(32, int(getattr(self.base_env.cfg, "pursuit_scenario_attempts", 300)) // 3)
+        assert self._scenario_builder is not None
         for _ in range(attempts):
-            sampled = self.base_env._sample_pursuit_scenario(phase)
+            sampled = self._scenario_builder.sample_scenario(phase)
             if sampled is not None:
                 sampled["fallback"] = True
                 sampled["path_kind"] = f"env_phase_{phase}"
                 return self._dense_env_sample(sampled)
-        sampled = self.base_env._fallback_pursuit_scenario(phase)
+        sampled = self._scenario_builder.fallback_scenario(phase)
         sampled["fallback"] = True
         sampled["path_kind"] = f"env_fallback_phase_{phase}"
         return self._dense_env_sample(sampled)
@@ -1700,16 +1706,16 @@ class ScenarioManager:
 
         env = self.base_env
         out = dict(data)
-        evader_pos = env._resample_path(data["evader_waypoints"], env._path_steps)
-        evader_vel = env._path_velocity(evader_pos)
+        evader_pos = self._resample_path(data["evader_waypoints"], env._path_steps)
+        evader_vel = self._path_velocity(evader_pos)
         dynamic_wp = data["dynamic_waypoints"]
         if dynamic_wp.shape[1] > 0:
             dynamic_pos = torch.stack(
-                [env._resample_path(dynamic_wp[:, slot], env._path_steps) for slot in range(dynamic_wp.shape[1])],
+                [self._resample_path(dynamic_wp[:, slot], env._path_steps) for slot in range(dynamic_wp.shape[1])],
                 dim=1,
             )
             dynamic_vel = torch.stack(
-                [env._path_velocity(dynamic_pos[:, slot]) for slot in range(dynamic_pos.shape[1])],
+                [self._path_velocity(dynamic_pos[:, slot]) for slot in range(dynamic_pos.shape[1])],
                 dim=1,
             )
         else:
@@ -1743,7 +1749,7 @@ class ScenarioManager:
         start_dist = torch.linalg.vector_norm(pursuer_start[:2] - evader_pos[0, :2])
         if float(start_dist.item()) < float(env.cfg.pursuit_pursuer_min_evader_distance):
             return False
-        if not env._point_free(pursuer_start, static_xy, static_active, dynamic_pos, dynamic_active):
+        if not point_free(env.cfg, pursuer_start, static_xy, static_active, dynamic_pos, dynamic_active):
             return False
 
         static_count = int(static_active.to(torch.int32).sum().item())
@@ -1803,10 +1809,10 @@ class ScenarioManager:
         safe_evader = (
             float(env.cfg.pillar_radius)
             + float(env.cfg.pursuit_evader_radius)
-            + float(env.cfg.pursuit_evader_tube_margin)
+            + float(getattr(env.cfg, "pursuit_evader_tube_margin", 0.0))
         )
-        d_evader = env._point_path_distance_xy(candidate, evader_pos[:, :2])
-        if float(d_evader[0].item()) <= safe_evader:
+        d_evader = torch.linalg.vector_norm(evader_pos[:, :2] - candidate, dim=-1).min()
+        if float(d_evader.item()) <= safe_evader:
             return False
         safe_start = (
             float(env.cfg.pillar_radius)
@@ -1845,8 +1851,15 @@ class ScenarioManager:
         for path in candidates:
             if placed >= desired_count:
                 break
-            path_vel = env._path_velocity(path)
-            if not env._dynamic_path_valid(path, evader_pos, static_xy, static_active, pos[:, :placed], active[:placed]):
+            path_vel = self._path_velocity(path)
+            if not self._dynamic_path_valid(
+                path,
+                evader_pos,
+                static_xy,
+                static_active,
+                pos[:, :placed],
+                active[:placed],
+            ):
                 continue
             pos[:, placed] = path
             vel[:, placed] = path_vel
@@ -1972,6 +1985,68 @@ class ScenarioManager:
         z = 0.5 * (float(lo[2]) + float(hi[2]))
         return torch.tensor([float(xy[0]), float(xy[1]), z], device=env.device, dtype=torch.float32)
 
+    def _dense_path_to_waypoints(self, path: torch.Tensor) -> torch.Tensor:
+        steps = self.base_env._path_waypoint_steps.to(device=path.device)
+        indices = torch.clamp(steps, max=path.shape[0] - 1)
+        return path[indices]
+
+    def _dense_dynamic_path_to_waypoints(self, path: torch.Tensor) -> torch.Tensor:
+        steps = self.base_env._path_waypoint_steps.to(device=path.device)
+        indices = torch.clamp(steps, max=path.shape[0] - 1)
+        return path[indices]
+
+    def _resample_path(self, path: torch.Tensor, steps: int) -> torch.Tensor:
+        if path.shape[0] == steps:
+            return path
+        source = torch.linspace(0.0, 1.0, path.shape[0], device=path.device)
+        target = torch.linspace(0.0, 1.0, steps, device=path.device)
+        segment = torch.searchsorted(source[1:], target).clamp(max=path.shape[0] - 2)
+        width = (source[segment + 1] - source[segment]).clamp_min(1e-6)
+        alpha = ((target - source[segment]) / width).view(-1, 1)
+        return path[segment] * (1.0 - alpha) + path[segment + 1] * alpha
+
+    def _path_velocity(self, path: torch.Tensor) -> torch.Tensor:
+        velocity = torch.zeros_like(path)
+        if path.shape[0] > 1:
+            velocity[1:] = (path[1:] - path[:-1]) / float(self.base_env.step_dt)
+            velocity[0] = velocity[1]
+        return velocity
+
+    def _dynamic_path_valid(
+        self,
+        path: torch.Tensor,
+        evader_pos: torch.Tensor,
+        static_xy: torch.Tensor,
+        static_active: torch.Tensor,
+        placed_paths: torch.Tensor,
+        placed_active: torch.Tensor,
+    ) -> bool:
+        env = self.base_env
+        radius = float(env.cfg.pursuit_dynamic_obstacle_radius)
+        lo, hi = env._safe_xy_bounds(radius + float(env.cfg.pursuit_obstacle_clearance))
+        if not bool(torch.all((path[:, :2] >= lo) & (path[:, :2] <= hi)).item()):
+            return False
+
+        safe_evader = radius + float(env.cfg.pursuit_evader_radius) + float(env.cfg.pursuit_obstacle_clearance)
+        if bool(torch.any(torch.linalg.vector_norm(path[:, :2] - evader_pos[:, :2], dim=-1) <= safe_evader).item()):
+            return False
+
+        if bool(static_active.any().item()):
+            distance = torch.linalg.vector_norm(
+                path[:, None, :2] - static_xy[None, :, :],
+                dim=-1,
+            )
+            safe_static = radius + float(env.cfg.pillar_radius) + float(env.cfg.pursuit_obstacle_clearance)
+            if bool(torch.any((distance <= safe_static) & static_active.view(1, -1)).item()):
+                return False
+
+        if placed_paths.numel() > 0 and bool(placed_active.any().item()):
+            distance = torch.linalg.vector_norm(path[:, None, :2] - placed_paths[:, :, :2], dim=-1)
+            safe_dynamic = 2.0 * radius + float(env.cfg.pursuit_obstacle_clearance)
+            if bool(torch.any((distance <= safe_dynamic) & placed_active.view(1, -1)).item()):
+                return False
+        return True
+
     def _tensor_xy(self, values: Sequence[tuple[float, float]]) -> torch.Tensor:
         return torch.tensor(values, device=self.base_env.device, dtype=torch.float32)
 
@@ -2075,6 +2150,7 @@ class RolloutRecorder:
         rollout = self.active[int(env_id)]
         if rollout is None:
             return None
+        static_obstacle_xy, dynamic_obstacle_paths_xy = _scenario_obstacle_geometry(rollout.scenario)
         mapping = getattr(self.base_env, "DONE_REASON_MAP", {})
         done_label = str(mapping.get(int(done_reason), f"reason_{int(done_reason)}"))
         length = len(rollout.pos_errors)
@@ -2109,10 +2185,39 @@ class RolloutRecorder:
             path_xy=rollout.positions.copy(),
             reference_xy=rollout.goals.copy(),
             errors=rollout.pos_errors.copy(),
+            static_obstacle_xy=static_obstacle_xy,
+            dynamic_obstacle_paths_xy=dynamic_obstacle_paths_xy,
         )
         self.results.append(result)
         self.active[int(env_id)] = None
         return result
+
+
+def _scenario_obstacle_geometry(
+    scenario: GoalScenario,
+) -> tuple[list[tuple[float, float]], list[list[tuple[float, float]]]]:
+    data = scenario.scenario_data
+    if data is None:
+        return [], []
+
+    static_xy = data.get("static_xy")
+    static_active = data.get("static_active")
+    static_obstacles: list[tuple[float, float]] = []
+    if isinstance(static_xy, torch.Tensor) and isinstance(static_active, torch.Tensor):
+        for point in static_xy[static_active].detach().cpu().tolist():
+            static_obstacles.append((float(point[0]), float(point[1])))
+
+    dynamic_pos = data.get("dynamic_pos")
+    dynamic_active = data.get("dynamic_active")
+    dynamic_paths: list[list[tuple[float, float]]] = []
+    if isinstance(dynamic_pos, torch.Tensor) and isinstance(dynamic_active, torch.Tensor):
+        active_slots = torch.nonzero(dynamic_active).squeeze(-1).detach().cpu().tolist()
+        positions = dynamic_pos.detach().cpu()
+        for slot in active_slots:
+            dynamic_paths.append(
+                [(float(point[0]), float(point[1])) for point in positions[:, int(slot), :2].tolist()]
+            )
+    return static_obstacles, dynamic_paths
 
 
 def _get_step_snapshot(base_env: Any, *, use_last_step_snapshot: bool) -> dict[str, torch.Tensor]:
@@ -2427,6 +2532,168 @@ def _print_performance_table(summary: Mapping[str, Any]) -> None:
     print("")
 
 
+def _plot_pursuit_trajectory_grids(
+    output_dir: Path,
+    env_cfg: Any,
+    results: Sequence[EpisodeResult],
+    plt: Any,
+    Circle: Any,
+    Rectangle: Any,
+) -> dict[str, str]:
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+
+    paths: dict[str, str] = {}
+    arena_min = env_cfg.arena_min
+    arena_max = env_cfg.arena_max
+    static_radius = float(getattr(env_cfg, "pillar_radius", 0.15))
+    dynamic_radius = float(getattr(env_cfg, "pursuit_dynamic_obstacle_radius", static_radius))
+
+    for difficulty in DIFFICULTY_ORDER:
+        stage_results = [result for result in results if result.scenario_kind == difficulty]
+        if not stage_results:
+            continue
+
+        panel_count = max(30, len(stage_results))
+        cols = 5
+        rows = math.ceil(panel_count / cols)
+        fig, axes = plt.subplots(rows, cols, figsize=(18, 3.45 * rows), squeeze=False)
+
+        for panel_idx, ax in enumerate(axes.flat):
+            if panel_idx >= len(stage_results):
+                ax.axis("off")
+                continue
+
+            result = stage_results[panel_idx]
+            ax.add_patch(
+                Rectangle(
+                    (arena_min[0], arena_min[1]),
+                    arena_max[0] - arena_min[0],
+                    arena_max[1] - arena_min[1],
+                    fill=False,
+                    lw=0.9,
+                    ls="--",
+                    ec="#555555",
+                    zorder=1,
+                )
+            )
+            for point in result.static_obstacle_xy:
+                ax.add_patch(
+                    Circle(
+                        point,
+                        radius=static_radius,
+                        facecolor="#737373",
+                        edgecolor="#303030",
+                        linewidth=0.6,
+                        alpha=0.65,
+                        zorder=3,
+                    )
+                )
+            for dynamic_path in result.dynamic_obstacle_paths_xy:
+                if not dynamic_path:
+                    continue
+                dynamic_x = [point[0] for point in dynamic_path]
+                dynamic_y = [point[1] for point in dynamic_path]
+                ax.plot(dynamic_x, dynamic_y, color="#9c4f4f", lw=0.8, ls=":", alpha=0.75, zorder=2)
+                ax.add_patch(
+                    Circle(
+                        dynamic_path[0],
+                        radius=dynamic_radius,
+                        facecolor="#c76b6b",
+                        edgecolor="#703838",
+                        linewidth=0.6,
+                        alpha=0.65,
+                        zorder=4,
+                    )
+                )
+
+            if result.reference_xy:
+                ref_x = [point[0] for point in result.reference_xy]
+                ref_y = [point[1] for point in result.reference_xy]
+                ax.plot(ref_x, ref_y, color="#e68624", lw=1.25, ls="--", alpha=0.9, zorder=5)
+                ax.scatter(
+                    ref_x[0], ref_y[0], marker="*", s=45, color="#e68624",
+                    edgecolors="black", linewidths=0.4, zorder=8,
+                )
+                ax.scatter(
+                    ref_x[-1], ref_y[-1], marker="X", s=25, color="#e68624",
+                    edgecolors="black", linewidths=0.35, zorder=8,
+                )
+
+            if result.path_xy:
+                path_x = [point[0] for point in result.path_xy]
+                path_y = [point[1] for point in result.path_xy]
+                ax.plot(path_x, path_y, color="#1769aa", lw=1.5, alpha=0.95, zorder=6)
+                ax.scatter(
+                    path_x[0], path_y[0], marker="o", s=24, color="#1769aa",
+                    edgecolors="white", linewidths=0.6, zorder=9,
+                )
+                ax.scatter(path_x[-1], path_y[-1], marker="x", s=30, color="#0b3558", linewidths=1.4, zorder=9)
+                progress_idx = np.linspace(0, len(path_x) - 1, 6, dtype=int)[1:-1]
+                ax.scatter(
+                    np.asarray(path_x)[progress_idx],
+                    np.asarray(path_y)[progress_idx],
+                    s=8,
+                    color="#74add1",
+                    edgecolors="none",
+                    zorder=7,
+                )
+
+            if result.success:
+                status_color = "#24733f"
+            elif result.collided:
+                status_color = "#a12d2d"
+            else:
+                status_color = "#8a6518"
+            final_error = "n/a" if result.final_pos_error is None else f"{result.final_pos_error:.2f} m"
+            ax.set_title(
+                f"{result.scenario_label} | {result.path_kind}\n"
+                f"{result.done_label}, {result.duration_s:.1f} s | final err {final_error}",
+                fontsize=8,
+                color=status_color,
+                pad=3,
+            )
+            ax.set_xlim(float(arena_min[0]) - 0.08, float(arena_max[0]) + 0.08)
+            ax.set_ylim(float(arena_min[1]) - 0.08, float(arena_max[1]) + 0.08)
+            ax.set_aspect("equal", adjustable="box")
+            ax.grid(True, color="#d9d9d9", linewidth=0.45, alpha=0.75)
+            ax.tick_params(labelsize=6, length=2)
+            ax.set_xlabel("x [m]", fontsize=7)
+            ax.set_ylabel("y [m]", fontsize=7)
+
+        legend_handles = [
+            Line2D([0], [0], color="#1769aa", lw=1.7, marker="o", markersize=4, label="Drone trajectory"),
+            Line2D([0], [0], color="#e68624", lw=1.4, ls="--", marker="*", markersize=7, label="Evader trajectory"),
+            Patch(facecolor="#737373", edgecolor="#303030", alpha=0.65, label="Static obstacle"),
+            Line2D(
+                [0], [0], color="#9c4f4f", lw=1.0, ls=":", marker="o",
+                markersize=5, label="Dynamic obstacle path/start",
+            ),
+            Line2D([0], [0], color="#74add1", lw=0, marker="o", markersize=3, label="Drone progress (20%)"),
+        ]
+        fig.suptitle(
+            f"{difficulty} stage trajectories ({len(stage_results)} scenarios)",
+            fontsize=15,
+            fontweight="bold",
+            y=0.995,
+        )
+        fig.legend(
+            handles=legend_handles,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.977),
+            ncols=5,
+            frameon=False,
+            fontsize=9,
+        )
+        fig.tight_layout(rect=(0.01, 0.01, 0.99, 0.945), h_pad=1.1, w_pad=0.8)
+        stage_path = output_dir / f"trajectories_{difficulty.lower()}.png"
+        fig.savefig(stage_path, dpi=180, facecolor="white")
+        plt.close(fig)
+        paths[f"trajectories_{difficulty.lower()}"] = str(stage_path)
+
+    return paths
+
+
 def _plot_rollouts(output_dir: Path, env_cfg: Any, results: Sequence[EpisodeResult]) -> dict[str, str]:
     if args_cli.no_plots or not results:
         return {}
@@ -2439,64 +2706,67 @@ def _plot_rollouts(output_dir: Path, env_cfg: Any, results: Sequence[EpisodeResu
 
     paths: dict[str, str] = {}
 
-    fig, ax = plt.subplots(figsize=(8, 7))
-    arena_min = env_cfg.arena_min
-    arena_max = env_cfg.arena_max
-    ax.add_patch(
-        Rectangle(
-            (arena_min[0], arena_min[1]),
-            arena_max[0] - arena_min[0],
-            arena_max[1] - arena_min[1],
-            fill=False,
-            lw=2.0,
-            ls="--",
-            ec="black",
-            label="Arena bounds",
-        )
-    )
-    if getattr(env_cfg, "enable_pillars", False) and not getattr(env_cfg, "enable_pursuit_evasion_curriculum", False):
-        for idx, (px, py) in enumerate(getattr(env_cfg, "pillar_positions_xy", ())):
-            ax.add_patch(
-                Circle(
-                    (float(px), float(py)),
-                    radius=float(env_cfg.pillar_radius),
-                    color="dimgray",
-                    alpha=0.35,
-                    ec="black",
-                    lw=1.0,
-                    label="Pillar obstacle" if idx == 0 else None,
-                )
+    if args_cli.benchmark_profile == "pursuit":
+        paths.update(_plot_pursuit_trajectory_grids(output_dir, env_cfg, results, plt, Circle, Rectangle))
+    else:
+        fig, ax = plt.subplots(figsize=(8, 7))
+        arena_min = env_cfg.arena_min
+        arena_max = env_cfg.arena_max
+        ax.add_patch(
+            Rectangle(
+                (arena_min[0], arena_min[1]),
+                arena_max[0] - arena_min[0],
+                arena_max[1] - arena_min[1],
+                fill=False,
+                lw=2.0,
+                ls="--",
+                ec="black",
+                label="Arena bounds",
             )
+        )
+        if getattr(env_cfg, "enable_pillars", False):
+            for idx, (px, py) in enumerate(getattr(env_cfg, "pillar_positions_xy", ())):
+                ax.add_patch(
+                    Circle(
+                        (float(px), float(py)),
+                        radius=float(env_cfg.pillar_radius),
+                        color="dimgray",
+                        alpha=0.35,
+                        ec="black",
+                        lw=1.0,
+                        label="Pillar obstacle" if idx == 0 else None,
+                    )
+                )
 
-    cmap = plt.get_cmap("tab20", max(1, len(results)))
-    for idx, result in enumerate(results):
-        if len(result.path_xy) < 2:
-            continue
-        xs = [p[0] for p in result.path_xy]
-        ys = [p[1] for p in result.path_xy]
-        color = cmap(idx)
-        ax.plot(xs, ys, color=color, lw=1.5, alpha=0.9, label=result.scenario_label if idx < 12 else None)
-        ax.scatter(xs[0], ys[0], color=color, marker="o", s=18)
-        ax.scatter(xs[-1], ys[-1], color=color, marker="x", s=30)
-        if len(result.reference_xy) >= 2:
-            ref_xs = [p[0] for p in result.reference_xy]
-            ref_ys = [p[1] for p in result.reference_xy]
-            ax.plot(ref_xs, ref_ys, color=color, lw=1.0, alpha=0.45, ls="--")
-            ax.scatter(ref_xs[0], ref_ys[0], color=color, marker="*", s=110, edgecolors="black", zorder=30)
-        else:
-            ax.scatter(result.target[0], result.target[1], color=color, marker="*", s=150, edgecolors="black", zorder=30)
+        cmap = plt.get_cmap("tab20", max(1, len(results)))
+        for idx, result in enumerate(results):
+            if len(result.path_xy) < 2:
+                continue
+            xs = [p[0] for p in result.path_xy]
+            ys = [p[1] for p in result.path_xy]
+            color = cmap(idx)
+            ax.plot(xs, ys, color=color, lw=1.5, alpha=0.9, label=result.scenario_label if idx < 12 else None)
+            ax.scatter(xs[0], ys[0], color=color, marker="o", s=18)
+            ax.scatter(xs[-1], ys[-1], color=color, marker="x", s=30)
+            if len(result.reference_xy) >= 2:
+                ref_xs = [p[0] for p in result.reference_xy]
+                ref_ys = [p[1] for p in result.reference_xy]
+                ax.plot(ref_xs, ref_ys, color=color, lw=1.0, alpha=0.45, ls="--")
+                ax.scatter(ref_xs[0], ref_ys[0], color=color, marker="*", s=110, edgecolors="black", zorder=30)
+            else:
+                ax.scatter(result.target[0], result.target[1], color=color, marker="*", s=150, edgecolors="black", zorder=30)
 
-    ax.set_title("Position-tracking benchmark trajectories")
-    ax.set_xlabel("x [m]")
-    ax.set_ylabel("y [m]")
-    ax.set_aspect("equal", adjustable="box")
-    ax.grid(True, alpha=0.25)
-    ax.legend(loc="best", fontsize=7, ncols=2)
-    fig.tight_layout()
-    trajectory_path = output_dir / "trajectory_xy.png"
-    fig.savefig(trajectory_path, dpi=180)
-    plt.close(fig)
-    paths["trajectory_xy"] = str(trajectory_path)
+        ax.set_title("Position-tracking benchmark trajectories")
+        ax.set_xlabel("x [m]")
+        ax.set_ylabel("y [m]")
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True, alpha=0.25)
+        ax.legend(loc="best", fontsize=7, ncols=2)
+        fig.tight_layout()
+        trajectory_path = output_dir / "trajectory_xy.png"
+        fig.savefig(trajectory_path, dpi=180)
+        plt.close(fig)
+        paths["trajectory_xy"] = str(trajectory_path)
 
     grouped = [(label, group) for label, group in _ordered_result_groups(results) if group]
     labels = [label for label, _group in grouped]
@@ -2669,7 +2939,6 @@ def main(env_cfg, agent_cfg: dict):
         else:
             evader_speed_hi = max(evader_speed_hi, 1.1)
         env_cfg.pursuit_evader_speed_range = (evader_speed_lo, evader_speed_hi)
-        env_cfg.pursuit_dynamic_max_speed = max(float(getattr(env_cfg, "pursuit_dynamic_max_speed", 0.85)), 0.85)
     env_cfg.use_position_controller = args_cli.policy_mode == "baseline"
     if args_cli.policy_mode == "rl":
         if getattr(env_cfg, "obstacle_observation_mode", None) == "ray_caster":

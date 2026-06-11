@@ -149,15 +149,17 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     # Filled by train.py from the resolved skrl trainer budget.
     pursuit_curriculum_total_steps: int = 0
     # Fractions for phases 1..4: static evader, moving light, moving static-heavy, moving mixed.
-    pursuit_curriculum_phase_fractions: tuple[float, ...] = (0.35, 0.35, 0.30, 0.0)
+    pursuit_curriculum_phase_fractions: tuple[float, ...] = (0.2, 0.3, 0.3, 0.2)
     # Fraction of each phase used for the soft handoff to the next enabled phase.
     pursuit_curriculum_blend_fraction: float = 0.2
     # Kept for old run configs; phase 1 is fully static in the grid curriculum.
     pursuit_phase1_fixed_evader_fraction: float = 1.0
-    # Spawn only the obstacle prim slots needed by reached curriculum phases.
+    # Kept for old run configs; pooled scenarios spawn all configured slots up front.
     pursuit_lazy_obstacle_spawning: bool = True
     pursuit_spawn_static_obstacles: int = 0
     pursuit_spawn_dynamic_obstacles: int = 0
+    # Exact-phase scenarios cached on disk and shared by all parallel environments.
+    pursuit_scenario_pool_size: int = 5000
 
     # Grid curriculum. Each episode samples a side pursuer spawn, grid obstacles, then A* evader paths.
     pursuit_grid_cell_size: float = 0.15
@@ -184,7 +186,7 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
 
     # Fixed observation/scene slots; inactive obstacles are moved outside the arena.
     pursuit_max_static_obstacles: int = 5
-    pursuit_max_dynamic_obstacles: int = 0
+    pursuit_max_dynamic_obstacles: int = 3
     # Dynamic obstacle geometry and motion cap.
     pursuit_dynamic_obstacle_radius: float = 0.16
     pursuit_dynamic_obstacle_height: float = 1.8
@@ -203,8 +205,8 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     #reward_pos_scale: float = 8.0
     reward_yaw: float = 0.3
     # reward_body_rates: float = 0.0015 , UNUSED -> basically sum of reward_body_rates_roll_pitch & yaw
-    reward_body_rates_roll_pitch: float = 0.01
-    reward_body_rates_yaw: float = 0.003
+    reward_body_rates_roll_pitch: float = 0.011
+    reward_body_rates_yaw: float = 0.005
     reward_lin_vel: float = 0.02
     reward_action_smoothness: float = 0.01
     # Optional split smoothness weights.
@@ -213,15 +215,15 @@ class PosTrackingEnvCfg(DirectRLEnvCfg):
     reward_action_smoothness_thrust: float  = 0.1
     reward_success: float = 10.0
     
-    penalty_altitude_limit: float = 10.0
-    penalty_xy_boundary: float = 10.0
-    penalty_pillar_collision: float = 10.0
+    penalty_altitude_limit: float = 50.0
+    penalty_xy_boundary: float = 50.0
+    penalty_pillar_collision: float = 50.0
     penalty_timeout: float = 10.0
 
     # Success criteria
-    pos_tolerance: float = 0.22
+    pos_tolerance: float = 0.2
     yaw_tolerance: float = 0.25
-    success_hold_time_s: float = 0.3
+    success_hold_time_s: float = 0.01
     terminate_on_success: bool = True
 
     # Episode reset policy. Safety violations are the inner constraints (floor,

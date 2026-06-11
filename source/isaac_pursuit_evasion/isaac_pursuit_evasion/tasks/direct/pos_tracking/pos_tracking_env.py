@@ -1,7 +1,6 @@
 """Single-drone position tracking environment for Crazyflie Brushless."""
 from __future__ import annotations
 
-import heapq
 import math
 from pathlib import Path
 import torch
@@ -35,6 +34,7 @@ from source.isaac_pursuit_evasion.dgppo.utils import (
 from source.isaac_pursuit_evasion.dynamics.propellers import Drone_cfg, Propellers
 
 from .pos_tracking_env_cfg import PosTrackingEnvCfg
+from .scenario_pool import load_scenario_pools
 
 EPISODE_STATUS_LABELS = {
     0: "running",
@@ -116,6 +116,7 @@ class PosTrackingEnv(DirectRLEnv):
 
         self._camera = self.scene.sensors.get("robot_camera") if self.cfg.enable_cameras else None
         self._ray_caster = self.scene.sensors.get("lidar_ray_caster") if self.cfg.enable_ray_caster else None
+        self._render_obstacles = bool(self.sim.has_gui() or self.cfg.enable_cameras)
         self._pursuit_enabled = bool(self.cfg.enable_pursuit_evasion_curriculum)
         self._max_static_obstacles = self._configured_static_obstacle_slots(self.cfg)
         self._max_dynamic_obstacles = self._configured_dynamic_obstacle_slots(self.cfg)
@@ -123,6 +124,8 @@ class PosTrackingEnv(DirectRLEnv):
         self._spawned_dynamic_obstacles = self._configured_spawned_dynamic_obstacles(self.cfg)
         self._static_obstacle_view: XformPrimView | None = None
         self._dynamic_obstacle_view: XformPrimView | None = None
+        self._static_obstacle_view_indices: list[list[int]] = []
+        self._dynamic_obstacle_view_indices: list[list[int]] = []
         self._static_obstacle_view_index = torch.full(
             (self.num_envs, self._max_static_obstacles), -1, device=self.device, dtype=torch.long
         )
@@ -231,9 +234,6 @@ class PosTrackingEnv(DirectRLEnv):
         self._scenario_phase = torch.ones(self.num_envs, dtype=torch.int64, device=self.device)
         self._scenario_fallback = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._scenario_fallback_count = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
-        # Tracks whether a full scenario has been generated for each env at least once.
-        self._scenario_initialized = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-
         self._dynamic_obstacle_waypoints = torch.zeros(
             self.num_envs, self._path_waypoint_count, self._max_dynamic_obstacles, 3, device=self.device
         )
@@ -285,6 +285,15 @@ class PosTrackingEnv(DirectRLEnv):
 
         self._dr_cfg = self.cfg.domain_randomization
         self._init_domain_randomization()
+
+        self._scenario_pools_cpu: dict[int, dict[str, torch.Tensor]] = {}
+        self._scenario_pools: dict[int, dict[str, torch.Tensor]] = {}
+        if self._pursuit_enabled:
+            self._scenario_pools_cpu = load_scenario_pools(
+                self.cfg,
+                self._path_waypoint_steps,
+                self._step_dt,
+            )
 
     # ---------------------------------------------------------------------
     # IsaacLab interface
@@ -792,23 +801,6 @@ class PosTrackingEnv(DirectRLEnv):
         return 0
 
     @staticmethod
-    def _phase_obstacle_limits(phase: int) -> tuple[int, int]:
-        static_hi = {
-            1: 2,
-            2: 2,
-            3: 5,
-            4: 5,
-        }
-        dynamic_hi = {
-            1: 0,
-            2: 0,
-            3: 0,
-            4: 3,
-        }
-        phase = int(phase)
-        return static_hi.get(phase, static_hi[1]), dynamic_hi.get(phase, dynamic_hi[1])
-
-    @staticmethod
     def _prepare_initial_obstacle_slots(cfg: PosTrackingEnvCfg) -> None:
         if not cfg.enable_pursuit_evasion_curriculum:
             cfg.pursuit_spawn_static_obstacles = len(cfg.pillar_positions_xy) if cfg.enable_pillars else 0
@@ -817,20 +809,9 @@ class PosTrackingEnv(DirectRLEnv):
 
         max_static = max(0, int(cfg.pursuit_max_static_obstacles))
         max_dynamic = max(0, int(cfg.pursuit_max_dynamic_obstacles))
-        if not bool(cfg.pursuit_lazy_obstacle_spawning):
-            cfg.pursuit_spawn_static_obstacles = max_static
-            cfg.pursuit_spawn_dynamic_obstacles = max_dynamic
-            return
-
-        phase_static, phase_dynamic = PosTrackingEnv._phase_obstacle_limits(1)
-        cfg.pursuit_spawn_static_obstacles = min(
-            max_static,
-            max(max(0, int(cfg.pursuit_spawn_static_obstacles)), phase_static),
-        )
-        cfg.pursuit_spawn_dynamic_obstacles = min(
-            max_dynamic,
-            max(max(0, int(cfg.pursuit_spawn_dynamic_obstacles)), phase_dynamic),
-        )
+        cfg.pursuit_lazy_obstacle_spawning = False
+        cfg.pursuit_spawn_static_obstacles = max_static
+        cfg.pursuit_spawn_dynamic_obstacles = max_dynamic
 
     @staticmethod
     def _configured_static_obstacle_slots(cfg: PosTrackingEnvCfg) -> int:
@@ -1423,6 +1404,8 @@ class PosTrackingEnv(DirectRLEnv):
     def _setup_obstacle_views(self) -> None:
         self._static_obstacle_view = None
         self._dynamic_obstacle_view = None
+        self._static_obstacle_view_indices = []
+        self._dynamic_obstacle_view_indices = []
         self._static_obstacle_view_index.fill_(-1)
         self._dynamic_obstacle_view_index.fill_(-1)
 
@@ -1437,6 +1420,7 @@ class PosTrackingEnv(DirectRLEnv):
                 "Pillar",
                 self._spawned_static_obstacles,
             )
+            self._static_obstacle_view_indices = self._static_obstacle_view_index.detach().cpu().tolist()
 
         if self._spawned_dynamic_obstacles > 0:
             self._dynamic_obstacle_view = XformPrimView(
@@ -1449,6 +1433,7 @@ class PosTrackingEnv(DirectRLEnv):
                 "Dynamic",
                 self._spawned_dynamic_obstacles,
             )
+            self._dynamic_obstacle_view_indices = self._dynamic_obstacle_view_index.detach().cpu().tolist()
 
     def _obstacle_view_indices(self, view: XformPrimView, prefix: str, slots: int) -> torch.Tensor:
         indices = torch.full((self.num_envs, slots), -1, dtype=torch.long, device=self.device)
@@ -1466,832 +1451,100 @@ class PosTrackingEnv(DirectRLEnv):
             raise RuntimeError(f"Obstacle view for {prefix} did not find all {self.num_envs} x {slots} prims.")
         return indices
 
-    def _ensure_obstacle_slots_for_phase(self, phase: int) -> None:
-        if not self._pursuit_enabled or not bool(self.cfg.pursuit_lazy_obstacle_spawning):
-            return
-
-        static_need, dynamic_need = self._phase_obstacle_limits(phase)
-        static_need = min(static_need, self._max_static_obstacles)
-        dynamic_need = min(dynamic_need, self._max_dynamic_obstacles)
-        if static_need <= self._spawned_static_obstacles and dynamic_need <= self._spawned_dynamic_obstacles:
-            return
-
-        old_static = self._spawned_static_obstacles
-        old_dynamic = self._spawned_dynamic_obstacles
-        self._spawned_static_obstacles = max(self._spawned_static_obstacles, static_need)
-        self._spawned_dynamic_obstacles = max(self._spawned_dynamic_obstacles, dynamic_need)
-        self.cfg.pursuit_spawn_static_obstacles = self._spawned_static_obstacles
-        self.cfg.pursuit_spawn_dynamic_obstacles = self._spawned_dynamic_obstacles
-
-        if self._spawned_static_obstacles > old_static:
-            self._spawn_arena_pillars(start_slot=old_static, end_slot=self._spawned_static_obstacles)
-        if self._spawned_dynamic_obstacles > old_dynamic:
-            self._spawn_dynamic_obstacles(start_slot=old_dynamic, end_slot=self._spawned_dynamic_obstacles)
-
-        self._setup_obstacle_views()
-        all_envs = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
-        self._move_static_obstacles(all_envs)
-        self._move_dynamic_obstacles(all_envs)
-        self._refresh_ray_caster_meshes()
-
-    def _is_in_curriculum_blend(self) -> bool:
-        """Return True if the curriculum is currently in a blend section between phases."""
-        fractions = self.cfg.pursuit_curriculum_phase_fractions
-        if not fractions:
-            return False
-        progress = self._curriculum_progress()
-        blend_ratio = max(0.0, min(1.0, float(self.cfg.pursuit_curriculum_blend_fraction)))
-        if blend_ratio <= 0.0:
-            return False
-        end = 0.0
-        for phase, fraction in enumerate(fractions, start=1):
-            fraction = max(0.0, float(fraction))
-            end += fraction
-            if fraction == 0.0:
-                continue
-            if progress <= end:
-                blend_width = fraction * blend_ratio
-                next_phase = next(
-                    (idx for idx in range(phase + 1, len(fractions) + 1) if float(fractions[idx - 1]) > 0.0),
-                    None,
-                )
-                if blend_width > 0.0 and next_phase is not None:
-                    blend_start = end - blend_width
-                    if progress >= blend_start:
-                        return True
-                return False
-        return False
-
-    def _resample_pursuit_scenarios_fast(self, env_ids: torch.Tensor) -> None:
-        """Cheap reset: reuse existing obstacle layout, only resample speed and pursuer start.
-
-        For each env we rescale the existing evader waypoints to a newly sampled speed,
-        then re-draw the pursuer start from the arena edge. The obstacle positions and
-        evader path topology are kept identical to the previous episode.
-        """
-        for env_id in env_ids.tolist():
-            # --- resample evader speed and rescale waypoints ------------------
-            new_speed = self._sample_evader_episode_speed()
-            old_waypoints = self._evader_waypoints[env_id]  # (W, 3)
-
-            if new_speed > 0.0:
-                # Recompute step distances for the new speed and re-parameterise the
-                # existing XY polyline at those distances.
-                step_dist = self._evader_step_distances(new_speed)
-                xy_poly = old_waypoints[:, :2]  # (W, 2)
-                z_val = float(old_waypoints[0, 2].item())
-                new_waypoints = self._grid_polyline_waypoints(xy_poly, step_dist, z_val)
-            else:
-                new_waypoints = old_waypoints.clone()
-
-            self._evader_waypoints[env_id] = new_waypoints
-
-            first_vel = self._first_waypoint_velocity(new_waypoints)
-            yaw = torch.atan2(first_vel[1], first_vel[0])
-            self._reference_pos[env_id] = new_waypoints[0]
-            self._reference_yaw[env_id, 0] = float(yaw.item())
-
-            # --- resample pursuer start position ------------------------------
-            grid = self._make_pursuit_grid()
-            new_start: torch.Tensor | None = None
-            if grid is not None:
-                new_start = self._sample_grid_pursuer_start(grid)
-            if new_start is None:
-                # fallback: keep the existing start position
-                new_start = self._pursuer_start_pos[env_id].clone()
-            new_start[2] = float(new_waypoints[0, 2].item())
-            self._pursuer_start_pos[env_id] = new_start
-
-        # No obstacle moves needed — static/dynamic layouts are unchanged.
-
     def _resample_pursuit_scenarios(self, env_ids: torch.Tensor) -> None:
-        """Resample pursuit scenarios for the given envs.
+        """Assign fresh pooled layouts and episode parameters to resetting environments."""
+        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        if env_ids.numel() == 0:
+            return
 
-        Fast path: if a scenario has already been generated for an env and we are
-        not currently in a curriculum blend section, only resample evader speed and
-        pursuer start position, keeping the existing obstacle/path topology.
+        phases = self._sample_curriculum_phases(env_ids.numel())
+        needed_phases = set(torch.unique(phases).tolist())
+        for phase in tuple(self._scenario_pools):
+            if phase not in needed_phases:
+                del self._scenario_pools[phase]
+        for phase in needed_phases:
+            if phase not in self._scenario_pools:
+                self._scenario_pools[phase] = {
+                    name: tensor.to(self.device)
+                    for name, tensor in self._scenario_pools_cpu[phase].items()
+                }
 
-        Full path: run the expensive grid + A* scenario generation for envs that are
-        uninitialized or for which a curriculum blend is active (new phase being
-        introduced).
-        """
-        in_blend = self._is_in_curriculum_blend()
-
-        # Split env_ids into fast-resample vs full-generation sets.
-        initialized = self._scenario_initialized[env_ids]
-        if in_blend or not initialized.any():
-            # All envs need full generation.
-            fast_ids = env_ids.new_empty(0)
-            full_ids = env_ids
-        elif initialized.all():
-            # All envs can use the fast path.
-            fast_ids = env_ids
-            full_ids = env_ids.new_empty(0)
-        else:
-            fast_ids = env_ids[initialized]
-            full_ids = env_ids[~initialized]
-
-        # ---- fast path -------------------------------------------------------
-        if fast_ids.numel() > 0:
-            self._resample_pursuit_scenarios_fast(fast_ids)
-
-        # ---- full generation path --------------------------------------------
-        if full_ids.numel() > 0:
-            attempts = max(1, int(self.cfg.pursuit_scenario_attempts))
-            for env_id in full_ids.tolist():
-                phase = self._sample_curriculum_phase()
-                self._ensure_obstacle_slots_for_phase(phase)
-                scenario = self._sample_pursuit_scenario_with_fallback(phase, attempts)
-
-                self._scenario_phase[env_id] = scenario["phase"]
-                self._scenario_fallback[env_id] = bool(scenario["fallback"])
-                if bool(scenario["fallback"]):
-                    self._scenario_fallback_count[env_id] += 1
-                self._evader_path_type[env_id] = scenario["path_type"]
-                self._evader_waypoints[env_id] = scenario["evader_waypoints"]
-                self._pursuer_start_pos[env_id] = scenario["pursuer_start"]
-                self._reference_pos[env_id] = scenario["evader_waypoints"][0]
-                self._reference_yaw[env_id, 0] = scenario["evader_yaw"]
-
-                self._static_obstacle_positions_xy[env_id] = scenario["static_xy"]
-                self._static_obstacle_active[env_id] = scenario["static_active"]
-                self._dynamic_obstacle_waypoints[env_id] = scenario["dynamic_waypoints"]
-                self._dynamic_obstacle_active[env_id] = scenario["dynamic_active"]
-                self._dynamic_obstacle_positions[env_id] = scenario["dynamic_waypoints"][0]
-
-            self._scenario_initialized[full_ids] = True
-            self._move_static_obstacles(full_ids)
-            self._move_dynamic_obstacles(full_ids)
-            self._refresh_debug_pillars()
-
-    def _sample_pursuit_scenario_with_fallback(
-        self,
-        phase: int,
-        attempts: int,
-    ) -> dict[str, torch.Tensor | int | float | bool]:
-        # Long trainings should not die because one reset sampled an over-tight scenario.
-        for _ in range(attempts):
-            scenario = self._sample_pursuit_scenario(phase)
-            if scenario is not None:
-                scenario["fallback"] = False
-                return scenario
-
-        easy_attempts = max(4, attempts // 4)
-        for easy_phase in range(int(phase) - 1, 0, -1):
-            for _ in range(easy_attempts):
-                scenario = self._sample_pursuit_scenario(easy_phase)
-                if scenario is not None:
-                    scenario["phase"] = int(easy_phase)
-                    scenario["fallback"] = True
-                    return scenario
-
-        scenario = self._fallback_pursuit_scenario(int(phase))
-        scenario["fallback"] = True
-        return scenario
-
-    def _sample_pursuit_scenario(self, phase: int) -> dict[str, torch.Tensor | int | float] | None:
-        n_static, n_dynamic = self._phase_obstacle_counts(phase)
-        grid = self._make_pursuit_grid()
-        if grid is None:
-            return None
-
-        pursuer_start = self._sample_grid_pursuer_start(grid)
-        if pursuer_start is None:
-            return None
-        pursuer_mask = self._mark_grid_square(grid, pursuer_start[:2], float(self.cfg.pursuit_pursuer_occupied_side))
-        grid["occupied"] |= pursuer_mask
-
-        dynamic = self._sample_grid_dynamic_obstacles(grid, n_dynamic)
-        if dynamic is None:
-            return None
-        dynamic_waypoints, dynamic_active = dynamic
-
-        static = self._sample_grid_static_obstacles(grid, n_static)
-        if static is None:
-            return None
-        static_xy, static_active = static
-
-        evader_cell = self._sample_grid_evader_cell(grid, pursuer_start[:2])
-        if evader_cell is None:
-            return None
-        evader_z = float(self._sample_evader_z())
-        pursuer_start[2] = evader_z
-
-        if int(phase) == 1:
-            evader_waypoints = self._grid_static_evader_waypoints(grid, evader_cell, evader_z)
-            path_type = -2
-        else:
-            evader_waypoints = self._sample_grid_evader_waypoints(grid, evader_cell, pursuer_mask, evader_z)
-            if evader_waypoints is None:
-                return None
-            path_type = 0
-
-        if not self._point_free(pursuer_start, static_xy, static_active, dynamic_waypoints, dynamic_active):
-            return None
-
-        first_vel = self._first_waypoint_velocity(evader_waypoints)
-        yaw = torch.atan2(first_vel[1], first_vel[0])
-        return {
-            "phase": int(phase),
-            "path_type": int(path_type),
-            "evader_waypoints": evader_waypoints,
-            "evader_yaw": float(yaw.item()),
-            "pursuer_start": pursuer_start,
-            "static_xy": static_xy,
-            "static_active": static_active,
-            "dynamic_waypoints": dynamic_waypoints,
-            "dynamic_active": dynamic_active,
-        }
-
-    def _fallback_pursuit_scenario(self, phase: int) -> dict[str, torch.Tensor | int | float]:
-        lo, hi = self._safe_xy_bounds(self.cfg.pursuit_evader_wall_clearance)
-        center = 0.5 * (lo + hi)
-        span = hi - lo
-        length = min(1.6, max(0.5, float(span[0]) * 0.35))
-
-        t = torch.linspace(0.0, 1.0, self._path_waypoint_count, device=self.device)
-        xy = center.view(1, 2).repeat(self._path_waypoint_count, 1)
-        xy[:, 0] = center[0] + (t - 0.5) * length
-
-        z = 0.5 * (self._arena_min_safe[2] + self._arena_max_safe[2])
-        evader_waypoints = torch.zeros(self._path_waypoint_count, 3, device=self.device)
-        evader_waypoints[:, :2] = xy
-        evader_waypoints[:, 2] = z
-
-        static_xy = self._inactive_obstacle_xy(self._max_static_obstacles)
-        static_active = torch.zeros(self._max_static_obstacles, dtype=torch.bool, device=self.device)
-        dynamic_waypoints = self._inactive_dynamic_pos(self._max_dynamic_obstacles).view(1, -1, 3).repeat(
-            self._path_waypoint_count, 1, 1
-        )
-        dynamic_active = torch.zeros(self._max_dynamic_obstacles, dtype=torch.bool, device=self.device)
-
-        pursuer_start = self._fallback_pursuer_start(evader_waypoints[0])
-        first_vel = self._first_waypoint_velocity(evader_waypoints)
-        yaw = torch.atan2(first_vel[1], first_vel[0])
-        return {
-            "phase": int(phase),
-            "path_type": -1,
-            "evader_waypoints": evader_waypoints,
-            "evader_yaw": float(yaw.item()),
-            "pursuer_start": pursuer_start,
-            "static_xy": static_xy,
-            "static_active": static_active,
-            "dynamic_waypoints": dynamic_waypoints,
-            "dynamic_active": dynamic_active,
-        }
-
-    def _fallback_pursuer_start(self, evader_start: torch.Tensor) -> torch.Tensor:
-        lo = self._arena_min_safe + float(self.cfg.pursuit_pursuer_wall_clearance)
-        hi = self._arena_max_safe - float(self.cfg.pursuit_pursuer_wall_clearance)
-        wanted = max(float(self.cfg.pursuit_pursuer_min_evader_distance), 0.9)
-        offsets = (
-            (-wanted, 0.0),
-            (0.0, -wanted),
-            (wanted, 0.0),
-            (0.0, wanted),
-            (-wanted, -0.5 * wanted),
-            (wanted, 0.5 * wanted),
-        )
-
-        for ox, oy in offsets:
-            pos = evader_start.clone()
-            pos[0] += ox
-            pos[1] += oy
-            pos = torch.clamp(pos, min=lo, max=hi)
-            dist = torch.linalg.vector_norm(pos[:2] - evader_start[:2])
-            if float(dist.item()) >= float(self.cfg.pursuit_pursuer_min_evader_distance):
-                return pos
-
-        pos = evader_start.clone()
-        pos[:2] = 0.5 * (lo[:2] + hi[:2])
-        pos[2] = torch.clamp(pos[2], min=lo[2], max=hi[2])
-        return pos
-
-    def _make_pursuit_grid(self) -> dict[str, torch.Tensor | float] | None:
-        cell = max(0.05, float(self.cfg.pursuit_grid_cell_size))
-        margin = max(0.0, float(self.cfg.pursuit_grid_wall_margin))
-        lo = self._arena_min_safe[:2] + margin
-        hi = self._arena_max_safe[:2] - margin
-        if bool(torch.any(hi <= lo).item()):
-            return None
-
-        xs = torch.arange(float(lo[0]), float(hi[0]) + 0.5 * cell, cell, device=self.device)
-        ys = torch.arange(float(lo[1]), float(hi[1]) + 0.5 * cell, cell, device=self.device)
-        xs = xs[xs <= float(hi[0]) + 1e-6]
-        ys = ys[ys <= float(hi[1]) + 1e-6]
-        if xs.numel() < 3 or ys.numel() < 3:
-            return None
-
-        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
-        occupied = torch.zeros((ys.numel(), xs.numel()), dtype=torch.bool, device=self.device)
-        return {"xs": xs, "ys": ys, "xx": xx, "yy": yy, "occupied": occupied, "cell_size": cell}
-
-    def _sample_grid_pursuer_start(self, grid: dict[str, torch.Tensor | float]) -> torch.Tensor | None:
-        rows = int(grid["ys"].shape[0])
-        cols = int(grid["xs"].shape[0])
-        if rows < 1 or cols < 1:
-            return None
-
-        side = int(torch.randint(0, 4, (1,), device=self.device).item())
-        if side == 0:
-            cell = (int(torch.randint(0, rows, (1,), device=self.device).item()), 0)
-        elif side == 1:
-            cell = (int(torch.randint(0, rows, (1,), device=self.device).item()), cols - 1)
-        elif side == 2:
-            cell = (0, int(torch.randint(0, cols, (1,), device=self.device).item()))
-        else:
-            cell = (rows - 1, int(torch.randint(0, cols, (1,), device=self.device).item()))
-
-        pos = torch.zeros(3, device=self.device)
-        pos[:2] = self._grid_cell_xy(grid, cell)
-        pos[2] = 0.5 * (self._arena_min_safe[2] + self._arena_max_safe[2])
-        return pos
-
-    def _sample_grid_dynamic_obstacles(
-        self,
-        grid: dict[str, torch.Tensor | float],
-        count: int,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        slots = self._max_dynamic_obstacles
-        waypoints = self._inactive_dynamic_pos(slots).view(1, slots, 3).repeat(self._path_waypoint_count, 1, 1)
-        active = torch.zeros(slots, dtype=torch.bool, device=self.device)
-        count = min(max(0, int(count)), slots)
-        if count == 0:
-            return waypoints, active
-
-        for slot in range(count):
-            rail = self._sample_grid_dynamic_rail(grid)
-            if rail is None:
-                return None
-            start_xy, end_xy, mask = rail
-            waypoints[:, slot] = self._dynamic_rail_waypoints(start_xy, end_xy)
-            active[slot] = True
-            grid["occupied"] |= mask
-        return waypoints, active
-
-    def _sample_grid_dynamic_rail(
-        self, grid: dict[str, torch.Tensor | float]
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        length_range = tuple(getattr(self.cfg, "pursuit_dynamic_rail_length_range", (0.8, 1.5)))
-        length_lo = max(0.1, float(min(length_range)))
-        length_hi = max(length_lo, float(max(length_range)))
-        radius = self._dynamic_grid_radius()
-        directions = ((1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, -1.0))
-        lo = torch.stack((grid["xs"][0], grid["ys"][0]))
-        hi = torch.stack((grid["xs"][-1], grid["ys"][-1]))
-
-        for _ in range(96):
-            free = self._grid_free_cells(grid)
-            if free.numel() == 0:
-                return None
-            pick = int(torch.randint(0, free.shape[0], (1,), device=self.device).item())
-            center = self._grid_cell_xy(grid, (int(free[pick, 0]), int(free[pick, 1])))
-
-            direction_id = int(torch.randint(0, len(directions), (1,), device=self.device).item())
-            direction = torch.tensor(directions[direction_id], device=self.device, dtype=torch.float32)
-            direction = direction / torch.linalg.vector_norm(direction).clamp_min(1e-6)
-            length = float(torch.empty((), device=self.device).uniform_(length_lo, length_hi).item())
-            start_xy = center - 0.5 * length * direction
-            end_xy = center + 0.5 * length * direction
-            if not bool(torch.all((start_xy >= lo) & (start_xy <= hi) & (end_xy >= lo) & (end_xy <= hi)).item()):
+        for phase in needed_phases:
+            pool = self._scenario_pools[phase]
+            phase_mask = phases == phase
+            phase_env_ids = env_ids[phase_mask]
+            count = phase_env_ids.numel()
+            if count == 0:
                 continue
 
-            mask = self._grid_segment_mask(grid, start_xy, end_xy, radius)
-            if bool(torch.any(grid["occupied"] & mask).item()):
-                continue
-            return start_xy, end_xy, mask
-        return None
+            pool_rows = torch.randint(0, pool["path_type"].shape[0], (count,), device=self.device)
+            speed = self._sample_evader_episode_speeds(count)
+            z = self._sample_evader_zs(count)
+            step_dist = self._evader_step_distances_batch(speed)
+            waypoints = self._grid_polylines_waypoints(pool["evader_xy"][pool_rows], step_dist, z)
 
-    def _dynamic_rail_waypoints(self, start_xy: torch.Tensor, end_xy: torch.Tensor) -> torch.Tensor:
-        path = torch.zeros(self._path_waypoint_count, 3, device=self.device)
-        length = torch.linalg.vector_norm(end_xy - start_xy).clamp_min(1e-6)
-        speed = max(0.0, float(self.cfg.pursuit_dynamic_max_speed))
-        if speed <= 1e-6:
-            alpha = torch.zeros(self._path_waypoint_count, device=self.device)
-        else:
-            t = self._path_waypoint_steps.to(torch.float32) * self._step_dt
-            phase = torch.remainder(t * speed / length, 2.0)
-            alpha = torch.where(phase <= 1.0, phase, 2.0 - phase)
-        path[:, :2] = start_xy.view(1, 2) * (1.0 - alpha.view(-1, 1)) + end_xy.view(1, 2) * alpha.view(-1, 1)
-        path[:, 2] = self._dynamic_center_z()
-        return path
+            candidate_count = pool["pursuer_candidate_count"][pool_rows]
+            candidate_pick = torch.floor(torch.rand(count, device=self.device) * candidate_count).to(torch.long)
+            candidate_xy = pool["pursuer_candidates_xy"][pool_rows, candidate_pick]
 
-    def _sample_grid_static_obstacles(
+            self._scenario_phase[phase_env_ids] = phase
+            self._scenario_fallback[phase_env_ids] = False
+            self._evader_path_type[phase_env_ids] = pool["path_type"][pool_rows]
+            self._evader_waypoints[phase_env_ids] = waypoints
+            self._pursuer_start_pos[phase_env_ids, :2] = candidate_xy
+            self._pursuer_start_pos[phase_env_ids, 2] = z
+            self._reference_pos[phase_env_ids] = waypoints[:, 0]
+            self._reference_yaw[phase_env_ids, 0] = self._first_waypoint_yaws(waypoints)
+
+            self._static_obstacle_positions_xy[phase_env_ids] = pool["static_xy"][pool_rows]
+            self._static_obstacle_active[phase_env_ids] = pool["static_active"][pool_rows]
+            self._dynamic_obstacle_waypoints[phase_env_ids] = pool["dynamic_waypoints"][pool_rows]
+            self._dynamic_obstacle_active[phase_env_ids] = pool["dynamic_active"][pool_rows]
+            self._dynamic_obstacle_positions[phase_env_ids] = pool["dynamic_waypoints"][pool_rows, 0]
+
+        self._move_static_obstacles(env_ids)
+        self._move_dynamic_obstacles(env_ids)
+        self._refresh_debug_pillars()
+
+    def _grid_polylines_waypoints(
         self,
-        grid: dict[str, torch.Tensor | float],
-        count: int,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        slots = self._max_static_obstacles
-        xy = self._inactive_obstacle_xy(slots)
-        active = torch.zeros(slots, dtype=torch.bool, device=self.device)
-        count = min(max(0, int(count)), slots)
-        if count == 0:
-            return xy, active
-
-        radius = self._static_grid_radius()
-        safe_static = 2.0 * float(self.cfg.pillar_radius) + float(self.cfg.pursuit_obstacle_clearance)
-        for slot in range(count):
-            free = self._grid_free_cells(grid)
-            if free.numel() == 0:
-                return None
-
-            placed = False
-            order = torch.randperm(free.shape[0], device=self.device)
-            for pick in order.tolist():
-                candidate = self._grid_cell_xy(grid, (int(free[pick, 0]), int(free[pick, 1])))
-                if slot > 0:
-                    dist = torch.linalg.vector_norm(xy[:slot] - candidate, dim=-1)
-                    if bool(torch.any(dist <= safe_static).item()):
-                        continue
-                mask = self._grid_disc_mask(grid, candidate, radius)
-                if bool(torch.any(grid["occupied"] & mask).item()):
-                    continue
-                xy[slot] = candidate
-                active[slot] = True
-                grid["occupied"] |= mask
-                placed = True
-                break
-            if not placed:
-                return None
-        return xy, active
-
-    def _sample_grid_evader_cell(
-        self,
-        grid: dict[str, torch.Tensor | float],
-        pursuer_xy: torch.Tensor,
-    ) -> tuple[int, int] | None:
-        free = self._grid_free_cells(grid)
-        if free.numel() == 0:
-            return None
-
-        xy = self._grid_cells_xy(grid, free)
-        min_dist = max(0.0, float(self.cfg.pursuit_pursuer_min_evader_distance))
-        valid = torch.linalg.vector_norm(xy - pursuer_xy.view(1, 2), dim=-1) >= min_dist
-        candidates = free[valid]
-        if candidates.numel() == 0:
-            return None
-
-        pick = int(torch.randint(0, candidates.shape[0], (1,), device=self.device).item())
-        return int(candidates[pick, 0]), int(candidates[pick, 1])
-
-    def _grid_static_evader_waypoints(
-        self,
-        grid: dict[str, torch.Tensor | float],
-        cell: tuple[int, int],
-        z: float,
+        xy: torch.Tensor,
+        step_dist: torch.Tensor,
+        z: torch.Tensor,
     ) -> torch.Tensor:
-        waypoints = torch.zeros(self._path_waypoint_count, 3, device=self.device)
-        waypoints[:, :2] = self._grid_cell_xy(grid, cell).view(1, 2)
-        waypoints[:, 2] = float(z)
+        batch_size = xy.shape[0]
+        waypoints = torch.zeros(batch_size, self._path_waypoint_count, 3, device=self.device)
+        seg_len = torch.linalg.vector_norm(xy[:, 1:] - xy[:, :-1], dim=-1).clamp_min(1e-6)
+        cumulative = torch.cat(
+            (torch.zeros(batch_size, 1, device=self.device), torch.cumsum(seg_len, dim=1)),
+            dim=1,
+        )
+        target = torch.cat(
+            (torch.zeros(batch_size, 1, device=self.device), torch.cumsum(step_dist, dim=1)),
+            dim=1,
+        )
+        target = torch.minimum(target, cumulative[:, -1:])
+        seg = torch.searchsorted(cumulative[:, 1:].contiguous(), target.contiguous())
+        seg = seg.clamp(max=seg_len.shape[1] - 1)
+        start = torch.gather(xy, 1, seg.unsqueeze(-1).expand(-1, -1, 2))
+        end = torch.gather(xy, 1, (seg + 1).unsqueeze(-1).expand(-1, -1, 2))
+        start_dist = torch.gather(cumulative, 1, seg)
+        length = torch.gather(seg_len, 1, seg)
+        tau = ((target - start_dist) / length).unsqueeze(-1)
+        waypoints[:, :, :2] = start * (1.0 - tau) + end * tau
+        waypoints[:, :, 2] = z.view(-1, 1)
         return waypoints
 
-    def _sample_grid_evader_waypoints(
-        self,
-        grid: dict[str, torch.Tensor | float],
-        start_cell: tuple[int, int],
-        pursuer_mask: torch.Tensor,
-        z: float,
-    ) -> torch.Tensor | None:
-        speed = self._sample_evader_episode_speed()
-        if speed <= 0.0:
-            return self._grid_static_evader_waypoints(grid, start_cell, z)
-
-        smooth = bool(getattr(self.cfg, "pursuit_smooth_evader_path", False))
-        step_dist = self._evader_step_distances(speed)
-        required_distance = float(torch.sum(step_dist).item())
-        needed = required_distance + float(grid["cell_size"])
-        occupied = grid["occupied"].clone()
-        current = start_cell
-        polyline = self._grid_cell_xy(grid, current).view(1, 2)
-        distance = 0.0
-
-        for path_id in range(24):
-            if distance >= needed:
-                break
-            next_polyline = None
-            goal_attempts = 1
-            if path_id > 0 and smooth:
-                goal_attempts = max(1, int(getattr(self.cfg, "pursuit_smooth_evader_goal_attempts", 6)))
-
-            for _ in range(goal_attempts):
-                incoming_direction = None
-                if path_id > 0 and polyline.shape[0] > 1 and smooth:
-                    incoming_direction = torch.nn.functional.normalize(polyline[-1] - polyline[-2], dim=0)
-                path = self._sample_grid_goal_path(grid, occupied, current, incoming_direction)
-                if path is None:
-                    continue
-                path_xy = self._grid_cells_to_xy(grid, path)
-                if path_id == 0 or not smooth:
-                    next_polyline = torch.cat((polyline, path_xy[1:]), dim=0)
-                else:
-                    next_polyline = self._blend_grid_goal_junction(grid, polyline, path_xy)
-                if next_polyline is not None:
-                    break
-
-            if next_polyline is None:
-                return None
-            polyline = next_polyline
-            distance = self._polyline_length_xy(polyline)
-            current = path[-1]
-            if path_id == 0:
-                occupied = occupied.clone()
-                occupied[pursuer_mask] = False
-
-        if distance < needed * 0.8:
-            return None
-        if distance < required_distance:
-            return None
-        if bool(getattr(self.cfg, "pursuit_smooth_evader_validate", True)) and not self._grid_xy_path_free(
-            grid,
-            polyline,
-        ):
-            return None
-        return self._grid_polyline_waypoints(polyline, step_dist, z)
-
-    def _sample_grid_goal_path(
-        self,
-        grid: dict[str, torch.Tensor | float],
-        occupied: torch.Tensor,
-        start_cell: tuple[int, int],
-        incoming_direction: torch.Tensor | None = None,
-    ) -> list[tuple[int, int]] | None:
-        free = torch.nonzero(~occupied, as_tuple=False)
-        if free.numel() == 0:
-            return None
-
-        start_xy = self._grid_cell_xy(grid, start_cell)
-        goal_min = max(0.0, float(self.cfg.pursuit_evader_goal_min_distance))
-        xy = self._grid_cells_xy(grid, free)
-        valid = torch.linalg.vector_norm(xy - start_xy.view(1, 2), dim=-1) >= goal_min
-        if bool(getattr(self.cfg, "pursuit_smooth_evader_path", False)):
-            margin = max(0.0, float(getattr(self.cfg, "pursuit_smooth_evader_goal_blend_distance", 0.35)))
-            lo = torch.stack((grid["xs"][0], grid["ys"][0])) + margin
-            hi = torch.stack((grid["xs"][-1], grid["ys"][-1])) - margin
-            valid &= torch.all((xy >= lo.view(1, 2)) & (xy <= hi.view(1, 2)), dim=-1)
-        if incoming_direction is not None:
-            goal_direction = torch.nn.functional.normalize(xy - start_xy.view(1, 2), dim=-1)
-            min_alignment = float(getattr(self.cfg, "pursuit_smooth_evader_goal_sample_min_alignment", -0.8))
-            alignment = torch.sum(goal_direction * incoming_direction.view(1, 2), dim=-1)
-            valid &= alignment >= min_alignment
-        candidates = free[valid]
-        if candidates.numel() == 0:
-            return None
-
-        order = torch.randperm(candidates.shape[0], device=self.device)
-        for pick in order[:64].tolist():
-            goal = (int(candidates[pick, 0]), int(candidates[pick, 1]))
-            path = self._astar_grid_path(occupied, start_cell, goal)
-            if path is not None and len(path) > 1:
-                return path
-        return None
-
-    def _grid_polyline_waypoints(self, xy: torch.Tensor, step_dist: torch.Tensor, z: float) -> torch.Tensor:
-        waypoints = torch.zeros(self._path_waypoint_count, 3, device=self.device)
-        if xy.shape[0] <= 1:
-            waypoints[:, :2] = xy[:1].view(1, 2)
-            waypoints[:, 2] = float(z)
-            return waypoints
-
-        seg_len = torch.linalg.vector_norm(xy[1:] - xy[:-1], dim=-1).clamp_min(1e-6)
-        cumulative = torch.cat((torch.zeros(1, device=self.device), torch.cumsum(seg_len, dim=0)))
-        target = torch.cat((torch.zeros(1, device=self.device), torch.cumsum(step_dist, dim=0)))
-        target = target.clamp(max=float(cumulative[-1].item()))
-        seg = torch.searchsorted(cumulative[1:], target).clamp(max=seg_len.shape[0] - 1)
-        tau = ((target - cumulative[seg]) / seg_len[seg]).view(-1, 1)
-        waypoints[:, :2] = xy[seg] * (1.0 - tau) + xy[seg + 1] * tau
-        waypoints[:, 2] = float(z)
-        return waypoints
-
-    def _blend_grid_goal_junction(
-        self,
-        grid: dict[str, torch.Tensor | float],
-        previous: torch.Tensor,
-        following: torch.Tensor,
-    ) -> torch.Tensor | None:
-        if previous.shape[0] <= 1 or following.shape[0] <= 1:
-            return None
-
-        blend = max(0.0, float(getattr(self.cfg, "pursuit_smooth_evader_goal_blend_distance", 0.35)))
-        blend = min(blend, 0.45 * self._polyline_length_xy(previous), 0.45 * self._polyline_length_xy(following))
-        if blend <= 1e-6:
-            return None
-
-        before, entry = self._polyline_prefix_at_distance(previous, self._polyline_length_xy(previous) - blend)
-        exit, after = self._polyline_suffix_at_distance(following, blend)
-        incoming = torch.nn.functional.normalize(previous[-1] - entry, dim=0)
-        outgoing = torch.nn.functional.normalize(exit - following[0], dim=0)
-        alignment = float(torch.dot(incoming, outgoing).item())
-        min_alignment = float(getattr(self.cfg, "pursuit_smooth_evader_goal_min_alignment", -0.8))
-        if alignment < min_alignment:
-            return None
-
-        incoming_tangent = torch.nn.functional.normalize(before[-1] - before[-2], dim=0)
-        outgoing_tangent = torch.nn.functional.normalize(after[1] - after[0], dim=0)
-        control_distance = 0.5 * blend
-        control_in = entry + control_distance * incoming_tangent
-        control_out = exit - control_distance * outgoing_tangent
-        resolution = max(2, int(getattr(self.cfg, "pursuit_smooth_evader_resolution", 4)))
-        t = torch.linspace(0.0, 1.0, resolution + 1, device=previous.device, dtype=previous.dtype)
-        curve = self._cubic_bezier_xy(entry, control_in, control_out, exit, t.view(-1, 1))
-        if bool(getattr(self.cfg, "pursuit_smooth_evader_validate", True)) and not self._grid_xy_path_free(grid, curve):
-            return None
-        return torch.cat((before[:-1], curve, after[1:]), dim=0)
-
-    @staticmethod
-    def _polyline_prefix_at_distance(xy: torch.Tensor, distance: float) -> tuple[torch.Tensor, torch.Tensor]:
-        seg_len = torch.linalg.vector_norm(xy[1:] - xy[:-1], dim=-1).clamp_min(1e-6)
-        cumulative = torch.cat((torch.zeros(1, device=xy.device), torch.cumsum(seg_len, dim=0)))
-        target = torch.as_tensor(distance, device=xy.device, dtype=xy.dtype).clamp(0.0, cumulative[-1])
-        seg = int(torch.searchsorted(cumulative[1:], target).clamp(max=seg_len.shape[0] - 1).item())
-        tau = (target - cumulative[seg]) / seg_len[seg]
-        point = xy[seg] * (1.0 - tau) + xy[seg + 1] * tau
-        if float(tau.item()) <= 1e-6:
-            return xy[: seg + 1], point
-        return torch.cat((xy[: seg + 1], point.view(1, 2)), dim=0), point
-
-    @staticmethod
-    def _polyline_suffix_at_distance(xy: torch.Tensor, distance: float) -> tuple[torch.Tensor, torch.Tensor]:
-        seg_len = torch.linalg.vector_norm(xy[1:] - xy[:-1], dim=-1).clamp_min(1e-6)
-        cumulative = torch.cat((torch.zeros(1, device=xy.device), torch.cumsum(seg_len, dim=0)))
-        target = torch.as_tensor(distance, device=xy.device, dtype=xy.dtype).clamp(0.0, cumulative[-1])
-        seg = int(torch.searchsorted(cumulative[1:], target).clamp(max=seg_len.shape[0] - 1).item())
-        tau = (target - cumulative[seg]) / seg_len[seg]
-        point = xy[seg] * (1.0 - tau) + xy[seg + 1] * tau
-        if float(tau.item()) >= 1.0 - 1e-6:
-            return point, xy[seg + 1 :]
-        return point, torch.cat((point.view(1, 2), xy[seg + 1 :]), dim=0)
-
-    @staticmethod
-    def _cubic_bezier_xy(
-        a: torch.Tensor,
-        b: torch.Tensor,
-        c: torch.Tensor,
-        d: torch.Tensor,
-        t: torch.Tensor,
-    ) -> torch.Tensor:
-        while a.ndim < t.ndim:
-            a = a.unsqueeze(-2)
-            b = b.unsqueeze(-2)
-            c = c.unsqueeze(-2)
-            d = d.unsqueeze(-2)
-        u = 1.0 - t
-        return u * u * u * a + 3.0 * u * u * t * b + 3.0 * u * t * t * c + t * t * t * d
-
-    @staticmethod
-    def _polyline_length_xy(xy: torch.Tensor) -> float:
-        if xy.shape[0] <= 1:
-            return 0.0
-        return float(torch.sum(torch.linalg.vector_norm(xy[1:] - xy[:-1], dim=-1)).item())
-
-    def _astar_grid_path(
-        self,
-        occupied: torch.Tensor,
-        start: tuple[int, int],
-        goal: tuple[int, int],
-    ) -> list[tuple[int, int]] | None:
-        occ = occupied.detach().cpu().tolist()
-        rows = len(occ)
-        cols = len(occ[0]) if rows > 0 else 0
-        if rows == 0 or cols == 0:
-            return None
-        if occ[start[0]][start[1]] or occ[goal[0]][goal[1]]:
-            return None
-
-        moves = (
-            (-1, 0, 1.0),
-            (1, 0, 1.0),
-            (0, -1, 1.0),
-            (0, 1, 1.0),
-            (-1, -1, math.sqrt(2.0)),
-            (-1, 1, math.sqrt(2.0)),
-            (1, -1, math.sqrt(2.0)),
-            (1, 1, math.sqrt(2.0)),
-        )
-
-        def heuristic(cell: tuple[int, int]) -> float:
-            return math.hypot(float(cell[0] - goal[0]), float(cell[1] - goal[1]))
-
-        heap: list[tuple[float, int, tuple[int, int]]] = []
-        heapq.heappush(heap, (heuristic(start), 0, start))
-        parent: dict[tuple[int, int], tuple[int, int]] = {}
-        cost = {start: 0.0}
-        closed: set[tuple[int, int]] = set()
-        push_id = 1
-
-        while heap:
-            _, _, cell = heapq.heappop(heap)
-            if cell in closed:
-                continue
-            if cell == goal:
-                path = [cell]
-                while cell in parent:
-                    cell = parent[cell]
-                    path.append(cell)
-                return list(reversed(path))
-
-            closed.add(cell)
-            row, col = cell
-            for dr, dc, move_cost in moves:
-                nr = row + dr
-                nc = col + dc
-                if nr < 0 or nr >= rows or nc < 0 or nc >= cols or occ[nr][nc]:
-                    continue
-                if dr != 0 and dc != 0 and (occ[row][nc] or occ[nr][col]):
-                    continue
-
-                new_cost = cost[cell] + move_cost
-                nxt = (nr, nc)
-                if new_cost >= cost.get(nxt, float("inf")):
-                    continue
-                cost[nxt] = new_cost
-                parent[nxt] = cell
-                heapq.heappush(heap, (new_cost + heuristic(nxt), push_id, nxt))
-                push_id += 1
-        return None
-
-    def _grid_free_cells(self, grid: dict[str, torch.Tensor | float]) -> torch.Tensor:
-        return torch.nonzero(~grid["occupied"], as_tuple=False)
-
-    def _grid_cell_xy(self, grid: dict[str, torch.Tensor | float], cell: tuple[int, int]) -> torch.Tensor:
-        row, col = cell
-        return torch.stack((grid["xs"][col], grid["ys"][row]))
-
-    def _grid_cells_xy(self, grid: dict[str, torch.Tensor | float], cells: torch.Tensor) -> torch.Tensor:
-        return torch.stack((grid["xs"][cells[:, 1]], grid["ys"][cells[:, 0]]), dim=-1)
-
-    def _grid_cells_to_xy(self, grid: dict[str, torch.Tensor | float], cells: list[tuple[int, int]]) -> torch.Tensor:
-        rows = torch.tensor([cell[0] for cell in cells], device=self.device, dtype=torch.long)
-        cols = torch.tensor([cell[1] for cell in cells], device=self.device, dtype=torch.long)
-        return torch.stack((grid["xs"][cols], grid["ys"][rows]), dim=-1)
-
-    def _mark_grid_square(
-        self,
-        grid: dict[str, torch.Tensor | float],
-        center: torch.Tensor,
-        side: float,
-    ) -> torch.Tensor:
-        half = 0.5 * max(0.0, float(side))
-        return (torch.abs(grid["xx"] - center[0]) <= half) & (torch.abs(grid["yy"] - center[1]) <= half)
-
-    def _grid_disc_mask(
-        self,
-        grid: dict[str, torch.Tensor | float],
-        center: torch.Tensor,
-        radius: float,
-    ) -> torch.Tensor:
-        dx = grid["xx"] - center[0]
-        dy = grid["yy"] - center[1]
-        return dx * dx + dy * dy <= float(radius) ** 2
-
-    def _grid_segment_mask(
-        self,
-        grid: dict[str, torch.Tensor | float],
-        start_xy: torch.Tensor,
-        end_xy: torch.Tensor,
-        radius: float,
-    ) -> torch.Tensor:
-        points = torch.stack((grid["xx"], grid["yy"]), dim=-1)
-        ab = end_xy - start_xy
-        denom = torch.sum(ab * ab).clamp_min(1e-6)
-        rel = points - start_xy.view(1, 1, 2)
-        t = torch.clamp(torch.sum(rel * ab.view(1, 1, 2), dim=-1) / denom, 0.0, 1.0)
-        closest = start_xy.view(1, 1, 2) + t.unsqueeze(-1) * ab.view(1, 1, 2)
-        return torch.linalg.vector_norm(points - closest, dim=-1) <= float(radius)
-
-    def _grid_xy_path_free(self, grid: dict[str, torch.Tensor | float], xy: torch.Tensor) -> bool:
-        if xy.shape[0] == 0:
-            return True
-        if xy.shape[0] == 1:
-            points = xy
-        else:
-            cell = max(1e-6, float(grid["cell_size"]))
-            seg_len = torch.linalg.vector_norm(xy[1:] - xy[:-1], dim=-1)
-            max_samples = max(2, int(torch.ceil(torch.max(seg_len) / (0.5 * cell)).item()) + 1)
-            t = torch.linspace(0.0, 1.0, max_samples, device=xy.device, dtype=xy.dtype)
-            points = xy[:-1, None, :] * (1.0 - t.view(1, -1, 1)) + xy[1:, None, :] * t.view(1, -1, 1)
-            points = points.reshape(-1, 2)
-
-        cell = max(1e-6, float(grid["cell_size"]))
-        xs = grid["xs"]
-        ys = grid["ys"]
-        cols = torch.round((points[:, 0] - xs[0]) / cell).to(torch.long)
-        rows = torch.round((points[:, 1] - ys[0]) / cell).to(torch.long)
-        in_bounds = (rows >= 0) & (rows < ys.shape[0]) & (cols >= 0) & (cols < xs.shape[0])
-        if not bool(torch.all(in_bounds).item()):
-            return False
-
-        occupied = grid["occupied"]
-        return not bool(torch.any(occupied[rows, cols]).item())
-
-    def _static_grid_radius(self) -> float:
-        return float(self.cfg.pillar_radius + self.cfg.pursuit_evader_radius + self.cfg.pursuit_obstacle_clearance)
-
-    def _dynamic_grid_radius(self) -> float:
-        return float(
-            self.cfg.pursuit_dynamic_obstacle_radius
-            + self.cfg.pursuit_evader_radius
-            + self.cfg.pursuit_obstacle_clearance
-        )
+    def _first_waypoint_yaws(self, waypoints: torch.Tensor) -> torch.Tensor:
+        dt_steps = (self._path_waypoint_steps[1:] - self._path_waypoint_steps[:-1]).to(waypoints.dtype)
+        velocity = (waypoints[:, 1:, :2] - waypoints[:, :-1, :2]) / (
+            dt_steps.view(1, -1, 1) * self._step_dt
+        ).clamp_min(self._step_dt)
+        moving = torch.linalg.vector_norm(velocity, dim=-1) > 0.05
+        first = torch.argmax(moving.to(torch.int64), dim=1)
+        selected = torch.gather(velocity, 1, first.view(-1, 1, 1).expand(-1, 1, 2)).squeeze(1)
+        yaw = torch.atan2(selected[:, 1], selected[:, 0])
+        return torch.where(moving.any(dim=1), yaw, torch.zeros_like(yaw))
 
     def _curriculum_progress(self) -> float:
         total = int(self.cfg.pursuit_curriculum_total_steps)
@@ -2299,11 +1552,15 @@ class PosTrackingEnv(DirectRLEnv):
             total = int(getattr(self.cfg, "total_timesteps", 1))
         return min(1.0, max(0.0, float(self.common_step_counter) / max(1, total)))
 
-    def _sample_curriculum_phase(self) -> int:
+    def _sample_curriculum_phases(self, count: int) -> torch.Tensor:
+        count = max(0, int(count))
+        if count == 0:
+            return torch.empty(0, device=self.device, dtype=torch.long)
+
         progress = self._curriculum_progress()
         fractions = self.cfg.pursuit_curriculum_phase_fractions
         if not fractions:
-            return 1
+            return torch.ones(count, device=self.device, dtype=torch.long)
 
         end = 0.0
         for phase, fraction in enumerate(fractions, start=1):
@@ -2324,83 +1581,41 @@ class PosTrackingEnv(DirectRLEnv):
                 )
                 if blend_width > 0.0 and next_phase is not None:
                     prob_next = max(0.0, min(1.0, (progress - (end - blend_width)) / blend_width))
-                    if float(torch.rand((), device=self.device)) < prob_next:
-                        return next_phase
-                return phase
+                    draws = torch.rand(count, device=self.device)
+                    return torch.where(
+                        draws < prob_next,
+                        torch.full_like(draws, next_phase, dtype=torch.long),
+                        torch.full_like(draws, phase, dtype=torch.long),
+                    )
+                return torch.full((count,), phase, device=self.device, dtype=torch.long)
         enabled = [phase for phase, fraction in enumerate(fractions, start=1) if float(fraction) > 0.0]
-        return enabled[-1] if enabled else 1
+        return torch.full((count,), enabled[-1] if enabled else 1, device=self.device, dtype=torch.long)
 
-    def _phase_obstacle_counts(self, phase: int) -> tuple[int, int]:
-        phase = int(phase)
-        choices: list[tuple[int, int]] = []
-        if phase == 1:
-            choices = [(s, 0) for s in range(1, 3)]
-        elif phase == 2:
-            choices = [(s, 0) for s in range(1, 3)]
-        elif phase == 3:
-            choices = [(s, 0) for s in range(2, 6)]
-        else:
-            for total in range(4, 7):
-                for dynamic in range(1, 4):
-                    static = total - dynamic
-                    choices.append((static, dynamic))
-
-        choices = [
-            (static, dynamic)
-            for static, dynamic in choices
-            if 0 <= static <= self._max_static_obstacles and 0 <= dynamic <= self._max_dynamic_obstacles
-        ]
-        if not choices:
-            return 0, 0
-        idx = int(torch.randint(0, len(choices), (1,), device=self.device).item())
-        return choices[idx]
-
-    def _sample_evader_episode_speed(self) -> float:
+    def _sample_evader_episode_speeds(self, count: int) -> torch.Tensor:
         speed_range = getattr(self.cfg, "pursuit_evader_speed_range", None)
         if speed_range is None:
-            return max(0.0, float(getattr(self.cfg, "pursuit_evader_speed", 0.0)))
+            speed = max(0.0, float(getattr(self.cfg, "pursuit_evader_speed", 0.0)))
+            return torch.full((count,), speed, device=self.device)
         lo = max(0.0, float(speed_range[0]))
         hi = max(0.0, float(speed_range[1]))
         if hi < lo:
             lo, hi = hi, lo
         if hi <= lo:
-            return lo
-        return float(torch.empty((), device=self.device).uniform_(lo, hi).item())
+            return torch.full((count,), lo, device=self.device)
+        return torch.empty(count, device=self.device).uniform_(lo, hi)
 
-    def _evader_step_distances(self, speed: float) -> torch.Tensor:
+    def _evader_step_distances_batch(self, speed: torch.Tensor) -> torch.Tensor:
         dt_steps = (self._path_waypoint_steps[1:] - self._path_waypoint_steps[:-1]).to(torch.float32)
-        return dt_steps * self._step_dt * float(speed)
+        return speed.view(-1, 1) * dt_steps.view(1, -1) * self._step_dt
 
-    def _sample_evader_z(self) -> torch.Tensor:
+    def _sample_evader_zs(self, count: int) -> torch.Tensor:
         clearance = float(self.cfg.pursuit_evader_wall_clearance)
         lo = self._arena_min_safe[2] + clearance
         hi = self._arena_max_safe[2] - clearance
         if float(hi) <= float(lo):
             lo = self._arena_min_safe[2]
             hi = self._arena_max_safe[2]
-        return lo + (hi - lo) * torch.rand((), device=self.device)
-
-    def _point_free(
-        self,
-        pos: torch.Tensor,
-        static_xy: torch.Tensor,
-        static_active: torch.Tensor,
-        dynamic_pos: torch.Tensor,
-        dynamic_active: torch.Tensor,
-    ) -> bool:
-        if bool(static_active.any().item()):
-            d_static = torch.linalg.vector_norm(static_xy - pos[:2], dim=-1)
-            safe = float(self.cfg.pillar_radius + self.cfg.drone_collision_radius + self.cfg.pursuit_obstacle_clearance)
-            if bool(torch.any((d_static <= safe) & static_active).item()):
-                return False
-        if bool(dynamic_active.any().item()):
-            dynamic_now = dynamic_pos[0] if dynamic_pos.ndim == 3 else dynamic_pos
-            d_dyn = torch.linalg.vector_norm(dynamic_now[:, :2] - pos[:2], dim=-1)
-            safe = float(self.cfg.pursuit_dynamic_obstacle_radius + self.cfg.drone_collision_radius)
-            bad = (d_dyn <= safe) & dynamic_active
-            if bool(bad.any().item()):
-                return False
-        return True
+        return lo + (hi - lo) * torch.rand(count, device=self.device)
 
     def _update_pursuit_episode_motion(self, env_ids: torch.Tensor | None = None) -> None:
         if env_ids is None:
@@ -2432,6 +1647,8 @@ class PosTrackingEnv(DirectRLEnv):
         return math_utils.quat_from_euler_xyz(zeros, zeros, yaw)
 
     def _move_static_obstacles(self, env_ids: torch.Tensor) -> None:
+        if not self._render_obstacles:
+            return
         slots = self._spawned_static_obstacles
         if self._static_obstacle_view is None or slots == 0:
             return
@@ -2444,11 +1661,14 @@ class PosTrackingEnv(DirectRLEnv):
         pos[:, :, :2] = xy
         pos[:, :, 2] = self._static_center_z()
         pos = pos + self._terrain.env_origins[env_ids].view(-1, 1, 3)
-        indices = self._static_obstacle_view_index[env_ids, :slots].reshape(-1)
-        self._static_obstacle_view.set_world_poses(pos.reshape(-1, 3), indices=indices.detach().cpu().tolist())
+        env_id_list = env_ids.detach().cpu().tolist()
+        indices = [idx for env_id in env_id_list for idx in self._static_obstacle_view_indices[env_id][:slots]]
+        self._static_obstacle_view.set_world_poses(pos.reshape(-1, 3), indices=indices)
         self._mark_ray_caster_outdated(env_ids)
 
     def _move_dynamic_obstacles(self, env_ids: torch.Tensor) -> None:
+        if not self._render_obstacles:
+            return
         slots = self._spawned_dynamic_obstacles
         if self._dynamic_obstacle_view is None or slots == 0:
             return
@@ -2458,8 +1678,9 @@ class PosTrackingEnv(DirectRLEnv):
         inactive = self._inactive_dynamic_pos(slots).view(1, -1, 3)
         pos = torch.where(active.unsqueeze(-1), pos, inactive.expand_as(pos))
         pos = pos + self._terrain.env_origins[env_ids].view(-1, 1, 3)
-        indices = self._dynamic_obstacle_view_index[env_ids, :slots].reshape(-1)
-        self._dynamic_obstacle_view.set_world_poses(pos.reshape(-1, 3), indices=indices.detach().cpu().tolist())
+        env_id_list = env_ids.detach().cpu().tolist()
+        indices = [idx for env_id in env_id_list for idx in self._dynamic_obstacle_view_indices[env_id][:slots]]
+        self._dynamic_obstacle_view.set_world_poses(pos.reshape(-1, 3), indices=indices)
         self._mark_ray_caster_outdated(env_ids)
 
     def _refresh_debug_pillars(self) -> None:
@@ -2498,24 +1719,6 @@ class PosTrackingEnv(DirectRLEnv):
             self._ray_caster._is_outdated[env_ids] = True
         except Exception:
             pass
-
-    def _waypoint_velocities(self, waypoints: torch.Tensor) -> torch.Tensor:
-        vel = torch.zeros_like(waypoints)
-        if waypoints.shape[0] <= 1:
-            return vel
-        dt_steps = (self._path_waypoint_steps[1:] - self._path_waypoint_steps[:-1]).to(waypoints.dtype)
-        dt = (dt_steps * self._step_dt).clamp_min(self._step_dt)
-        shape = (dt.shape[0],) + (1,) * (waypoints.ndim - 1)
-        vel[:-1] = (waypoints[1:] - waypoints[:-1]) / dt.view(shape)
-        vel[-1] = vel[-2]
-        return vel
-
-    def _first_waypoint_velocity(self, waypoints: torch.Tensor) -> torch.Tensor:
-        vel = self._waypoint_velocities(waypoints)
-        speed = torch.linalg.vector_norm(vel[:, :2], dim=-1)
-        moving = torch.nonzero(speed > 0.05, as_tuple=False).flatten()
-        idx = int(moving[0].item()) if moving.numel() > 0 else 0
-        return vel[idx]
 
     def _eval_evader_waypoints(self, env_ids: torch.Tensor, step_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self._eval_waypoints(self._evader_waypoints, env_ids, step_ids)
