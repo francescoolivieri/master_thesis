@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -56,6 +58,11 @@ parser.add_argument(
     help="Env YAML used to train the checkpoint. Defaults to params/env.yaml next to the checkpoint/run.",
 )
 parser.add_argument(
+    "--allow-observation-adapter",
+    action="store_true",
+    help="Allow legacy PPO observation conversion when checkpoint and benchmark dimensions differ.",
+)
+parser.add_argument(
     "--actor-cfg",
     type=str,
     default="source/isaac_pursuit_evasion/deployment/cfg/actor_pos_tracking_ray_cfg.yml",
@@ -81,6 +88,12 @@ parser.add_argument(
     type=int,
     default=30,
     help="Number of pursuit benchmark scenarios to run for Easy, Medium, and Hard.",
+)
+parser.add_argument(
+    "--evader-speed",
+    type=float,
+    default=None,
+    help="Pursuit evader speed in m/s. Defaults to the maximum speed from the training config.",
 )
 parser.add_argument(
     "--fixed-goals",
@@ -224,6 +237,8 @@ def _apply_env_overrides_from_agent_cfg(env_cfg: Any, agent_cfg: Any) -> None:
 
 
 _TRAINING_ENV_COMPAT_KEYS = (
+    "episode_length_s",
+    "decimation",
     "arena_min",
     "arena_max",
     "arena_margin",
@@ -244,6 +259,7 @@ _TRAINING_ENV_COMPAT_KEYS = (
     "flag_yaw_tracking",
     "flag_penalize_linvel",
     "flag_action_smoothness_penalty",
+    "enable_pursuit_evasion_curriculum",
     "include_yaw_in_observations",
     "include_yaw_with_ray_caster",
     "enable_obstacle_observations",
@@ -257,12 +273,49 @@ _TRAINING_ENV_COMPAT_KEYS = (
     "ray_caster_horizontal_fov_range",
     "ray_caster_offset",
     "reference_obstacle_clearance",
+    "ref_pos_min",
+    "ref_pos_max",
+    "ref_yaw_range",
+    "pursuit_curriculum_phase_fractions",
+    "pursuit_curriculum_blend_fraction",
+    "pursuit_phase1_fixed_evader_fraction",
+    "pursuit_scenario_pool_size",
+    "pursuit_grid_cell_size",
+    "pursuit_grid_wall_margin",
+    "pursuit_pursuer_occupied_side",
+    "pursuit_evader_goal_min_distance",
+    "pursuit_dynamic_rail_length_range",
+    "pursuit_path_waypoint_dt",
+    "pursuit_evader_speed_range",
+    "pursuit_smooth_evader_path",
+    "pursuit_smooth_evader_resolution",
+    "pursuit_smooth_evader_validate",
+    "pursuit_smooth_evader_goal_blend_distance",
+    "pursuit_smooth_evader_goal_sample_min_alignment",
+    "pursuit_smooth_evader_goal_min_alignment",
+    "pursuit_smooth_evader_goal_attempts",
+    "pursuit_evader_wall_clearance",
+    "pursuit_evader_radius",
+    "pursuit_max_static_obstacles",
+    "pursuit_max_dynamic_obstacles",
+    "pursuit_dynamic_obstacle_radius",
+    "pursuit_dynamic_obstacle_height",
+    "pursuit_obstacle_clearance",
+    "pursuit_dynamic_max_speed",
+    "pursuit_pursuer_wall_clearance",
+    "pursuit_pursuer_min_evader_distance",
+    "pursuit_scenario_attempts",
     "reward_pos",
     "reward_pos_scale",
+    "reward_approach",
     "reward_yaw",
     "reward_body_rates",
+    "reward_body_rates_roll_pitch",
+    "reward_body_rates_yaw",
     "reward_lin_vel",
     "reward_action_smoothness",
+    "reward_action_smoothness_rpy",
+    "reward_action_smoothness_thrust",
     "reward_success",
     "penalty_timeout",
     "penalty_altitude_limit",
@@ -272,6 +325,8 @@ _TRAINING_ENV_COMPAT_KEYS = (
     "yaw_tolerance",
     "success_hold_time_s",
     "terminate_on_success",
+    "terminate_on_safety_violation",
+    "terminate_on_out_of_boundaries",
     "enable_clip_states",
 )
 
@@ -287,6 +342,12 @@ def _apply_env_overrides_from_training_env_cfg(env_cfg: Any, env_cfg_data: Mappi
             continue
         setattr(env_cfg, key, _as_plain_container(env_cfg_data[key]))
         applied.append(key)
+    sim_cfg = _as_plain_container(env_cfg_data.get("sim"))
+    if isinstance(sim_cfg, Mapping) and "dt" in sim_cfg and hasattr(env_cfg, "sim"):
+        env_cfg.sim.dt = float(sim_cfg["dt"])
+        applied.append("sim.dt")
+    if hasattr(env_cfg, "sim") and hasattr(env_cfg.sim, "render_interval"):
+        env_cfg.sim.render_interval = int(env_cfg.decimation)
     if applied:
         print(f"[INFO] Applied training env params: {', '.join(sorted(applied))}")
 
@@ -534,8 +595,41 @@ def _checkpoint_params_yaml(checkpoint: str | Path | None, filename: str) -> Pat
     run_dir = _checkpoint_run_dir(checkpoint)
     if run_dir is None:
         return None
-    candidate = run_dir / "params" / filename
-    return candidate if candidate.exists() else None
+    for candidate in (run_dir / "params" / filename, run_dir / filename):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _selected_training_cfg_path(checkpoint: str | Path | None, explicit: Path | None, filename: str) -> Path | None:
+    if explicit is not None:
+        path = _resolve_existing_path(explicit)
+        return path if path.exists() else None
+    return _checkpoint_params_yaml(checkpoint, filename)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _require_ppo_training_context(checkpoint: str | Path | None) -> tuple[Path, Path]:
+    agent_path = _selected_training_cfg_path(checkpoint, args_cli.trained_agent_cfg, "agent.yaml")
+    env_path = _selected_training_cfg_path(checkpoint, args_cli.trained_env_cfg, "env.yaml")
+    missing = []
+    if agent_path is None:
+        missing.append("agent.yaml")
+    if env_path is None:
+        missing.append("env.yaml")
+    if missing:
+        raise FileNotFoundError(
+            f"PPO checkpoint {checkpoint} is missing its training context: {', '.join(missing)}. "
+            "Keep params/ beside checkpoints/, or pass --trained-agent-cfg and --trained-env-cfg."
+        )
+    return agent_path, env_path
 
 
 def _agent_cfg_for_checkpoint(default_cfg: Mapping[str, Any], checkpoint: str | Path | None) -> dict[str, Any]:
@@ -609,6 +703,16 @@ def _validate_checkpoint_algorithm(agent_cfg_data: Mapping[str, Any], checkpoint
         f"but --algorithm {args_cli.algorithm} was selected. "
         f"Re-run with --algorithm {inferred} so the benchmark builds the matching policy loader."
     )
+
+
+def _validate_task_env_contract(env_cfg_data: Mapping[str, Any]) -> None:
+    control_mode = str(env_cfg_data.get("control_mode", ""))
+    task_name = str(args_cli.task).lower()
+    expected = "RL_rates" if "rates" in task_name else "RL_velocity" if "velocity" in task_name else ""
+    if expected and control_mode and control_mode != expected:
+        raise ValueError(
+            f"Training env config uses control_mode={control_mode}, but --task {args_cli.task} expects {expected}."
+        )
 
 
 def _ppo_actor_cfg_from_agent_cfg(agent_cfg_data: Mapping[str, Any], base_env: Any) -> ActorPolicyConfig | None:
@@ -699,11 +803,153 @@ def _ppo_actor_cfg_from_checkpoint(checkpoint: str | Path, fallback_cfg: ActorPo
     )
 
 
+def _ppo_checkpoint_provenance(
+    checkpoint: str | Path,
+    agent_cfg_path: Path,
+    env_cfg_path: Path,
+) -> dict[str, Any]:
+    checkpoint_path = _resolve_existing_path(checkpoint)
+    agent_cfg_data = _load_yaml_mapping(agent_cfg_path)
+    env_cfg_data = _load_yaml_mapping(env_cfg_path)
+    run_dir = _checkpoint_run_dir(checkpoint_path)
+    metadata_path = None
+    if run_dir is not None:
+        for candidate in (run_dir / "params" / "run_metadata.json", run_dir / "run_metadata.json"):
+            if candidate.exists():
+                metadata_path = candidate
+                break
+    run_metadata = None
+    if metadata_path is not None and metadata_path.exists():
+        run_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata_algorithm = str(run_metadata.get("algorithm", "")).lower()
+        if metadata_algorithm and metadata_algorithm != "ppo":
+            raise ValueError(
+                f"Run metadata says algorithm={metadata_algorithm}, but PPO evaluation was requested."
+            )
+        metadata_task = run_metadata.get("task")
+        if metadata_task and str(metadata_task) != str(args_cli.task):
+            raise ValueError(
+                f"Run metadata says task={metadata_task}, but benchmark task={args_cli.task}."
+            )
+    payload = torch.load(str(checkpoint_path), map_location="cpu")
+    state_dict = _extract_ppo_policy_state_dict(payload)
+    if state_dict is None:
+        raise ValueError(f"Unable to locate PPO policy weights in checkpoint: {checkpoint_path}")
+
+    linear_layers: list[tuple[int, torch.Tensor]] = []
+    for key, value in state_dict.items():
+        parts = str(key).split(".")
+        if len(parts) >= 3 and parts[0] == "net_container" and parts[-1] == "weight":
+            if isinstance(value, torch.Tensor) and value.ndim == 2:
+                linear_layers.append((int(parts[1]), value))
+    if not linear_layers:
+        raise ValueError(f"Unable to infer PPO network dimensions from checkpoint: {checkpoint_path}")
+    linear_layers.sort(key=lambda item: item[0])
+
+    obs_state = payload.get("observation_preprocessor") if isinstance(payload, Mapping) else None
+    scaler_mean = obs_state.get("running_mean") if isinstance(obs_state, Mapping) else None
+    scaler_count = obs_state.get("current_count") if isinstance(obs_state, Mapping) else None
+    checkpoint_step = None
+    step_match = re.search(r"([0-9]+)$", checkpoint_path.stem)
+    if step_match:
+        checkpoint_step = int(step_match.group(1))
+    agent_section = agent_cfg_data.get("agent", {})
+    trainer_section = agent_cfg_data.get("trainer", {})
+    sim_section = env_cfg_data.get("sim", {})
+    training_contract = {
+        "seed": env_cfg_data.get("seed", agent_cfg_data.get("seed")),
+        "agent_class": agent_section.get("class") if isinstance(agent_section, Mapping) else None,
+        "trainer_timesteps": trainer_section.get("timesteps") if isinstance(trainer_section, Mapping) else None,
+        "episode_length_s": env_cfg_data.get("episode_length_s"),
+        "sim_dt": sim_section.get("dt") if isinstance(sim_section, Mapping) else None,
+        "decimation": env_cfg_data.get("decimation"),
+        "control_mode": env_cfg_data.get("control_mode"),
+        "obstacle_observation_mode": env_cfg_data.get("obstacle_observation_mode"),
+        "ray_caster_observation_mode": env_cfg_data.get("ray_caster_observation_mode"),
+        "ray_caster_observation_data": env_cfg_data.get("ray_caster_observation_data"),
+        "ray_caster_num_rays": env_cfg_data.get("ray_caster_num_rays"),
+        "pursuit_evader_speed_range": env_cfg_data.get("pursuit_evader_speed_range"),
+        "pursuit_max_static_obstacles": env_cfg_data.get("pursuit_max_static_obstacles"),
+        "pursuit_max_dynamic_obstacles": env_cfg_data.get("pursuit_max_dynamic_obstacles"),
+        "observation_preprocessor": agent_section.get("observation_preprocessor")
+        if isinstance(agent_section, Mapping)
+        else None,
+    }
+    return {
+        "checkpoint_path": str(checkpoint_path),
+        "checkpoint_sha256": _file_sha256(checkpoint_path),
+        "checkpoint_size_bytes": checkpoint_path.stat().st_size,
+        "checkpoint_step": checkpoint_step,
+        "agent_cfg_path": str(agent_cfg_path),
+        "agent_cfg_sha256": _file_sha256(agent_cfg_path),
+        "env_cfg_path": str(env_cfg_path),
+        "env_cfg_sha256": _file_sha256(env_cfg_path),
+        "run_metadata_path": str(metadata_path) if metadata_path is not None and metadata_path.exists() else None,
+        "run_metadata": run_metadata,
+        "training_contract": training_contract,
+        "policy_obs_dim": int(linear_layers[0][1].shape[1]),
+        "policy_action_dim": int(linear_layers[-1][1].shape[0]),
+        "policy_hidden_layers": [int(weight.shape[0]) for _idx, weight in linear_layers[:-1]],
+        "observation_scaler_present": isinstance(scaler_mean, torch.Tensor),
+        "observation_scaler_shape": list(scaler_mean.shape) if isinstance(scaler_mean, torch.Tensor) else None,
+        "observation_scaler_count": float(scaler_count.item())
+        if isinstance(scaler_count, torch.Tensor) and scaler_count.numel() == 1
+        else None,
+    }
+
+
+def _validate_ppo_runtime_contract(
+    base_env: Any,
+    agent_cfg_data: Mapping[str, Any],
+    provenance: Mapping[str, Any],
+) -> None:
+    env_obs_dim = _obs_dim_from_env(base_env)
+    env_action_dim = _action_dim_from_env(base_env)
+    policy_obs_dim = int(provenance["policy_obs_dim"])
+    policy_action_dim = int(provenance["policy_action_dim"])
+    if policy_action_dim != env_action_dim:
+        raise ValueError(
+            f"PPO checkpoint action_dim={policy_action_dim}, but benchmark environment action_dim={env_action_dim}."
+        )
+    if policy_obs_dim != env_obs_dim and not args_cli.allow_observation_adapter:
+        raise ValueError(
+            f"PPO checkpoint obs_dim={policy_obs_dim}, but restored benchmark environment obs_dim={env_obs_dim}."
+        )
+
+    agent_section = agent_cfg_data.get("agent", {}) if isinstance(agent_cfg_data, Mapping) else {}
+    uses_scaler = isinstance(agent_section, Mapping) and str(
+        agent_section.get("observation_preprocessor", "")
+    ).lower() not in {"", "none", "null"}
+    scaler_shape = provenance.get("observation_scaler_shape")
+    if uses_scaler and scaler_shape is None:
+        raise ValueError("PPO training config requires an observation preprocessor, but the checkpoint has no scaler.")
+    if scaler_shape is not None and int(math.prod(scaler_shape)) != policy_obs_dim:
+        raise ValueError(
+            f"PPO observation scaler shape={scaler_shape} does not match checkpoint obs_dim={policy_obs_dim}."
+        )
+    print(
+        "[INFO] PPO training contract verified: "
+        f"obs_dim={policy_obs_dim}, action_dim={policy_action_dim}, "
+        f"scaler={'yes' if scaler_shape is not None else 'no'}, "
+        f"checkpoint_step={provenance.get('checkpoint_step')}, "
+        f"trainer_timesteps={provenance.get('training_contract', {}).get('trainer_timesteps')}, "
+        f"checkpoint_sha256={str(provenance['checkpoint_sha256'])[:12]}."
+    )
+
+
 class PolicyRunner:
-    def __init__(self, actor, device: str, base_env: Any | None = None):
+    def __init__(
+        self,
+        actor,
+        device: str,
+        base_env: Any | None = None,
+        *,
+        allow_observation_adapter: bool = False,
+    ):
         self.actor = actor
         self.device = torch.device(device)
         self.base_env = base_env
+        self.allow_observation_adapter = bool(allow_observation_adapter)
         self.obs_scaler = getattr(self.actor, "obs_scaler", None)
         self.expected_obs_dim = self._infer_obs_dim(actor)
 
@@ -716,6 +962,7 @@ class PolicyRunner:
         base_env: Any | None = None,
         agent_cfg_data: Mapping[str, Any] | None = None,
         device: str,
+        allow_observation_adapter: bool = False,
     ) -> "PolicyRunner":
         cfg = None
         if base_env is not None and agent_cfg_data is not None:
@@ -730,8 +977,13 @@ class PolicyRunner:
             f"obs_dim={cfg.obs_dim}, action_dim={cfg.action_dim}, hidden_layers={list(cfg.hidden_layers)}",
             flush=True,
         )
-        actor = load_actor_from_checkpoint(checkpoint, cfg, device=device)
-        return cls(actor, device=device, base_env=base_env)
+        actor = load_actor_from_checkpoint(checkpoint, cfg, device=device, strict=True)
+        return cls(
+            actor,
+            device=device,
+            base_env=base_env,
+            allow_observation_adapter=allow_observation_adapter,
+        )
 
     @classmethod
     def from_wandb(
@@ -753,10 +1005,20 @@ class PolicyRunner:
     def __call__(self, obs: torch.Tensor) -> torch.Tensor:
         obs = obs.to(self.device, dtype=torch.float32)
         if self.expected_obs_dim is not None and obs.shape[-1] != self.expected_obs_dim:
+            if not self.allow_observation_adapter:
+                raise ValueError(
+                    f"PPO checkpoint expects obs_dim={self.expected_obs_dim}, but the restored training "
+                    f"environment produced obs_dim={obs.shape[-1]}. Use --allow-observation-adapter only "
+                    "for a deliberately supported legacy checkpoint."
+                )
             obs = self._adapt_observation(obs)
         if self.obs_scaler and self.obs_scaler.mean is not None and self.obs_scaler.std is not None:
             mean = self.obs_scaler.mean.to(self.device)
             std = self.obs_scaler.std.to(self.device)
+            if mean.numel() != obs.shape[-1] or std.numel() != obs.shape[-1]:
+                raise ValueError(
+                    f"PPO observation scaler has shape {tuple(mean.shape)}, but policy input is {obs.shape[-1]}."
+                )
             obs = (obs - mean) / (std + 1e-6)
         with torch.no_grad():
             action = self.actor.act(obs, deterministic=True)
@@ -1375,6 +1637,7 @@ class ScenarioManager:
         *,
         pursuit: bool,
         tests_per_difficulty: int,
+        evader_speed: float | None = None,
     ):
         self.base_env = base_env
         self.pursuit = bool(pursuit)
@@ -1389,11 +1652,27 @@ class ScenarioManager:
             self._pursuit_queue = [(difficulty, idx) for difficulty in DIFFICULTY_ORDER for idx in range(count)]
         self._next_pursuit = 0
         self.active: list[GoalScenario | None] = [None for _ in range(int(base_env.num_envs))]
+        self._trajectory_stats: list[dict[str, float]] = []
         self._scenario_builder = ScenarioPoolBuilder(base_env.cfg, base_env.device) if self.pursuit else None
+        speed_range = tuple(getattr(base_env.cfg, "pursuit_evader_speed_range", (0.0, 0.0)))
+        self._evader_speed = max(0.0, float(max(speed_range) if evader_speed is None else evader_speed))
 
     @property
     def pursuit_target_episodes(self) -> int:
         return len(self._pursuit_queue)
+
+    def trajectory_summary(self) -> dict[str, float | int] | None:
+        if not self._trajectory_stats:
+            return None
+        return {
+            "scenario_count": len(self._trajectory_stats),
+            "requested_speed_mps": self._evader_speed,
+            "min_executed_distance_m": min(item["executed_distance_m"] for item in self._trajectory_stats),
+            "max_executed_speed_mps": max(item["max_speed_mps"] for item in self._trajectory_stats),
+            "min_distance_ratio": min(item["distance_ratio"] for item in self._trajectory_stats),
+            "min_near_target_fraction": min(item["near_target_fraction"] for item in self._trajectory_stats),
+            "fallback_count": sum(int(item["fallback"]) for item in self._trajectory_stats),
+        }
 
     def assign(self, env_ids: Sequence[int]) -> list[int]:
         assigned: list[int] = []
@@ -1466,6 +1745,20 @@ class ScenarioManager:
         evader_pos = data["evader_pos"]
         static_active = data["static_active"]
         dynamic_active = data["dynamic_active"]
+        stats = self._evader_trajectory_stats(data)
+        speed_hi = max(0.0, float(max(getattr(self.base_env.cfg, "pursuit_evader_speed_range", (0.0, 0.0)))))
+        speed_tolerance = max(1e-3, 1e-3 * speed_hi)
+        if stats["max_speed_mps"] > speed_hi + speed_tolerance:
+            raise RuntimeError(
+                f"Scenario {difficulty}_{scenario_idx:02d} exceeds the training evader speed maximum: "
+                f"{stats['max_speed_mps']:.3f} > {speed_hi:.3f} m/s."
+            )
+        if self._evader_speed > 0.0 and stats["distance_ratio"] < 0.9:
+            raise RuntimeError(
+                f"Scenario {difficulty}_{scenario_idx:02d} evader path is too short: "
+                f"executed/requested distance ratio={stats['distance_ratio']:.3f}."
+            )
+        self._trajectory_stats.append(stats)
         start = evader_pos[0].detach().cpu().tolist()
         end = evader_pos[-1].detach().cpu().tolist()
         path_kind = str(data.get("path_kind", "pursuit"))
@@ -1551,7 +1844,7 @@ class ScenarioManager:
             pursuer_xy = (-1.55, -0.95)
         elif mode == 1:
             path_kind = "circle"
-            xy = self._circle_xy((0.35, 0.05), radius=0.62, cycles=0.85, phase=0.35 * scenario_idx)
+            xy = self._circle_xy((0.35, 0.05), radius=0.62, phase=0.35 * scenario_idx)
             pursuer_xy = (-1.45, -0.95)
             return self._pack_candidate(path_kind, xy, pursuer_xy, desired_static=2, desired_dynamic=0, variant=variant)
         else:
@@ -1642,6 +1935,22 @@ class ScenarioManager:
             fallback=False,
         )
 
+    def _evader_trajectory_stats(self, data: Mapping[str, Any]) -> dict[str, float]:
+        evader_pos = data["evader_pos"]
+        evader_vel = data["evader_vel"]
+        speed = torch.linalg.vector_norm(evader_vel, dim=-1)
+        executed_distance = torch.linalg.vector_norm(evader_pos[1:] - evader_pos[:-1], dim=-1).sum()
+        duration_s = max(0.0, float(evader_pos.shape[0] - 1) * float(self.base_env.step_dt))
+        requested_distance = self._evader_speed * duration_s
+        near_target = speed >= 0.95 * self._evader_speed if self._evader_speed > 0.0 else speed <= 0.05
+        return {
+            "executed_distance_m": float(executed_distance.item()),
+            "max_speed_mps": float(speed.max().item()),
+            "distance_ratio": float(executed_distance.item()) / max(requested_distance, 1e-6),
+            "near_target_fraction": float(near_target.to(torch.float32).mean().item()),
+            "fallback": float(bool(data.get("fallback", False))),
+        }
+
     def _pack_scenario_data(
         self,
         *,
@@ -1655,6 +1964,7 @@ class ScenarioManager:
         dynamic_active: torch.Tensor,
         fallback: bool,
     ) -> dict[str, Any]:
+        evader_pos = self._waypoints_to_dense(self._dense_path_to_waypoints(evader_pos))
         evader_vel = self._path_velocity(evader_pos)
         speed = torch.linalg.vector_norm(evader_vel[:, :2], dim=-1)
         moving = torch.nonzero(speed > 0.05).squeeze(-1)
@@ -1690,7 +2000,7 @@ class ScenarioManager:
         attempts = max(32, int(getattr(self.base_env.cfg, "pursuit_scenario_attempts", 300)) // 3)
         assert self._scenario_builder is not None
         for _ in range(attempts):
-            sampled = self._scenario_builder.sample_scenario(phase)
+            sampled = self._scenario_builder.sample_scenario(phase, evader_speed=self._evader_speed)
             if sampled is not None:
                 sampled["fallback"] = True
                 sampled["path_kind"] = f"env_phase_{phase}"
@@ -1706,12 +2016,12 @@ class ScenarioManager:
 
         env = self.base_env
         out = dict(data)
-        evader_pos = self._resample_path(data["evader_waypoints"], env._path_steps)
+        evader_pos = self._waypoints_to_dense(data["evader_waypoints"])
         evader_vel = self._path_velocity(evader_pos)
         dynamic_wp = data["dynamic_waypoints"]
         if dynamic_wp.shape[1] > 0:
             dynamic_pos = torch.stack(
-                [self._resample_path(dynamic_wp[:, slot], env._path_steps) for slot in range(dynamic_wp.shape[1])],
+                [self._waypoints_to_dense(dynamic_wp[:, slot]) for slot in range(dynamic_wp.shape[1])],
                 dim=1,
             )
             dynamic_vel = torch.stack(
@@ -1742,8 +2052,12 @@ class ScenarioManager:
         if not bool(torch.all((evader_pos >= lo) & (evader_pos <= hi)).item()):
             return False
         speed = torch.linalg.vector_norm(evader_vel, dim=-1)
-        evader_speed_hi = float(getattr(env.cfg, "pursuit_evader_speed_range", (0.0, 0.0))[1])
-        if bool(torch.any(speed > evader_speed_hi * 1.05).item()):
+        evader_speed_hi = max(0.0, float(max(getattr(env.cfg, "pursuit_evader_speed_range", (0.0, 0.0)))))
+        speed_tolerance = max(1e-3, 1e-3 * evader_speed_hi)
+        if bool(torch.any(speed > evader_speed_hi + speed_tolerance).item()):
+            return False
+        stats = self._evader_trajectory_stats(data)
+        if self._evader_speed > 0.0 and stats["distance_ratio"] < 0.9:
             return False
 
         start_dist = torch.linalg.vector_norm(pursuer_start[:2] - evader_pos[0, :2])
@@ -1943,15 +2257,25 @@ class ScenarioManager:
         return torch.cat((xy, z), dim=-1)
 
     def _polyline_xy(self, points: Sequence[tuple[float, float]]) -> torch.Tensor:
-        return self.base_env._polyline_sample(self._tensor_xy(points), self.base_env._path_steps)
+        route = self._tensor_xy(points)
+        route = torch.cat((route, torch.flip(route[1:-1], dims=(0,)), route[:1]), dim=0)
+        return self._sample_repeating_route(route)
 
-    def _circle_xy(self, center: tuple[float, float], *, radius: float, cycles: float, phase: float) -> torch.Tensor:
-        env = self.base_env
-        t = torch.linspace(0.0, 1.0, env._path_steps, device=env.device)
-        theta = 2.0 * math.pi * float(cycles) * t + float(phase)
+    def _circle_xy(self, center: tuple[float, float], *, radius: float, phase: float) -> torch.Tensor:
+        theta = torch.linspace(0.0, 2.0 * math.pi, 129, device=self.base_env.device) + float(phase)
         center_t = self._tensor_xy([center])[0]
-        xy = center_t + float(radius) * torch.stack((torch.cos(theta), torch.sin(theta)), dim=-1)
-        return xy
+        route = center_t + float(radius) * torch.stack((torch.cos(theta), torch.sin(theta)), dim=-1)
+        return self._sample_repeating_route(route)
+
+    def _sample_repeating_route(self, route: torch.Tensor) -> torch.Tensor:
+        env = self.base_env
+        seg_len = torch.linalg.vector_norm(route[1:] - route[:-1], dim=-1).clamp_min(1e-6)
+        cumulative = torch.cat((torch.zeros(1, device=env.device), torch.cumsum(seg_len, dim=0)))
+        elapsed = torch.arange(env._path_steps, device=env.device, dtype=torch.float32) * float(env.step_dt)
+        distance = torch.remainder(elapsed * self._evader_speed, cumulative[-1])
+        segment = torch.searchsorted(cumulative[1:], distance).clamp(max=seg_len.shape[0] - 1)
+        alpha = ((distance - cumulative[segment]) / seg_len[segment]).view(-1, 1)
+        return route[segment] * (1.0 - alpha) + route[segment + 1] * alpha
 
     def _transform_xy(self, xy: torch.Tensor, variant: int, *, margin: float) -> torch.Tensor:
         out = xy.clone()
@@ -1995,15 +2319,17 @@ class ScenarioManager:
         indices = torch.clamp(steps, max=path.shape[0] - 1)
         return path[indices]
 
-    def _resample_path(self, path: torch.Tensor, steps: int) -> torch.Tensor:
-        if path.shape[0] == steps:
-            return path
-        source = torch.linspace(0.0, 1.0, path.shape[0], device=path.device)
-        target = torch.linspace(0.0, 1.0, steps, device=path.device)
-        segment = torch.searchsorted(source[1:], target).clamp(max=path.shape[0] - 2)
-        width = (source[segment + 1] - source[segment]).clamp_min(1e-6)
-        alpha = ((target - source[segment]) / width).view(-1, 1)
-        return path[segment] * (1.0 - alpha) + path[segment + 1] * alpha
+    def _waypoints_to_dense(self, waypoints: torch.Tensor) -> torch.Tensor:
+        env = self.base_env
+        step_ids = torch.arange(env._path_steps, device=waypoints.device)
+        waypoint_steps = env._path_waypoint_steps.to(device=waypoints.device)
+        segment = torch.searchsorted(waypoint_steps[1:], step_ids).clamp(max=waypoints.shape[0] - 2)
+        start_steps = waypoint_steps[segment]
+        duration = (waypoint_steps[segment + 1] - start_steps).to(waypoints.dtype).clamp_min(1.0)
+        alpha = ((step_ids - start_steps).to(waypoints.dtype) / duration).view(
+            (-1,) + (1,) * (waypoints.ndim - 1)
+        )
+        return waypoints[segment] * (1.0 - alpha) + waypoints[segment + 1] * alpha
 
     def _path_velocity(self, path: torch.Tensor) -> torch.Tensor:
         velocity = torch.zeros_like(path)
@@ -2904,23 +3230,37 @@ def main(env_cfg, agent_cfg: dict):
     episode_csv_path = log_dir / "episode_summary.csv"
 
     checkpoint = args_cli.checkpoint
-    if checkpoint is None and args_cli.artifact and args_cli.algorithm == "dgppo":
+    if checkpoint is None and args_cli.artifact:
         checkpoint = _download_wandb_artifact(args_cli.artifact, args_cli.artifact_file)
     if checkpoint is not None:
         checkpoint_path = _resolve_checkpoint_path(checkpoint)
         if checkpoint_path is None:
             raise ValueError("Could not resolve checkpoint path.")
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
         checkpoint = str(checkpoint_path)
 
+    ppo_provenance = None
+    if args_cli.policy_mode == "rl" and args_cli.algorithm == "ppo" and checkpoint is not None:
+        agent_cfg_path, env_cfg_path = _require_ppo_training_context(checkpoint)
+        ppo_provenance = _ppo_checkpoint_provenance(checkpoint, agent_cfg_path, env_cfg_path)
     trained_agent_cfg = _agent_cfg_for_checkpoint(agent_cfg, checkpoint)
     trained_env_cfg = _env_cfg_for_checkpoint(checkpoint)
     _validate_checkpoint_algorithm(trained_agent_cfg, checkpoint)
+    _validate_task_env_contract(trained_env_cfg)
+    saved_seed = trained_env_cfg.get("seed", trained_agent_cfg.get("seed"))
+    training_seed = int(saved_seed) if saved_seed is not None else None
+    if args_cli.seed is None and training_seed is not None:
+        args_cli.seed = training_seed
+        print(f"[INFO] Using training seed for benchmark: {args_cli.seed}")
 
     env_cfg.scene.num_envs = int(args_cli.num_envs or env_cfg.scene.num_envs)
     env_cfg.sim.device = args_cli.device if args_cli.device else env_cfg.sim.device
     _apply_env_overrides_from_agent_cfg(env_cfg, trained_agent_cfg)
     _apply_env_overrides_from_training_env_cfg(env_cfg, trained_env_cfg)
     env_cfg.domain_randomization.enable = False
+    training_evader_speed_range = tuple(getattr(env_cfg, "pursuit_evader_speed_range", (0.6, 1.0)))
+    benchmark_evader_speed = None
     if args_cli.benchmark_profile == "pursuit":
         env_cfg.enable_pursuit_evasion_curriculum = True
         env_cfg.enable_walls = True
@@ -2929,16 +3269,22 @@ def main(env_cfg, agent_cfg: dict):
         env_cfg.pursuit_max_dynamic_obstacles = max(3, int(getattr(env_cfg, "pursuit_max_dynamic_obstacles", 3)))
         env_cfg.pursuit_scenario_attempts = max(300, int(getattr(env_cfg, "pursuit_scenario_attempts", 300)))
         env_cfg.ref_update_interval_s = 0.0
-        evader_speed_range = tuple(getattr(env_cfg, "pursuit_evader_speed_range", (0.6, 1.0)))
-        evader_speed_lo = max(0.0, float(evader_speed_range[0]))
-        evader_speed_hi = max(evader_speed_lo, float(evader_speed_range[1]))
-        if getattr(env_cfg, "control_mode", "") == "RL_velocity":
-            xy_speed = min(abs(float(env_cfg.vel_scale[0])), abs(float(env_cfg.vel_scale[1])))
-            desired_evader_cap = min(1.35, max(0.9, 0.6 * xy_speed))
-            evader_speed_hi = max(evader_speed_hi, desired_evader_cap)
-        else:
-            evader_speed_hi = max(evader_speed_hi, 1.1)
-        env_cfg.pursuit_evader_speed_range = (evader_speed_lo, evader_speed_hi)
+        training_evader_speed_hi = max(0.0, float(max(training_evader_speed_range)))
+        benchmark_evader_speed = (
+            training_evader_speed_hi if args_cli.evader_speed is None else float(args_cli.evader_speed)
+        )
+        if benchmark_evader_speed < 0.0:
+            raise ValueError("--evader-speed must be non-negative.")
+        if benchmark_evader_speed > training_evader_speed_hi + 1e-6:
+            raise ValueError(
+                f"--evader-speed={benchmark_evader_speed:g} exceeds the training maximum "
+                f"of {training_evader_speed_hi:g} m/s."
+            )
+        print(
+            "[INFO] Pursuit evader speed: "
+            f"{benchmark_evader_speed:g} m/s "
+            f"(training range {min(training_evader_speed_range):g}-{max(training_evader_speed_range):g} m/s)."
+        )
     env_cfg.use_position_controller = args_cli.policy_mode == "baseline"
     if args_cli.policy_mode == "rl":
         if getattr(env_cfg, "obstacle_observation_mode", None) == "ray_caster":
@@ -3030,6 +3376,8 @@ def main(env_cfg, agent_cfg: dict):
 
     device = env.unwrapped.device if hasattr(env, "unwrapped") else torch.device("cpu")
     base_env = env.unwrapped if hasattr(env, "unwrapped") else env
+    if ppo_provenance is not None:
+        _validate_ppo_runtime_contract(base_env, trained_agent_cfg, ppo_provenance)
     policy = None
     if args_cli.policy_mode == "rl":
         if args_cli.algorithm == "dgppo":
@@ -3043,13 +3391,6 @@ def main(env_cfg, agent_cfg: dict):
                     base_env=base_env,
                     device=str(device),
                 )
-        elif args_cli.artifact:
-            policy = PolicyRunner.from_wandb(
-                args_cli.artifact,
-                args_cli.actor_cfg,
-                device=str(device),
-                artifact_file=args_cli.artifact_file,
-            )
         elif checkpoint:
             policy = PolicyRunner.from_checkpoint(
                 checkpoint,
@@ -3057,6 +3398,7 @@ def main(env_cfg, agent_cfg: dict):
                 base_env=base_env,
                 agent_cfg_data=trained_agent_cfg,
                 device=str(device),
+                allow_observation_adapter=args_cli.allow_observation_adapter,
             )
         else:
             print("[WARN] No checkpoint provided; falling back to random actions.")
@@ -3072,6 +3414,7 @@ def main(env_cfg, agent_cfg: dict):
         fixed_goals=fixed_goals,
         pursuit=args_cli.benchmark_profile == "pursuit",
         tests_per_difficulty=int(args_cli.tests_per_difficulty),
+        evader_speed=benchmark_evader_speed,
     )
     all_env_ids = list(range(int(base_env.num_envs)))
     assigned_env_ids = scenario_manager.assign(all_env_ids)
@@ -3172,6 +3515,16 @@ def main(env_cfg, agent_cfg: dict):
     plot_paths = _plot_rollouts(log_dir, env_cfg, recorder.results)
     summary = _summarize_results(recorder.results, recorder)
     _print_performance_table(summary)
+    trajectory_summary = scenario_manager.trajectory_summary()
+    if trajectory_summary is not None:
+        print(
+            "[INFO] Evader trajectory validation: "
+            f"speed={trajectory_summary['requested_speed_mps']:.3f} m/s, "
+            f"min_distance={trajectory_summary['min_executed_distance_m']:.3f} m, "
+            f"min_distance_ratio={trajectory_summary['min_distance_ratio']:.3f}, "
+            f"max_speed={trajectory_summary['max_executed_speed_mps']:.3f} m/s, "
+            f"fallbacks={trajectory_summary['fallback_count']}."
+        )
 
     metrics = {
         "task": args_cli.task,
@@ -3179,6 +3532,30 @@ def main(env_cfg, agent_cfg: dict):
         "control_mode": base_env.cfg.control_mode,
         "policy_mode": args_cli.policy_mode,
         "checkpoint": checkpoint,
+        "ppo_training_provenance": ppo_provenance,
+        "training_seed": training_seed,
+        "benchmark_seed": args_cli.seed,
+        "effective_benchmark_contract": {
+            "observation_dim": _obs_dim_from_env(base_env),
+            "action_dim": _action_dim_from_env(base_env),
+            "episode_length_s": float(base_env.cfg.episode_length_s),
+            "sim_dt": float(base_env.sim.cfg.dt),
+            "step_dt": float(base_env.step_dt),
+            "decimation": int(base_env.cfg.decimation),
+            "control_mode": str(base_env.cfg.control_mode),
+            "obstacle_observation_mode": str(base_env.cfg.obstacle_observation_mode),
+            "ray_caster_observation_mode": str(base_env.cfg.ray_caster_observation_mode),
+            "ray_caster_observation_data": str(base_env.cfg.ray_caster_observation_data),
+            "ray_caster_num_rays": int(base_env.cfg.ray_caster_num_rays),
+            "pursuit_evader_speed_range": list(base_env.cfg.pursuit_evader_speed_range),
+            "benchmark_evader_speed": benchmark_evader_speed,
+            "pursuit_max_static_obstacles": int(base_env.cfg.pursuit_max_static_obstacles),
+            "pursuit_max_dynamic_obstacles": int(base_env.cfg.pursuit_max_dynamic_obstacles),
+            "domain_randomization": bool(base_env.cfg.domain_randomization.enable),
+            "terminate_on_safety_violation": bool(base_env.cfg.terminate_on_safety_violation),
+            "terminate_on_success": bool(base_env.cfg.terminate_on_success),
+            "terminate_on_out_of_boundaries": bool(base_env.cfg.terminate_on_out_of_boundaries),
+        },
         "benchmark_profile": args_cli.benchmark_profile,
         "tests_per_difficulty": int(args_cli.tests_per_difficulty)
         if args_cli.benchmark_profile == "pursuit"
@@ -3186,6 +3563,9 @@ def main(env_cfg, agent_cfg: dict):
         "num_steps": total_steps,
         "target_episodes": target_episodes,
         "fixed_goals": [list(goal) for goal in fixed_goals],
+        "training_pursuit_evader_speed_range": list(training_evader_speed_range),
+        "benchmark_evader_speed": benchmark_evader_speed,
+        "evader_trajectory_validation": trajectory_summary,
         "pursuit_evader_speed_range": list(getattr(base_env.cfg, "pursuit_evader_speed_range", (0.0, 0.0))),
         "pursuit_dynamic_max_speed": float(getattr(base_env.cfg, "pursuit_dynamic_max_speed", 0.0)),
         "obstacle_observation_mode": str(getattr(base_env.cfg, "obstacle_observation_mode", "")),

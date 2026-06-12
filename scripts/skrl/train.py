@@ -13,6 +13,7 @@ a more user-friendly way.
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import json
 import math
 import re
 import sys
@@ -103,6 +104,7 @@ parser.add_argument(
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 
+raw_cli_args = sys.argv[1:]
 args_cli, hydra_args = parser.parse_known_args()
 # always enable cameras to record video
 if args_cli.video:
@@ -460,11 +462,13 @@ class WandbCheckpointUploader:
         *,
         artifact_type: str = "model",
         metadata: Optional[dict] = None,
+        context_files: Optional[list[Path]] = None,
     ) -> None:
         self._bridge = bridge
         self._dir = checkpoints_dir
         self._artifact_type = artifact_type
         self._metadata = metadata or {}
+        self._context_files = list(context_files or [])
         self._known_mtimes: dict[str, float] = {}
         self._record_existing()
 
@@ -543,7 +547,7 @@ class WandbCheckpointUploader:
             for name in names_to_try:
                 uploaded = self._bridge.log_artifact(
                     name,
-                    [path],
+                    [path, *self._context_files],
                     artifact_type=self._artifact_type,
                     description=description,
                     aliases=aliases,
@@ -1268,6 +1272,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+    run_metadata = {
+        "schema_version": 1,
+        "created_at": datetime.now().astimezone().isoformat(),
+        "task": args_cli.task,
+        "algorithm": algorithm,
+        "ml_framework": args_cli.ml_framework,
+        "seed": int(agent_cfg["seed"]),
+        "num_envs": int(env_cfg.scene.num_envs),
+        "total_frames": args_cli.total_frames,
+        "trainer_timesteps": int(agent_cfg.get("trainer", {}).get("timesteps", 0)),
+        "control_mode": getattr(env_cfg, "control_mode", None),
+        "obstacle_observation_mode": getattr(env_cfg, "obstacle_observation_mode", None),
+        "ray_caster_observation_mode": getattr(env_cfg, "ray_caster_observation_mode", None),
+        "ray_caster_observation_data": getattr(env_cfg, "ray_caster_observation_data", None),
+        "command_line": [sys.argv[0], *raw_cli_args],
+    }
+    metadata_path = Path(log_dir) / "params" / "run_metadata.json"
+    metadata_path.write_text(json.dumps(run_metadata, indent=2), encoding="utf-8")
 
     # get checkpoint path (to resume training), preferring CLI and falling back to env config warmstart
     resume_source = None
@@ -1389,6 +1411,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         bridge=wandb_bridge,
         checkpoints_dir=checkpoints_dir,
         metadata=checkpoint_metadata,
+        context_files=[
+            Path(log_dir) / "params" / "agent.yaml",
+            Path(log_dir) / "params" / "env.yaml",
+            Path(log_dir) / "params" / "run_metadata.json",
+        ],
     )
 
     # augment agent post-interaction hook with performance and media logging
